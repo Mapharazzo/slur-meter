@@ -1,0 +1,67 @@
+# ────────────────────────────────────────────────
+# Daily Slur Meter — Master Configuration
+# ────────────────────────────────────────────────
+
+# ── Profanity Dictionary ──
+# Each category is a list of words/phrases (lowercase).
+# The engine checks each subtitle line against all tiers.
+# Use `*` wildcard for variations: e.g. "f*ck" matches fck, fuck, f**k, etc.
+categories:
+  hard:
+    - "nigger"
+    - "nigga"
+    - "cunt"
+    - "faggot"
+    - "dyke"
+    - "kike"
+    - "spic"
+    - "tranny"
+  soft:
+    - "shit"
+    - "ass"
+    - "bastard"
+    - "bitch"
+    - "damn"
+    - "dick"
+    - "piss"
+    - "cock"
+    - "pussy"
+    - "crap"
+    - "slut"
+    - "whore"
+    - "bollocks"
+    - "bloody"
+    - "goddamn"
+    - "motherfucker"
+    - "motherfucking"
+  f_bombs:
+    - "fuck"
+    - "fucker"
+    - "fucking"
+    - "fucked"
+    - "motherfucker"
+    - "motherfucking"
+
+# ── Video Styling ──
+video:
+  resolution: [1080, 1920]   # 9:16 vertical
+  duration_seconds: 60       # Max short length
+  fps: 30
+  colors:
+    background: "#0d0d0d"
+    hard_slur: "#ff1744"      # Neon Red
+    soft_slur: "#ffea00"      # Neon Yellow
+    f_bomb: "#d500f9"         # Neon Purple
+    line: "#00e5ff"           # Cyan
+    text: "#ffffff"
+    accent: "#ff1744"         # Neon Red
+  fonts:
+    heading: "assets/fonts/Montserrat-Bold.ttf"
+    body: "assets/fonts/Montserrat-Regular.ttf"
+    numbers: "assets/fonts/Montserrat-Bold.ttf"
+
+# ── Intro TTS Voice ──
+tts:
+  engine: "edge"              # "edge" = free Edge TTS; "openai" for premium
+  voice: "en-US-GuyNeural"    # Edge TTS voice ID
+  speed: 1.0

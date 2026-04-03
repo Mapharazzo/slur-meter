@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#0a0a0a] text-gray-100 font-sans;
+  }
+}
+
+@layer components {
+  .glass {
+    @apply bg-white/[0.04] backdrop-blur-md border border-white/[0.06];
+  }
+  .glow-hard { box-shadow: 0 0 20px rgba(255, 23, 68, 0.3); }
+  .glow-soft { box-shadow: 0 0 20px rgba(255, 234, 0, 0.3); }
+  .glow-fbomb { box-shadow: 0 0 20px rgba(213, 0, 249, 0.3); }
+  .glow-accent { box-shadow: 0 0 20px rgba(118, 255, 3, 0.3); }
+}
+
+@layer utilities {
+  .animate-pulse-slow {
+    animation: pulse-slow 2s ease-in-out infinite;
+  }
+}
+
+@keyframes pulse-slow {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 1; }
+}

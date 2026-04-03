@@ -1,0 +1,10 @@
+services:
+  daily-slur-meter:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./results:/app/results
+      - ./output:/app/output
+      - ./tmp:/app/tmp
+    command: ["--imdb", "tt0110912", "--render"]

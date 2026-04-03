@@ -1,0 +1,84 @@
+# ——— slur-meter ———
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+.env
+.venv/
+venv/
+ENV/
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Results & Analysis
+results/
+!results/.gitkeep
+tmp/
+output/
+!fixtures/demo/
+!fixtures/pulp_fiction/
+
+# Media / Bulky files
+*.srt
+*.mp4
+*.png
+# Allow the demo images
+!fixtures/demo/*.png
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reports
+reports/
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+pytestdebug.log
+
+# Web UI
+webui/node_modules/
+webui/dist/
+webui/.env
+
+# Lockfiles
+# uv.lock  # Decided to include it for reproducibility
+
+# Docker
+.dockerignore

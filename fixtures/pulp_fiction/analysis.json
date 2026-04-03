@@ -1,0 +1,1141 @@
+{
+  "events": [
+    {
+      "time": 27.485,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 81.206,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 145.979,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 148.732,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 208.958,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 221.221,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 279.32,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 468.468,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 492.742,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 517.475,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 520.562,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 602.936,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 605.98,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 622.872,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 642.6,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 642.6,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 650.692,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 657.49,
+      "word": "damn",
+      "tier": "soft"
+    },
+    {
+      "time": 688.355,
+      "word": "pussy",
+      "tier": "soft"
+    },
+    {
+      "time": 693.36,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 695.487,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 695.487,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 713.38,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 723.098,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 731.439,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 734.317,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 773.565,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 773.565,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 776.359,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 776.359,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 776.359,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 776.359,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 776.359,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 776.359,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 804.846,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1005.839,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 1005.839,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1041.082,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1100.225,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1100.225,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1112.612,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1158.95,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 1158.95,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1169.711,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 1169.711,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1173.715,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 1180.221,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 1184.601,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 1188.73,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 1188.73,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1195.737,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1197.864,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1277.36,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1281.698,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 1281.698,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1311.478,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1323.823,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1382.841,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 1410.118,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1420.837,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1440.69,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1452.702,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1465.215,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 1465.215,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 1505.964,
+      "word": "piss",
+      "tier": "soft"
+    },
+    {
+      "time": 1505.964,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 1517.726,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1552.052,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 1552.052,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 1661.077,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1671.838,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 1678.219,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1678.219,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1681.222,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1681.222,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1738.822,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1763.722,
+      "word": "fucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1768.935,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1775.358,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1775.358,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1789.08,
+      "word": "fucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 1793.96,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 1796.755,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 2054.429,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 2219.969,
+      "word": "bloody",
+      "tier": "soft"
+    },
+    {
+      "time": 2219.969,
+      "word": "bloody",
+      "tier": "soft"
+    },
+    {
+      "time": 2231.606,
+      "word": "bloody",
+      "tier": "soft"
+    },
+    {
+      "time": 2460.96,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 2524.065,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 2576.951,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 2579.329,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 2579.329,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 3039.497,
+      "word": "piss",
+      "tier": "soft"
+    },
+    {
+      "time": 3273.106,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3279.32,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3279.32,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3299.341,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3328.203,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3340.59,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 3354.354,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3375.0,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3391.474,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3417.125,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3419.627,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 3422.589,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3425.592,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 3425.592,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3429.095,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 3429.095,
+      "word": "fucked",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3434.559,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3446.196,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 3452.619,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 3454.704,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 3457.207,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3469.803,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 3469.803,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3469.803,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3478.561,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3524.357,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3528.361,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3557.349,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 3577.327,
+      "word": "bitch",
+      "tier": "soft"
+    },
+    {
+      "time": 4052.469,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4056.598,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4064.23,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4215.465,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4218.968,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4222.597,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 4228.061,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 4228.061,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 4231.106,
+      "word": "nigger",
+      "tier": "hard"
+    },
+    {
+      "time": 4234.609,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4375.208,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 4425.216,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 4433.975,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 4443.985,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 4464.464,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 4481.731,
+      "word": "goddamn",
+      "tier": "soft"
+    },
+    {
+      "time": 4629.212,
+      "word": "ass",
+      "tier": "soft"
+    },
+    {
+      "time": 4646.354,
+      "word": "damn",
+      "tier": "soft"
+    },
+    {
+      "time": 5094.552,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5112.821,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5122.372,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5134.968,
+      "word": "shit",
+      "tier": "soft"
+    },
+    {
+      "time": 5134.968,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5145.353,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5160.368,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5160.368,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5160.368,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5162.328,
+      "word": "motherfucker",
+      "tier": "soft"
+    },
+    {
+      "time": 5162.328,
+      "word": "motherfucker",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5166.708,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5166.708,
+      "word": "fucking",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5206.623,
+      "word": "fuck",
+      "tier": "f_bombs"
+    },
+    {
+      "time": 5281.489,
+      "word": "shit",
+      "tier": "soft"
+    }
+  ],
+  "binned": [
+    {
+      "minute": 0,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 1,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 1,
+      "score": 3
+    },
+    {
+      "minute": 2,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 2,
+      "score": 6
+    },
+    {
+      "minute": 3,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 2,
+      "score": 6
+    },
+    {
+      "minute": 4,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 1,
+      "score": 3
+    },
+    {
+      "minute": 7,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 8,
+      "hard": 0,
+      "soft": 2,
+      "f_bombs": 1,
+      "score": 5
+    },
+    {
+      "minute": 10,
+      "hard": 3,
+      "soft": 2,
+      "f_bombs": 2,
+      "score": 23
+    },
+    {
+      "minute": 11,
+      "hard": 0,
+      "soft": 4,
+      "f_bombs": 1,
+      "score": 7
+    },
+    {
+      "minute": 12,
+      "hard": 1,
+      "soft": 6,
+      "f_bombs": 4,
+      "score": 23
+    },
+    {
+      "minute": 13,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 16,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 1,
+      "score": 4
+    },
+    {
+      "minute": 17,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 18,
+      "hard": 0,
+      "soft": 2,
+      "f_bombs": 1,
+      "score": 5
+    },
+    {
+      "minute": 19,
+      "hard": 0,
+      "soft": 6,
+      "f_bombs": 5,
+      "score": 21
+    },
+    {
+      "minute": 21,
+      "hard": 0,
+      "soft": 3,
+      "f_bombs": 1,
+      "score": 6
+    },
+    {
+      "minute": 22,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 23,
+      "hard": 1,
+      "soft": 1,
+      "f_bombs": 1,
+      "score": 9
+    },
+    {
+      "minute": 24,
+      "hard": 1,
+      "soft": 3,
+      "f_bombs": 0,
+      "score": 8
+    },
+    {
+      "minute": 25,
+      "hard": 1,
+      "soft": 4,
+      "f_bombs": 0,
+      "score": 9
+    },
+    {
+      "minute": 27,
+      "hard": 1,
+      "soft": 3,
+      "f_bombs": 0,
+      "score": 8
+    },
+    {
+      "minute": 28,
+      "hard": 0,
+      "soft": 3,
+      "f_bombs": 0,
+      "score": 3
+    },
+    {
+      "minute": 29,
+      "hard": 0,
+      "soft": 2,
+      "f_bombs": 5,
+      "score": 17
+    },
+    {
+      "minute": 34,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 1,
+      "score": 3
+    },
+    {
+      "minute": 36,
+      "hard": 0,
+      "soft": 2,
+      "f_bombs": 0,
+      "score": 2
+    },
+    {
+      "minute": 37,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 41,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 42,
+      "hard": 0,
+      "soft": 3,
+      "f_bombs": 1,
+      "score": 6
+    },
+    {
+      "minute": 50,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 54,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 4,
+      "score": 12
+    },
+    {
+      "minute": 55,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 2,
+      "score": 7
+    },
+    {
+      "minute": 56,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 3,
+      "score": 10
+    },
+    {
+      "minute": 57,
+      "hard": 0,
+      "soft": 6,
+      "f_bombs": 8,
+      "score": 30
+    },
+    {
+      "minute": 58,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 2,
+      "score": 6
+    },
+    {
+      "minute": 59,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 1,
+      "score": 4
+    },
+    {
+      "minute": 67,
+      "hard": 0,
+      "soft": 3,
+      "f_bombs": 0,
+      "score": 3
+    },
+    {
+      "minute": 70,
+      "hard": 1,
+      "soft": 5,
+      "f_bombs": 1,
+      "score": 13
+    },
+    {
+      "minute": 72,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    },
+    {
+      "minute": 73,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 2,
+      "score": 6
+    },
+    {
+      "minute": 74,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 2,
+      "score": 7
+    },
+    {
+      "minute": 77,
+      "hard": 0,
+      "soft": 2,
+      "f_bombs": 0,
+      "score": 2
+    },
+    {
+      "minute": 84,
+      "hard": 0,
+      "soft": 0,
+      "f_bombs": 1,
+      "score": 3
+    },
+    {
+      "minute": 85,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 4,
+      "score": 13
+    },
+    {
+      "minute": 86,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 7,
+      "score": 22
+    },
+    {
+      "minute": 88,
+      "hard": 0,
+      "soft": 1,
+      "f_bombs": 0,
+      "score": 1
+    }
+  ],
+  "summary": {
+    "total_hard": 9,
+    "total_soft": 79,
+    "total_f_bombs": 67,
+    "peak_minute": 57,
+    "peak_score": 30,
+    "runtime_minutes": 88,
+    "total_words_counted": 155,
+    "rating": "\ud83d\ude2c EDGY"
+  },
+  "metadata": {
+    "movie_title": "Pulp Fiction (1994)",
+    "imdb_id": "tt0110912",
+    "metadata_tags": {
+      "video_title": "Rating Pulp Fiction (1994) on toxicity\u2026 it's bad \ud83d\udcc9",
+      "description": "The Daily Slur Meter analysed Pulp Fiction (1994)!\n\n\ud83d\udd34 Hard Slurs: 9\n\ud83d\udca3 F-Bombs: 67\n\ud83c\udfc6 Rating: \ud83d\ude2c EDGY\n\nWhat movie should we rate next? Comment below! \ud83d\udc47\n\n",
+      "tags": [
+        "daily slur meter",
+        "movie stats",
+        "slur count",
+        "pulp fiction (1994)",
+        "movie analysis",
+        "data viz",
+        "shorts",
+        "movie rating",
+        "profanity",
+        "toxic movies"
+      ],
+      "hashtags": [
+        "#Shorts",
+        "#MovieStats",
+        "#DailySlurMeter",
+        "#PulpFiction(1994)",
+        "#DataViz",
+        "#TOUGH"
+      ],
+      "tier": "tough",
+      "verdict": "\ud83d\udd25 TOUGH \u2014 bring a bib!"
+    },
+    "director": "Quentin Tarantino",
+    "imdb_rating": "8.9",
+    "runtime": "154 min",
+    "awards": "Won 1 Oscar. 67 wins & 74 nominations total.",
+    "actors": "John Travolta, Uma Thurman, Samuel L. Jackson"
+  }
+}

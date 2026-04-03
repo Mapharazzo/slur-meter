@@ -1,0 +1,19 @@
+# ── FastAPI backend ──
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+python-multipart>=0.0.18
+pydantic>=2.0.0
+PyYAML>=6.0
+
+# ── Pipeline deps ──
+python-dotenv>=1.0.0
+pysrt>=1.1.2
+requests>=2.31.0
+rarfile>=4.1
+pandas>=2.1.0
+regex>=2023.10.3
+matplotlib>=3.8.0
+numpy>=1.26.0
+Pillow>=10.0.0
+edge-tts>=6.1.9
+tqdm>=4.66.0
