@@ -33,10 +33,19 @@ class OpenSubtitlesClient:
 
     BASE_URL = "https://api.opensubtitles.com/api/v1"
 
-    def __init__(self, api_key: str, user_agent: str, jwt: str | None = None):
+    def __init__(
+        self,
+        api_key: str,
+        user_agent: str,
+        jwt: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+    ):
         self.api_key = api_key
         self.user_agent = user_agent
         self.jwt = jwt
+        self.username = username
+        self.password = password
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -44,6 +53,23 @@ class OpenSubtitlesClient:
                 "User-Agent": user_agent,
             }
         )
+
+    def login(self) -> str:
+        """Authenticate with OpenSubtitles and return a JWT."""
+        if not self.username or not self.password:
+            raise ValueError("Username and password are required for login")
+
+        resp = self.session.post(
+            f"{self.BASE_URL}/login",
+            json={
+                "username": self.username,
+                "password": self.password,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        self.jwt = data["token"]
+        return self.jwt
 
     # ──────────────────── Search ────────────────────
 
@@ -83,7 +109,7 @@ class OpenSubtitlesClient:
                     movie_year=str(attrs.get("feature_details", {}).get("year", "")) or None,
                     language=attrs.get("language", language),
                     fps=_safe_float(attrs.get("fps")),
-                    imdb_id=f"tt{int(attrs['feature_details']['imdb_id']):07d}" if attrs.get("feature_details", {}).get("imdb_id") else None,
+                    imdb_id=safe_imdb_id(attrs.get("feature_details", {}).get("imdb_id")),
                 )
             )
         return results
@@ -100,12 +126,35 @@ class OpenSubtitlesClient:
         dest_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 1 — get download link
-        headers = {"Authorization": f"Bearer {self.jwt}"} if self.jwt else {}
-        resp = self.session.post(
-            f"{self.BASE_URL}/download",
-            json={"file_id": file_id},
-            headers=headers,
-        )
+        payload = {"file_id": file_id}
+        
+        def _get_link():
+            headers = {"Authorization": f"Bearer {self.jwt}"} if self.jwt else {}
+            return self.session.post(
+                f"{self.BASE_URL}/download",
+                json=payload,
+                headers=headers,
+            )
+
+        resp = _get_link()
+        
+        if resp.status_code == 401:
+            # 1. Try to refresh the token if we have credentials
+            if self.username and self.password:
+                try:
+                    self.login()
+                    resp = _get_link()
+                except Exception:
+                    pass
+            
+            # 2. If still 401, try anonymous download (omitting the Bearer token)
+            if resp.status_code == 401:
+                resp = self.session.post(
+                    f"{self.BASE_URL}/download",
+                    json=payload,
+                    headers={}, # Explicitly empty headers to bypass the stale session JWT if any
+                )
+
         resp.raise_for_status()
         dl_data = resp.json()
         url = dl_data["link"]
@@ -198,6 +247,23 @@ def _safe_float(val: str | None) -> float | None:
         return float(val)
     except (ValueError, TypeError):
         return None
+
+
+def safe_imdb_id(val) -> str | None:
+    if val is None or val == "":
+        return None
+    s_val = str(val).strip()
+    if not s_val:
+        return None
+    # If it's already 'tt12345', return it
+    if s_val.lower().startswith("tt"):
+        return s_val
+    try:
+        # Standard numeric ID
+        return f"tt{int(s_val):07d}"
+    except (ValueError, TypeError):
+        # Could be 'q_4fed600a11' or similar; return it as is
+        return s_val
 
 
 def _to_srt_name(file_name: str) -> str:
