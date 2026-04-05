@@ -1,10 +1,16 @@
 """Quick frame preview tool — generates specific frames from existing job data.
 
 Usage:
-    uv run python dev_frames.py
-    uv run python dev_frames.py --job cd205689 --frames 56,57
-    uv run python dev_frames.py --job cd205689 --segment intro
-    uv run python dev_frames.py --job cd205689 --segment intro --frames 0,30,60,90,119
+    uv run python scripts/dev_frames.py
+    uv run python scripts/dev_frames.py --job cd205689 --frames 56,57
+    uv run python scripts/dev_frames.py --job cd205689 --segment intro_hold
+    uv run python scripts/dev_frames.py --job cd205689 --segment intro_transition --frames 0,15,30,45,59
+    uv run python scripts/dev_frames.py --job cd205689 --segment graph --frames 56,57
+
+Or via make:
+    make preview JOB=cd205689 SEG=intro_hold
+    make preview JOB=cd205689 SEG=intro_transition
+    make preview JOB=cd205689 SEG=graph FRAMES=56,57
 """
 
 import argparse
@@ -13,7 +19,7 @@ import re
 import sys
 from pathlib import Path
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parent.parent   # scripts/ → project root
 sys.path.insert(0, str(BASE_DIR))
 
 from dotenv import load_dotenv
@@ -31,7 +37,10 @@ def run(job_id: str, frame_indices: list[int], segment: str):
 
     analysis_path = BASE_DIR / "results" / f"{job_id}.json"
     if not analysis_path.exists():
-        sys.exit(f"No analysis found: {analysis_path}")
+        # Fall back to fixtures directory
+        analysis_path = BASE_DIR / "fixtures" / job_id / "analysis.json"
+    if not analysis_path.exists():
+        sys.exit(f"No analysis found for job '{job_id}' in results/ or fixtures/")
 
     analysis   = json.loads(analysis_path.read_text())
     binned     = analysis.get("binned", [])
@@ -72,70 +81,76 @@ def run(job_id: str, frame_indices: list[int], segment: str):
     compositor  = VideoCompositor(cfg)
     poster_area = compositor.render_poster_area(title, year, poster_path, movie_info, day_number)
 
-    # ── Intro segment ──────────────────────────────────────────────────────────
-    if segment == "intro":
-        fps     = cfg["video"]["fps"]
-        n_intro = int(4.0 * fps)  # 120 frames at 30 fps
+    run_all = (segment == "all")
 
-        # Decide which intro frame indices to preview
-        if frame_indices:
-            preview = [i for i in frame_indices if 0 <= i < n_intro]
-        else:
-            # 8 evenly spaced samples across the intro
-            step    = max(1, n_intro // 8)
-            preview = list(range(0, n_intro, step))
-
-        # Compute which plotter frames are needed for those intro frames
-        def _plotter_idx(intro_i):
-            t = intro_i / max(n_intro - 1, 1)
-            return min(int(t * total_frames * 0.8), total_frames - 1)
-
-        needed_set    = sorted(set(_plotter_idx(i) for i in range(n_intro)))
-        print(f"Generating {len(needed_set)} plotter frames for intro background…")
-        pf_list       = plotter.generate_specific_frames(
-            binned, graph_dir, frame_indices=needed_set,
-            total_frames=total_frames, runtime_min=runtime_min,
-        )
-        pf_map = {idx: p for idx, p in zip(needed_set, pf_list)}
-
-        # Build per-intro-frame plotter path list (nearest available)
-        intro_pf = []
-        for i in range(n_intro):
-            fi = _plotter_idx(i)
-            nearest = min(pf_map.keys(), key=lambda k: abs(k - fi))
-            intro_pf.append(pf_map[nearest])
-
-        print(f"Rendering {len(preview)} intro preview frames {preview}…")
-        intro_frames = compositor.render_intro(
-            title, year, poster_area,
-            plotter_frames=intro_pf,
-            poster_path=poster_path,
-            movie_info=movie_info,
-            duration=4.0,
-        )
-        for i in preview:
-            out_path = out_dir / f"intro_{i:05d}.png"
-            t = i / max(n_intro - 1, 1)
-            print(f"  intro frame {i:3d}: graph progress={t * 0.8 * 100:.0f}%")
-            Image.fromarray(intro_frames[i]).save(out_path)
+    # ── Intro hold ─────────────────────────────────────────────────────────────
+    if segment == "intro_hold" or run_all:
+        fps    = cfg["video"]["fps"]
+        n      = int(2.5 * fps)
+        sample = frame_indices if frame_indices else [0, n // 4, n // 2, n - 1]
+        sample = [i for i in sample if 0 <= i < n]
+        print(f"Rendering intro_hold, previewing frames {sample}…")
+        hold_frames = compositor.render_intro_hold(title, poster_path, day_number)
+        for i in sample:
+            out_path = out_dir / f"intro_hold_{i:05d}.png"
+            Image.fromarray(hold_frames[i]).save(out_path)
             print(f"  Saved: {out_path}")
 
-    # ── Graph segment (original behaviour) ─────────────────────────────────────
-    else:
-        indices = frame_indices if frame_indices else [56, 57]
-        print(f"Generating {len(indices)} frames {indices} (as if from {total_frames} total)…")
-        plotter_frames = plotter.generate_specific_frames(
+    # ── Intro transition ────────────────────────────────────────────────────────
+    if segment == "intro_transition" or run_all:
+        fps  = cfg["video"]["fps"]
+        n    = int(2.0 * fps)
+        if frame_indices:
+            sample = [i for i in frame_indices if 0 <= i < n]
+        else:
+            step   = max(1, n // 6)
+            sample = list(range(0, n, step))
+        print("Generating plotter frame 0 for transition fade-in…")
+        pf_list = plotter.generate_specific_frames(
+            binned, graph_dir, frame_indices=[0],
+            total_frames=total_frames, runtime_min=runtime_min,
+        )
+        print(f"Rendering intro_transition, previewing frames {sample}…")
+        trans_frames = compositor.render_intro_transition(poster_path, poster_area, pf_list)
+        for i in sample:
+            t  = i / max(n - 1, 1)
+            te = t * t * (3 - 2 * t)
+            out_path = out_dir / f"intro_transition_{i:05d}.png"
+            Image.fromarray(trans_frames[i]).save(out_path)
+            print(f"  frame {i:2d}  t={t:.2f}  te={te:.2f}  blur={14*te:.1f}px  saved: {out_path}")
+
+    # ── Graph ──────────────────────────────────────────────────────────────────
+    if segment == "graph" or run_all:
+        indices = frame_indices if frame_indices else [0, 112, 224, 337, 449]
+        print(f"Generating graph frames {indices}…")
+        pf_list = plotter.generate_specific_frames(
             binned, graph_dir, frame_indices=indices, total_frames=total_frames,
             runtime_min=runtime_min,
         )
-        for idx, frame_path in zip(indices, plotter_frames):
+        for idx, frame_path in zip(indices, pf_list):
             frames = compositor.render_graph_segment(
                 [frame_path], poster_area, poster_path, duration=1 / cfg["video"]["fps"]
             )
-            out_path = out_dir / f"preview_{idx:05d}.png"
-            runtime  = idx / 449 * 88
-            print(f"  frame {idx}: progress={idx/449*100:.1f}%, cutoff={runtime:.1f}min")
+            out_path = out_dir / f"graph_{idx:05d}.png"
+            print(f"  frame {idx}: progress={idx / (total_frames - 1) * 100:.0f}%")
             Image.fromarray(frames[0]).save(out_path)
+            print(f"  Saved: {out_path}")
+
+    # ── Verdict / outro ────────────────────────────────────────────────────────
+    if segment == "verdict" or run_all:
+        summary = analysis.get("summary", {})
+        fps = cfg["video"]["fps"]
+        n   = int(9.0 * fps)
+        if frame_indices:
+            sample = [i for i in frame_indices if 0 <= i < n]
+        else:
+            # Sample across the slam animation (first 5s) + hold
+            sample = [0, 15, 30, 50, 75, 100, 150, n - 1]
+        print(f"Rendering verdict ({n} frames), previewing {sample}…")
+        verdict_frames = compositor.render_verdict(title, summary, poster_area)
+        for i in sample:
+            out_path = out_dir / f"verdict_{i:05d}.png"
+            Image.fromarray(verdict_frames[i]).save(out_path)
             print(f"  Saved: {out_path}")
 
     print("Done.")
@@ -144,8 +159,9 @@ def run(job_id: str, frame_indices: list[int], segment: str):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--job",     default="cd205689")
-    parser.add_argument("--segment", default="graph", choices=["graph", "intro"],
-                        help="Which segment to preview")
+    parser.add_argument("--segment", default="all",
+                        choices=["all", "intro_hold", "intro_transition", "graph", "verdict"],
+                        help="Which segment to preview (default: all)")
     parser.add_argument("--frames",  default="",
                         help="Comma-separated frame indices (empty = auto sample)")
     args    = parser.parse_args()

@@ -130,21 +130,45 @@ def cmd_fetch_and_analyse(config: dict, imdb_id: str | None = None,
 def cmd_render(config: dict, analysis_json: str):
     """Phase 2 + 3: Plot graph → composite video via ffmpeg."""
 
-    with open(analysis_json) as f:
+    analysis_path = Path(analysis_json)
+    with open(analysis_path) as f:
         analysis = json.load(f)
 
-    summary = analysis.get("summary", {})
+    summary  = analysis.get("summary", {})
     metadata = analysis.get("metadata", {})
-    binned = analysis.get("binned", [])
-    title = metadata.get("movie_title", "Unknown")
-    year = metadata.get("movie_year", "")
+    binned   = analysis.get("binned", [])
+    title    = metadata.get("movie_title", "Unknown").split("(")[0].strip()
+    year     = metadata.get("movie_year", "")
+
+    # Infer job slug from the analysis file path (e.g. fixtures/pulp_fiction/analysis.json)
+    job_slug = analysis_path.stem          # "analysis" if nested, else the id
+    if job_slug == "analysis":
+        job_slug = analysis_path.parent.name   # "pulp_fiction"
+
+    # Look for poster in output/<job_slug>/poster.jpg
+    poster_path = Path("output") / job_slug / "poster.jpg"
+    if not poster_path.exists():
+        poster_path = None
+
+    # Movie info dict for the banner overlay
+    movie_info = {
+        "Director":   metadata.get("director", ""),
+        "imdbRating": metadata.get("imdb_rating", ""),
+        "Runtime":    metadata.get("runtime", ""),
+        "Awards":     metadata.get("awards", ""),
+        "Actors":     metadata.get("actors", ""),
+    }
+
+    day_number = len(list(Path("results").glob("*.json"))) if Path("results").exists() else None
 
     print(f"🎬 Rendering video: {title} ({year})")
+    if poster_path:
+        print(f"   🖼️  Poster: {poster_path}")
 
     # Step 1: Generate animated graph frames
     from src.video.plotter import RagePlotter
     plotter = RagePlotter(config)
-    frames_dir = Path("output/graph_frames")
+    frames_dir = Path("output") / job_slug / "graph_frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     print("📈 Generating rage graph frames…")
     plotter_frames = plotter.generate_frames(binned, frames_dir)
@@ -153,46 +177,52 @@ def cmd_render(config: dict, analysis_json: str):
     # Step 2: Render all video segments as PNGs
     from src.video.compositor import VideoCompositor
     compositor = VideoCompositor(config)
-    render_dir = Path("output/render")
+    render_dir = Path("output") / job_slug / "render"
     print("🎞️ Rendering video segments…")
-    compositor.render_all(
+    render_result = compositor.render_all(
         output_dir=render_dir,
         title=title,
         year=year,
         plotter_frames=plotter_frames,
         summary=summary,
+        poster_path=poster_path,
+        movie_info=movie_info,
+        day_number=day_number,
     )
+    segment_timing = render_result["timing"]
 
-    # Step 3: Generate TTS audio
-    from src.video.tts import build_intro_audio, build_outro_audio
-    audio_dir = Path("output/audio")
-    audio_dir.mkdir(parents=True, exist_ok=True)
-    print("🔊 Generating TTS intro…")
-    intro_audio = audio_dir / "intro.mp3"
-    build_intro_audio(title, year, intro_audio, config)
+    # Step 3: Generate & mix audio via the audio pipeline
+    from src.audio.pipeline import AudioPipeline
+    audio_dir = Path("output") / job_slug / "audio"
+    print("🔊 Building audio layers…")
+    pipeline = AudioPipeline(config, audio_dir, segment_timing)
+    pipeline.build_layers(title, year, summary)
+    print(f"   → {len(pipeline.timeline.layers)} audio layer(s)")
+    pipeline.generate_all()
+    mixed_audio = audio_dir / "mixed.m4a"
+    pipeline.mix(mixed_audio)
+    print(f"   → Mixed audio: {mixed_audio}")
 
     # Step 4: Concatenate all PNG frames via ffmpeg into final MP4
     concat_dir = render_dir / "concat"
-    total_frames = len(list(concat_dir.glob("*.png")))
+    total_frames = render_result["total_frames"]
     if total_frames == 0:
         print("❌ No frames to render!")
         return
 
     fps = config.get("video", {}).get("fps", 30)
-    output_mp4 = Path("output") / f"{title.replace(' ', '_')}.mp4"
-    output_mp4.parent.mkdir(parents=True, exist_ok=True)
+    output_mp4 = Path("output") / job_slug / f"{title.replace(' ', '_')}.mp4"
 
     print(f"🎬 Encoding final video ({total_frames} frames @ {fps}fps)…")
     ffmpeg_cmd = [
         "ffmpeg", "-y",
         "-framerate", str(fps),
         "-i", str(concat_dir / "%05d.png"),
-        "-i", str(intro_audio),
+        "-i", str(mixed_audio),
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         "-preset", "medium",
-        "-c:a", "aac",
-        "-b:a", "128k",
+        "-c:a", "copy",
         "-shortest",
         str(output_mp4),
     ]
@@ -201,7 +231,6 @@ def cmd_render(config: dict, analysis_json: str):
         subprocess.run(ffmpeg_cmd, check=True)
         print(f"✅ Video saved → {output_mp4}")
     else:
-        # No ffmpeg? save frames as fallback
         print("⚠️ ffmpeg not found — frames saved to output/render/")
         print("   Install ffmpeg to produce the final MP4")
 
