@@ -135,6 +135,7 @@ class ElevenLabsProvider(AudioProvider):
 
     def _generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
         import os
+
         import requests
 
         api_key_env = kwargs.get("api_key_env") or self.config.get("api_key_env", "ELEVENLABS_API_KEY")
@@ -204,7 +205,7 @@ class SilenceProvider(AudioProvider):
         subprocess.run(
             [
                 "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", str(duration),
                 "-c:a", "aac", "-b:a", "128k",
                 str(output_path),

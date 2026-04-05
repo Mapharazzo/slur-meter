@@ -8,8 +8,8 @@ Takes a raw .srt file and the config dictionary, then outputs:
 import re
 from pathlib import Path
 
-import pysrt
 import pandas as pd
+import pysrt
 
 
 class ProfanityEngine:

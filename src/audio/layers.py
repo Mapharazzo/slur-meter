@@ -58,10 +58,10 @@ class AudioTimeline:
         self.layers.append(layer)
 
     def get_by_role(self, role: str) -> list[AudioLayer]:
-        return [l for l in self.layers if l.role == role]
+        return [layer for layer in self.layers if layer.role == role]
 
     def get_by_name(self, name: str) -> AudioLayer | None:
-        for l in self.layers:
-            if l.name == name:
-                return l
+        for layer in self.layers:
+            if layer.name == name:
+                return layer
         return None

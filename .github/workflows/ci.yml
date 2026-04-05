@@ -25,7 +25,7 @@ jobs:
           uv pip install -e ".[test]"
 
       - name: Lint with ruff
-        run: uv run ruff check src/ tests/
+        run: uv run ruff check src/ tests/ api/
 
       - name: Run unit tests
         run: uv run pytest tests/ -v --tb=short --ignore=tests/integration -m "not slow"

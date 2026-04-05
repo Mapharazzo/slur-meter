@@ -23,7 +23,7 @@ class AudioMixer:
 
     def mix(self, timeline: AudioTimeline, output_path: Path) -> Path:
         """Render *timeline* to a single audio file at *output_path*."""
-        layers = [l for l in timeline.layers if l.file and l.file.exists()]
+        layers = [layer for layer in timeline.layers if layer.file and layer.file.exists()]
         if not layers:
             # No audio layers — produce silence for the video duration
             return self._make_silence(timeline.total_duration, output_path)
@@ -76,7 +76,7 @@ class AudioMixer:
             mix_inputs.append(out_label)
 
         # Ducking: find TTS layers that duck others
-        duckers = [l for l in layers if l.duck_others]
+        duckers = [layer for layer in layers if layer.duck_others]
         if duckers:
             filter_parts, mix_inputs = self._apply_ducking(
                 filter_parts, mix_inputs, layers, duckers, total_dur
@@ -173,7 +173,6 @@ class AudioMixer:
         while the TTS plays.  Uses ffmpeg's volume filter with enable
         expressions for simplicity (no sidechain needed).
         """
-        ducker_indices = {id(l): i for i, l in enumerate(layers)}
         new_parts = list(filter_parts)
         new_inputs = list(mix_inputs)
 

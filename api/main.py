@@ -2,19 +2,16 @@
 
 import asyncio
 import json
-import os
-import re
 import sys
 from pathlib import Path
-from typing import Optional
 
+import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-import uvicorn
 
 # ─── Path setup ───────────────────────────────────────
 
@@ -22,22 +19,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR / ".env", override=True)
 
-from api.database import (
-    init_db,
-    upsert_job,
-    update_job,
-    get_job,
-    list_jobs,
-    get_steps,
-    get_costs,
+from api.database import (  # noqa: E402
     get_aggregate_costs,
-    get_releases,
-    upsert_release,
     get_alerts,
+    get_costs,
+    get_job,
+    get_releases,
     get_revenue,
+    get_steps,
+    init_db,
+    list_jobs,
+    upsert_job,
 )
-from src.data.opensubtitles import safe_imdb_id
-from api.pipeline import run_pipeline
+from api.pipeline import run_pipeline  # noqa: E402
+from src.data.opensubtitles import safe_imdb_id  # noqa: E402
 
 # ─── App ───────────────────────────────────────────────
 
@@ -64,8 +59,8 @@ def startup():
 # ─── Models ────────────────────────────────────────────
 
 class SubmitRequest(BaseModel):
-    imdb_id: Optional[str] = None
-    query: Optional[str] = None
+    imdb_id: str | None = None
+    query: str | None = None
 
 
 # ─── Jobs ──────────────────────────────────────────────
@@ -101,7 +96,7 @@ async def submit_job(req: SubmitRequest):
 
 @app.get("/api/jobs")
 async def list_all_jobs(
-    status: Optional[str] = Query(None),
+    status: str | None = Query(None),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
@@ -179,8 +174,8 @@ async def serve_frame(imdb_id: str, segment: str, frame_num: int):
 
 @app.get("/api/costs")
 async def aggregate_costs(
-    start: Optional[str] = Query(None),
-    end: Optional[str] = Query(None),
+    start: str | None = Query(None),
+    end: str | None = Query(None),
     group_by: str = Query("category"),
 ):
     return get_aggregate_costs(start=start, end=end, group_by=group_by)
@@ -189,7 +184,7 @@ async def aggregate_costs(
 # ─── Releases ─────────────────────────────────────────
 
 @app.get("/api/releases")
-async def list_releases(imdb_id: Optional[str] = Query(None)):
+async def list_releases(imdb_id: str | None = Query(None)):
     return get_releases(imdb_id=imdb_id)
 
 
@@ -238,7 +233,7 @@ async def alerts(limit: int = Query(50, ge=1, le=200)):
 # ─── Revenue (stubbed) ────────────────────────────────
 
 @app.get("/api/revenue")
-async def revenue(imdb_id: Optional[str] = Query(None)):
+async def revenue(imdb_id: str | None = Query(None)):
     return get_revenue(imdb_id=imdb_id)
 
 

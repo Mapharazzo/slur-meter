@@ -6,8 +6,8 @@ All timestamps are ISO 8601 UTC strings.
 
 import json
 import sqlite3
-from contextlib import contextmanager
-from datetime import datetime, timezone
+from contextlib import contextmanager, suppress
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +33,7 @@ def get_db():
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
@@ -43,10 +43,8 @@ def _row_to_dict(row: sqlite3.Row | None) -> dict | None:
     # Deserialize JSON columns
     for col in ("analysis_json", "movie_info", "segment_timing", "warnings", "detail", "metadata"):
         if col in d and isinstance(d[col], str):
-            try:
+            with suppress(json.JSONDecodeError, TypeError):
                 d[col] = json.loads(d[col])
-            except (json.JSONDecodeError, TypeError):
-                pass
     return d
 
 

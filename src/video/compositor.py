@@ -13,8 +13,7 @@ import re
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 GRAPH_H  = 1280   # top — animated plot
 POSTER_H = 640    # bottom — movie info + thumbnail
@@ -82,7 +81,7 @@ class VideoCompositor:
                   fill=self._hex(accent), width=1)
 
         # ── Movie details — vertically centered in remaining space (y: 140 – 640) ──
-        DETAIL_TOP = 140
+        DETAIL_TOP = 140  # noqa: N806
         detail_h   = POSTER_H - DETAIL_TOP
 
         has_meta    = bool(year or (runtime and runtime != "N/A") or (imdb_r and imdb_r != "N/A"))
@@ -91,11 +90,15 @@ class VideoCompositor:
         has_awards  = bool(awards and awards not in ("N/A", ""))
 
         block_h = 74   # title
-        if has_meta:    block_h += 50
-        if has_dir:     block_h += 54
-        if has_actors:  block_h += 52
+        if has_meta:
+            block_h += 50
+        if has_dir:
+            block_h += 54
+        if has_actors:
+            block_h += 52
         block_h += 28   # divider
-        if has_awards:  block_h += 40
+        if has_awards:
+            block_h += 40
 
         y = DETAIL_TOP + max(10, (detail_h - block_h) // 2)
 
@@ -106,9 +109,12 @@ class VideoCompositor:
 
         # ── Year · Runtime · ★ IMDb ──
         meta_parts = []
-        if year:                            meta_parts.append(year)
-        if runtime and runtime != "N/A":    meta_parts.append(runtime)
-        if imdb_r  and imdb_r  != "N/A":   meta_parts.append(f"★ {imdb_r}")
+        if year:
+            meta_parts.append(year)
+        if runtime and runtime != "N/A":
+            meta_parts.append(runtime)
+        if imdb_r and imdb_r != "N/A":
+            meta_parts.append(f"★ {imdb_r}")
         if meta_parts:
             draw.text((cx, y), "   ·   ".join(meta_parts),
                       fill=self.colors["dim"], font=self._font(30), anchor="mt")
@@ -240,7 +246,7 @@ class VideoCompositor:
         graph_bg = self._make_graph_bg(poster_path)
 
         # First plotter frame (graph at t=0) for fade-in
-        first_graph: "Image.Image | None" = None
+        first_graph: Image.Image | None = None
         if plotter_frames:
             first_graph = Image.open(str(plotter_frames[0])).convert("RGBA")
             first_graph = first_graph.resize((self.width, GRAPH_H), Image.LANCZOS)
@@ -359,7 +365,7 @@ class VideoCompositor:
 
         # Items: (text, color, font_size)
         # Header is drawn separately (always present); stats slam in one by one.
-        HEADER_Y = GRAPH_H // 2 - 330
+        HEADER_Y = GRAPH_H // 2 - 330  # noqa: N806
         stats = [
             (f"Hard Slurs:  {hard}",              self.colors["hard"],   34),
             (f"Soft Slurs:  {soft}",              self.colors["soft"],   34),
@@ -377,9 +383,9 @@ class VideoCompositor:
             y += fsize + 22 + gap
 
         # Animation timing: each item starts slamming SLAM_EVERY frames apart
-        SLAM_DUR   = 18   # frames for one item's slam animation
-        SLAM_EVERY = 22   # frames between each item's start
-        RATING_DELAY = 15  # extra pause before the rating slams in
+        SLAM_DUR = 18    # noqa: N806  # frames for one item's slam animation
+        SLAM_EVERY = 22  # noqa: N806  # frames between each item's start
+        RATING_DELAY = 15  # noqa: N806  # extra pause before the rating slams in
 
         start_frames = []
         t = 8  # first item starts at frame 8
@@ -388,7 +394,7 @@ class VideoCompositor:
             extra = RATING_DELAY if i == len(stats) - 2 else 0
             t += SLAM_EVERY + extra
 
-        DROP = 90  # pixels to drop from
+        DROP = 90  # noqa: N806  # pixels to drop from
 
         def slam_y(frame_idx, item_start, y_final):
             elapsed = frame_idx - item_start
@@ -440,9 +446,9 @@ class VideoCompositor:
         *verdict_start_offset* is the time (seconds) when the verdict segment
         begins within the full video — used to get absolute timestamps.
         """
-        SLAM_DUR = 18
-        SLAM_EVERY = 22
-        RATING_DELAY = 15
+        SLAM_DUR = 18      # noqa: N806
+        SLAM_EVERY = 22    # noqa: N806
+        RATING_DELAY = 15  # noqa: N806
 
         labels = ["hard_slurs", "soft_slurs", "f_bombs", "peak", "rating"]
 
@@ -547,7 +553,7 @@ class VideoCompositor:
                 VideoCompositor._emoji_font_cache = ImageFont.truetype(
                     self._EMOJI_FONT_PATH, self._EMOJI_NATIVE_SIZE
                 )
-            except (IOError, OSError):
+            except OSError:
                 VideoCompositor._emoji_font_cache = None
         return self._emoji_font_cache  # type: ignore[return-value]
 
@@ -655,7 +661,7 @@ class VideoCompositor:
         ]:
             try:
                 return ImageFont.truetype(path, size)
-            except IOError:
+            except OSError:
                 continue
         return ImageFont.load_default()
 

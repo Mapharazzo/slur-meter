@@ -1,7 +1,8 @@
 """Unit tests for analysis engine — isolated profanity detection."""
 
-import pytest
 from pathlib import Path
+
+import pytest
 
 from src.analysis.engine import ProfanityEngine
 

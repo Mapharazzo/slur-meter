@@ -10,7 +10,6 @@ Usage:
   upload_short("output/final.mp4", metadata={...})
 """
 
-import os
 from pathlib import Path
 
 
@@ -27,9 +26,9 @@ def upload_short(
     YouTube auto-classifies ≤60s vertical videos as Shorts.
     """
 
+    from google_auth_oauthlib.flow import InstalledAppFlow
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
-    from google_auth_oauthlib.flow import InstalledAppFlow
 
     # Scopes needed for YouTube uploads
     scopes = ["https://www.googleapis.com/auth/youtube.upload"]

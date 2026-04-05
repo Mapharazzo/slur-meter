@@ -1,10 +1,9 @@
 """Integration test: Full pipeline — fetch → analyse → render → metadata."""
 
+
 import pytest
-from pathlib import Path
 
 from src.analysis.engine import ProfanityEngine
-from src.video.compositor import VideoCompositor
 from src.publishing.metadata import generate_metadata
 
 

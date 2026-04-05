@@ -1,6 +1,5 @@
-import pytest
-from pathlib import Path
 from src.video.plotter import RagePlotter
+
 
 class TestRagePlotter:
     def test_generate_frames_returns_paths(self, test_config, tmp_path):

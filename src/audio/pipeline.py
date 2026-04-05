@@ -64,7 +64,6 @@ class AudioPipeline:
 
     def _music_prompt(self) -> str:
         """Generate a music prompt from movie context for AI music providers."""
-        rating = self._summary.get("rating", "")
         hard = self._summary.get("total_hard", 0)
         soft = self._summary.get("total_soft", 0)
         f_bombs = self._summary.get("total_f_bombs", 0)

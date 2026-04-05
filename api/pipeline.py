@@ -14,7 +14,7 @@ import re
 import shutil
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -23,18 +23,21 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env", override=True)
 
-from src.data.opensubtitles import OpenSubtitlesClient, SubtitleCache, safe_imdb_id
-from src.analysis.engine import ProfanityEngine
-from src.video.plotter import RagePlotter
-from src.video.compositor import VideoCompositor
-from src.audio.pipeline import AudioPipeline
-from src.publishing.metadata import generate_metadata
-
-from api.database import update_job, record_step, record_cost
+from api.database import record_cost, record_step, update_job  # noqa: E402
+from src.analysis.engine import ProfanityEngine  # noqa: E402
+from src.audio.pipeline import AudioPipeline  # noqa: E402
+from src.data.opensubtitles import (  # noqa: E402
+    OpenSubtitlesClient,
+    SubtitleCache,
+    safe_imdb_id,
+)
+from src.publishing.metadata import generate_metadata  # noqa: E402
+from src.video.compositor import VideoCompositor  # noqa: E402
+from src.video.plotter import RagePlotter  # noqa: E402
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _step(imdb_id: str, name: str, status: str, message: str = "",
@@ -63,6 +66,7 @@ def get_client():
 async def fetch_movie_info(imdb_id: str, output_dir: Path) -> tuple[dict, "Path | None"]:
     """Fetch movie metadata + poster from TMDB via IMDB ID."""
     import asyncio
+
     import requests as req
 
     token = os.environ.get("TMDB_READ_TOKEN", "")

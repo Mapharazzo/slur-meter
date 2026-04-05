@@ -1,12 +1,17 @@
 """Unit tests — data fetching module."""
 
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 
 from src.data.opensubtitles import (
-    OpenSubtitlesClient, SubtitleCache, SubtitleResult,
-    _clean_title, _safe_float, _to_srt_name, safe_imdb_id,
+    OpenSubtitlesClient,
+    SubtitleCache,
+    SubtitleResult,
+    _clean_title,
+    _safe_float,
+    _to_srt_name,
+    safe_imdb_id,
 )
 
 
