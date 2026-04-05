@@ -60,8 +60,64 @@ video:
     body: "assets/fonts/Montserrat-Regular.ttf"
     numbers: "assets/fonts/Montserrat-Bold.ttf"
 
-# ── Intro TTS Voice ──
+# ── Audio Pipeline ──
+# Each section can use a different provider: "edge", "file", "silence"
+# provider_config is passed directly to the provider's generate() method.
+audio:
+
+  # Intro voiceover (plays during intro_hold / intro_transition)
+  intro_tts:
+    enabled: true
+    provider: "edge"           # "edge" | "file" | "silence"
+    provider_config:
+      voice: "en-US-GuyNeural"
+      speed: 1.0
+    # text: ""                 # leave blank for auto-generated text
+    volume: 1.0
+    fade_out: 0.3
+    duck_amount: 0.25          # how much to duck music while this plays
+
+  # Outro voiceover (plays during verdict segment)
+  outro_tts:
+    enabled: true
+    provider: "edge"
+    provider_config:
+      voice: "en-US-GuyNeural"
+      speed: 1.0
+    # text: ""                 # leave blank for default outro text
+    volume: 1.0
+    fade_out: 0.5
+    start_offset: 4.0         # seconds into verdict before outro starts
+    duck_amount: 0.25
+
+  # Background music (loops for full video duration)
+  # provider: "file" for a local mp3, "lyria" for AI-generated per-movie
+  background_music:
+    enabled: false
+    provider: "lyria"
+    provider_config:
+      api_key_env: "OPENROUTER_API_KEY"
+      model: "google/lyria-3-pro-preview"
+    volume: 0.18
+    fade_in: 1.0
+    fade_out: 2.0
+
+  # Sound effects synced to verdict stat slams
+  verdict_sfx:
+    enabled: false             # flip to true once you have SFX files
+    provider: "file"
+    provider_config:
+      path: "assets/audio/slam.mp3"
+    slam_volume: 0.7
+    # Optional: different SFX for the final rating reveal
+    rating:
+      provider: "file"
+      provider_config:
+        path: "assets/audio/rating_reveal.mp3"
+      volume: 1.0
+
+# ── Legacy TTS config (kept for backwards compat, prefer audio.intro_tts) ──
 tts:
-  engine: "edge"              # "edge" = free Edge TTS; "openai" for premium
-  voice: "en-US-GuyNeural"    # Edge TTS voice ID
+  engine: "edge"
+  voice: "en-US-GuyNeural"
   speed: 1.0

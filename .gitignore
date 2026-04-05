@@ -82,3 +82,7 @@ webui/.env
 
 # Docker
 .dockerignore
+
+# Runtime data cache
+data/
+*.db
