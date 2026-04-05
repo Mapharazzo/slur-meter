@@ -151,7 +151,7 @@ class VideoCompositor:
     # ─────────────────────────────────────────────
 
     def _make_frame(self, graph_content: Image.Image,
-                    poster_area: Image.Image) -> np.ndarray:
+                    poster_area: Image.Image) -> Image.Image:
         """Combine poster info (top) and graph (bottom) into a full 1080×1920 frame."""
         frame = Image.new("RGB", (self.width, self.height),
                           self._hex(self.colors["bg"]))
@@ -164,7 +164,7 @@ class VideoCompositor:
             [(0, POSTER_H - bar_h // 2), (self.width, POSTER_H + bar_h // 2)],
             fill=self._hex(self.colors["accent"]),
         )
-        return np.array(frame)
+        return frame
 
     # ─────────────────────────────────────────────
     #  Shared background helper
@@ -192,7 +192,7 @@ class VideoCompositor:
         poster_path: "Path | None",
         day_number: "int | None" = None,
         duration: float = 2.0,
-    ) -> list[np.ndarray]:
+    ):
         """Full-canvas poster reveal with day banner overlay. No split layout yet."""
         n = int(duration * self.fps)
 
@@ -226,8 +226,8 @@ class VideoCompositor:
         draw.text((cx, canvas_h - 260), title,
                   fill=self.colors["text"], font=self._font(72), anchor="mt")
 
-        frame_arr = np.array(frame_img)
-        return [frame_arr] * n
+        for _ in range(n):
+            yield frame_img
 
     def render_intro_transition(
         self,
@@ -235,7 +235,7 @@ class VideoCompositor:
         poster_area: Image.Image,
         plotter_frames: "list[Path]",
         duration: float = 2.0,
-    ) -> list[np.ndarray]:
+    ):
         """Animate poster from full-canvas into the top 640px banner position.
 
         Simultaneously: poster blurs + darkens, brand banner fades in,
@@ -267,7 +267,6 @@ class VideoCompositor:
         else:
             dx, dy, dw, dh = 0, 0, self.width, POSTER_H
 
-        frames = []
         for i in range(n):
             t = i / max(n - 1, 1)
             te = t * t * (3 - 2 * t)   # smoothstep
@@ -319,9 +318,7 @@ class VideoCompositor:
                 bar_y = POSTER_H - 4
                 canvas.paste(bar, (0, bar_y), mask=bar.split()[3])
 
-            frames.append(np.array(canvas))
-
-        return frames
+            yield canvas
 
     def render_graph_segment(
         self,
@@ -329,21 +326,21 @@ class VideoCompositor:
         poster_area: Image.Image,
         poster_path: "Path | None" = None,
         duration: float = 47.0,
-    ) -> list[np.ndarray]:
+    ):
         n  = int(duration * self.fps)
         bg = self._make_graph_bg(poster_path)
 
         if not plotter_frames:
-            return [self._make_frame(bg, poster_area)] * n
+            for _ in range(n):
+                yield self._make_frame(bg, poster_area)
+            return
 
-        frames = []
         for i in range(n):
             content = bg.copy()
             graph_png = Image.open(str(plotter_frames[i % len(plotter_frames)])).convert("RGBA")
             graph_png = graph_png.resize((self.width, GRAPH_H), Image.LANCZOS)
             content.paste(graph_png, (0, 0), mask=graph_png.split()[3])
-            frames.append(self._make_frame(content, poster_area))
-        return frames
+            yield self._make_frame(content, poster_area)
 
     def render_verdict(
         self,
@@ -351,7 +348,7 @@ class VideoCompositor:
         summary: dict,
         poster_area: Image.Image,
         duration: float = 9.0,
-    ) -> list[np.ndarray]:
+    ):
         n  = int(duration * self.fps)
         s  = summary or {}
         rating = s.get("rating", "RATED")
@@ -409,7 +406,6 @@ class VideoCompositor:
                 offset = -12 * math.sin(t2 * math.pi) * (1 - t2)
             return int(y_final - offset)
 
-        frames = []
         for frame_idx in range(n):
             content = Image.new("RGB", (self.width, GRAPH_H),
                                 self._hex(self.colors["bg"]))
@@ -427,9 +423,7 @@ class VideoCompositor:
                 self._draw_with_emoji(draw, (cx, y_pos), text,
                                       fill=color, size=fsize, anchor="mt")
 
-            frames.append(self._make_frame(content, poster_area))
-
-        return frames
+            yield self._make_frame(content, poster_area)
 
     # ─────────────────────────────────────────────
     #  Verdict timing (for SFX sync)
@@ -514,8 +508,7 @@ class VideoCompositor:
             seg_dir = output_dir / seg_name
             seg_dir.mkdir(parents=True, exist_ok=True)
             start_frame = global_idx
-            for idx, frame in enumerate(segments[seg_name]):
-                img = Image.fromarray(frame)
+            for idx, img in enumerate(segments[seg_name]):
                 img.save(seg_dir / f"{idx:05d}.png")
                 img.save(all_dir / f"{global_idx:05d}.png")
                 global_idx += 1

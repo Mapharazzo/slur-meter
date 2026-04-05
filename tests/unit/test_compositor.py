@@ -13,16 +13,16 @@ class TestVideoCompositor:
 
     def test_intro_hold_shape(self, test_config):
         c = VideoCompositor(test_config)
-        frames = c.render_intro_hold("Test", poster_path=None, duration=0.5)
+        frames = list(c.render_intro_hold("Test", poster_path=None, duration=0.5))
         assert len(frames) == 15  # 0.5s × 30fps
-        assert frames[0].shape == (1920, 1080, 3)
+        assert frames[0].size == (1080, 1920)
 
     def test_intro_transition_shape(self, test_config):
         c = VideoCompositor(test_config)
         poster_area = Image.new("RGB", (1080, 640), (0, 0, 0))
-        frames = c.render_intro_transition(poster_path=None, poster_area=poster_area, plotter_frames=[], duration=0.5)
+        frames = list(c.render_intro_transition(poster_path=None, poster_area=poster_area, plotter_frames=[], duration=0.5))
         assert len(frames) == 15
-        assert frames[0].shape == (1920, 1080, 3)
+        assert frames[0].size == (1080, 1920)
 
     def test_verdict_shape(self, test_config):
         c = VideoCompositor(test_config)
@@ -32,17 +32,17 @@ class TestVideoCompositor:
             "peak_score": 15, "rating": "🚨 TOXIC AF",
         }
         poster_area = Image.new("RGB", (1080, 640), (0, 0, 0))
-        frames = c.render_verdict("Test", summary, poster_area, duration=0.5)
+        frames = list(c.render_verdict("Test", summary, poster_area, duration=0.5))
         assert len(frames) == 15
-        assert frames[0].shape == (1920, 1080, 3)
+        assert frames[0].size == (1080, 1920)
 
     def test_graph_empty(self, test_config):
         c = VideoCompositor(test_config)
         poster_area = Image.new("RGB", (1080, 640), (0, 0, 0))
-        frames = c.render_graph_segment([], poster_area, duration=0.5)
+        frames = list(c.render_graph_segment([], poster_area, duration=0.5))
         assert len(frames) == 15
         for f in frames:
-            assert f.shape == (1920, 1080, 3)
+            assert f.size == (1080, 1920)
 
 
 class TestRagePlotter:
