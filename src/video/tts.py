@@ -48,7 +48,6 @@ def build_intro_audio(movie_title: str, movie_year: str,
     tts_cfg = config.get("tts", {})
     voice = tts_cfg.get("voice", "en-US-GuyNeural")
     speed = tts_cfg.get("speed", 1.0)
-    rate = f"{int((speed - 1.0) * 100):+d}%"
     text = (
         f"How toxic is {movie_title} from {movie_year}? "
         "Let's check the Daily Slur Meter!"

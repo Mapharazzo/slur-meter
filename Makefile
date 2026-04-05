@@ -10,7 +10,7 @@ PORT    ?= 8001
 HOST    ?= 0.0.0.0
 
 .PHONY: help install test test-fast test-ci test-serve \
-        lint fix clean kill restart dev
+        lint fix clean kill restart dev render preview
 
 # ── Help ────────────────────────────────────
 help:
@@ -30,19 +30,19 @@ install-deps: ## Just install deps (don't re-run setup)
 
 # ── Tests ──────────────────────────────────
 test: ## Run ALL tests (unit + integration)
-	PYTHONPATH=. uv run pytest tests/ \
+	$(ACT) && PYTHONPATH=. $(PYTHON) -m pytest tests/ \
 	  -v --tb=short \
 	  --ignore=tests/integration 2>/dev/null || \
-	PYTHONPATH=. uv run pytest tests/ \
+	PYTHONPATH=. $(PYTHON) -m pytest tests/ \
 	  -v --tb=short \
 	  -m "not slow"
 
 test-fast: ## Fast subset only (unit, no I/O, no API)
-	PYTHONPATH=. uv run pytest tests/unit \
+	$(ACT) && PYTHONPATH=. $(PYTHON) -m pytest tests/unit \
 	  -v --tb=short
 
 test-ci: ## CI mode — junit xml + coverage
-	PYTHONPATH=. uv run pytest tests/ \
+	$(ACT) && PYTHONPATH=. $(PYTHON) -m pytest tests/ \
 	  -v --tb=short \
 	  --ignore=tests/integration \
 	  --junitxml=reports/junit.xml \
@@ -55,7 +55,7 @@ test-serve: ## Serve test coverage report
 
 # ── Dev Server ──────────────────────────────
 server: ## Start FastAPI API server (hot-reload, port 8001)
-	PYTHONPATH=. $(UV) run uvicorn api.main:app --host $(HOST) --port $(PORT) --reload
+	$(ACT) && PYTHONPATH=. $(PYTHON) -m uvicorn api.main:app --host $(HOST) --port $(PORT) --reload
 
 kill: ## Kill process on port $(PORT)
 	fuser -k -9 $(PORT)/tcp 2>/dev/null || echo "Nothing on $(PORT)"
@@ -63,20 +63,40 @@ kill: ## Kill process on port $(PORT)
 restart: kill ## Kill + start server on port $(PORT)
 	@sleep 1 && $(MAKE) server
 
-dev: server  ## Alias for 'make server'
+ui: ## Start Vite dev server (hot-reload, port 5173)
+	npm --prefix webui run dev
+
+dev: ## Start API + UI dev servers side-by-side (needs two terminals, or use tmux)
+	@echo "Run in two separate terminals:"
+	@echo "  make server   → API on :8001"
+	@echo "  make ui       → Vite on :5173 (proxies /api → :8001)"
+
+# ── Video ───────────────────────────────────
+JOB    ?= pulp_fiction
+SEG    ?= all
+FRAMES ?=
+
+render: ## Render full video  JOB=pulp_fiction  (uses fixtures/<JOB>/analysis.json or results/<JOB>.json)
+	@ANALYSIS=$$(test -f results/$(JOB).json && echo results/$(JOB).json || echo fixtures/$(JOB)/analysis.json); \
+	  test -f $$ANALYSIS || (echo "No analysis found for JOB=$(JOB)"; exit 1); \
+	  PYTHONPATH=. uv run python main.py --render-only $$ANALYSIS
+
+preview: ## Render preview frames  JOB=<id>  SEG=all|intro_hold|intro_transition|graph|verdict  FRAMES=0,30,59
+	PYTHONPATH=. uv run python scripts/dev_frames.py \
+	  --job $(JOB) --segment $(SEG) --frames "$(FRAMES)"
 
 # ── Lint / Fix ─────────────────────────────
 lint: ## Ruff lint check
-	$(ACTIVATE) && ruff check src/ api/ tests/
+	$(ACT) && ruff check src/ api/ tests/
 
 lint-fix: ## Ruff lint auto-fix
-	$(ACTIVATE) && ruff check --fix src/ api/ tests/
+	$(ACT) && ruff check --fix src/ api/ tests/
 
 format: ## Ruff format
-	$(ACTIVATE) && ruff format src/ api/ tests/
+	$(ACT) && ruff format src/ api/ tests/
 
 typecheck: ## mypy type check (optional)
-	$(ACTIVATE) && mypy src/ api/
+	$(ACT) && mypy src/ api/
 
 # ── Clean ──────────────────────────────────
 clean: ## Remove build artefacts + caches

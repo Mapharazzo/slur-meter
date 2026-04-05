@@ -1,12 +1,17 @@
 """Unit tests — data fetching module."""
 
+from unittest.mock import patch
+
 import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
 
 from src.data.opensubtitles import (
-    OpenSubtitlesClient, SubtitleCache, SubtitleResult,
-    _clean_title, _safe_float, _to_srt_name,
+    OpenSubtitlesClient,
+    SubtitleCache,
+    SubtitleResult,
+    _clean_title,
+    _safe_float,
+    _to_srt_name,
+    safe_imdb_id,
 )
 
 
@@ -25,6 +30,21 @@ class TestHelpers:
 
     def test_safe_float_invalid(self):
         assert _safe_float("abc") is None
+
+    def test_safe_imdb_id_numeric(self):
+        assert safe_imdb_id("110912") == "tt0110912"
+        assert safe_imdb_id(110912) == "tt0110912"
+
+    def test_safe_imdb_id_tt_already(self):
+        assert safe_imdb_id("tt0110912") == "tt0110912"
+
+    def test_safe_imdb_id_weird(self):
+        # This was causing the crash reported by user
+        assert safe_imdb_id("q_4fed600a11") == "q_4fed600a11"
+
+    def test_safe_imdb_id_empty(self):
+        assert safe_imdb_id("") is None
+        assert safe_imdb_id(None) is None
 
     def test_to_srt_name(self):
         assert _to_srt_name("movie.zip") == "movie.srt"
@@ -71,6 +91,26 @@ class TestOpenSubtitlesClient:
         assert len(results) == 1
         assert results[0].movie_title == "Django Unchained"
         assert results[0].file_id == "1001"
+
+    @patch("requests.Session.get")
+    def test_search_with_weird_id(self, mock_get, client):
+        mock_get.return_value.json.return_value = {
+            "data": [{
+                "id": 9999,
+                "attributes": {
+                    "feature_details": {
+                        "title": "Weird ID Item",
+                        "year": 2024,
+                        "imdb_id": "q_4fed600a11",
+                    },
+                    "files": [{"file_name": "weird.srt"}],
+                    "language": "en",
+                }
+            }]
+        }
+        mock_get.return_value.raise_for_status = lambda: None
+        results = client.search(query="Anything")
+        assert results[0].imdb_id == "q_4fed600a11"
 
     @patch("requests.Session.get")
     def test_search_by_query(self, mock_get, client):

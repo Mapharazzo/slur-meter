@@ -1,7 +1,5 @@
 """Unit tests — video compositor and plotter (no ffmpeg)."""
 
-import numpy as np
-import pytest
 from PIL import Image
 
 from src.video.compositor import VideoCompositor
@@ -13,11 +11,17 @@ class TestVideoCompositor:
         assert c.width == 1080
         assert c.height == 1920
 
-    def test_intro_shape(self, test_config):
+    def test_intro_hold_shape(self, test_config):
+        c = VideoCompositor(test_config)
+        frames = c.render_intro_hold("Test", poster_path=None, duration=0.5)
+        assert len(frames) == 15  # 0.5s × 30fps
+        assert frames[0].shape == (1920, 1080, 3)
+
+    def test_intro_transition_shape(self, test_config):
         c = VideoCompositor(test_config)
         poster_area = Image.new("RGB", (1080, 640), (0, 0, 0))
-        frames = c.render_intro("Test", "2024", poster_area, duration=0.5)
-        assert len(frames) == 15  # 0.5s × 30fps
+        frames = c.render_intro_transition(poster_path=None, poster_area=poster_area, plotter_frames=[], duration=0.5)
+        assert len(frames) == 15
         assert frames[0].shape == (1920, 1080, 3)
 
     def test_verdict_shape(self, test_config):

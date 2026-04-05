@@ -1,9 +1,10 @@
 # Shared test fixtures
 
-import pytest
+import sys
 from pathlib import Path
 
-import sys
+import pytest
+
 # Ensure project root is on sys.path so `from src.*` and `from api.*` work
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

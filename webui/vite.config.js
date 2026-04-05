@@ -6,7 +6,7 @@ export default defineConfig({
   server: {
     // Proxy API calls to FastAPI during dev
     proxy: {
-      '/api': 'http://localhost:8000',
+      '/api': 'http://localhost:8001',
     },
   },
 })

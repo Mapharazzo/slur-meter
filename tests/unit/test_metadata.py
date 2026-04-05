@@ -1,5 +1,5 @@
-import pytest
 from src.publishing.metadata import generate_metadata
+
 
 class TestMetadataGeneration:
     def test_clean_movie_metadata(self):

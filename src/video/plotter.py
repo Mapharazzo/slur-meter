@@ -11,15 +11,16 @@ Portrait format: 540×640 px per frame (scaled to 1080×1280 by the compositor).
 from pathlib import Path
 
 import matplotlib
-matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
-from scipy.interpolate import make_interp_spline
-import warnings
-warnings.filterwarnings("ignore", message="Glyph.*missing from font")
-
+import pandas as pd
 from PIL import Image, ImageDraw, ImageFont
+from scipy.interpolate import make_interp_spline
+
+matplotlib.use("Agg")
+import warnings
+
+warnings.filterwarnings("ignore", message="Glyph.*missing from font")
 
 
 class RagePlotter:
@@ -201,7 +202,7 @@ class RagePlotter:
             img.paste(Image.new("RGBA", (self.W - px, self.H), (0, 0, 0, 0)), (px, 0))
 
         # ── All PIL overlays rendered at 2× then scaled down for anti-aliasing ──
-        S = 8
+        S = 8  # noqa: N806  # supersampling factor for anti-aliasing
         ow, oh = self.W * S, self.H * S
         overlay = Image.new("RGBA", (ow, oh), (0, 0, 0, 0))
         odraw   = ImageDraw.Draw(overlay)
@@ -231,7 +232,7 @@ class RagePlotter:
             for p in font_paths:
                 try:
                     return ImageFont.truetype(p, size * S)
-                except IOError:
+                except OSError:
                     continue
             return ImageFont.load_default()
 
@@ -274,7 +275,7 @@ class RagePlotter:
         lx = (ow - total_w) // 2
         ly = 10 * S
 
-        for (lbl, rgb), iw in zip(legend_items, item_widths):
+        for (lbl, rgb), iw in zip(legend_items, item_widths, strict=False):
             c    = rgb + (220,)
             my   = ly + 7 * S
             odraw.line([(lx, my), (lx + line_w, my)], fill=c, width=3 * S)
