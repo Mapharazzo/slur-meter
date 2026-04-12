@@ -111,7 +111,9 @@ CREATE TABLE IF NOT EXISTS revenue (
     views       INTEGER DEFAULT 0,
     revenue_usd REAL DEFAULT 0.0,
     likes       INTEGER DEFAULT 0,
-    comments    INTEGER DEFAULT 0
+    comments    INTEGER DEFAULT 0,
+    shares      INTEGER DEFAULT 0,
+    fetched_at  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
@@ -120,12 +122,20 @@ CREATE INDEX IF NOT EXISTS idx_costs_imdb ON costs(imdb_id);
 CREATE INDEX IF NOT EXISTS idx_costs_category ON costs(category);
 CREATE INDEX IF NOT EXISTS idx_releases_imdb ON releases(imdb_id);
 CREATE INDEX IF NOT EXISTS idx_revenue_imdb ON revenue(imdb_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_revenue_unique ON revenue(imdb_id, platform, date);
 """
 
 
 def init_db():
     with get_db() as conn:
         conn.executescript(_SCHEMA)
+        # Migrations: add columns that may not exist in older databases
+        for migration in [
+            "ALTER TABLE revenue ADD COLUMN shares INTEGER DEFAULT 0",
+            "ALTER TABLE revenue ADD COLUMN fetched_at TEXT",
+        ]:
+            with suppress(Exception):
+                conn.execute(migration)
         now = _now()
         conn.execute(
             """UPDATE jobs 
@@ -379,7 +389,36 @@ def get_alerts(limit: int = 50) -> list[dict]:
         return alerts[:limit]
 
 
-# ─── Revenue (stubbed) ──────────────────────────────
+# ─── Revenue ────────────────────────────────────────
+
+def upsert_revenue(
+    imdb_id: str,
+    platform: str,
+    date: str,
+    views: int = 0,
+    revenue_usd: float = 0.0,
+    likes: int = 0,
+    comments: int = 0,
+    shares: int = 0,
+) -> dict:
+    """Insert or update a daily stats snapshot for a video on a platform."""
+    now = _now()
+    with get_db() as conn:
+        conn.execute(
+            """INSERT INTO revenue (imdb_id, platform, date, views, revenue_usd, likes, comments, shares, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(imdb_id, platform, date) DO UPDATE SET
+                 views=excluded.views, revenue_usd=excluded.revenue_usd,
+                 likes=excluded.likes, comments=excluded.comments,
+                 shares=excluded.shares, fetched_at=excluded.fetched_at""",
+            (imdb_id, platform, date, views, revenue_usd, likes, comments, shares, now),
+        )
+        row = conn.execute(
+            "SELECT * FROM revenue WHERE imdb_id = ? AND platform = ? AND date = ?",
+            (imdb_id, platform, date),
+        ).fetchone()
+        return dict(row)
+
 
 def get_revenue(imdb_id: str | None = None) -> list[dict]:
     with get_db() as conn:
@@ -390,3 +429,24 @@ def get_revenue(imdb_id: str | None = None) -> list[dict]:
         else:
             rows = conn.execute("SELECT * FROM revenue ORDER BY date DESC LIMIT 100").fetchall()
         return [dict(r) for r in rows]
+
+
+def get_platform_stats(imdb_id: str) -> list[dict]:
+    """Return the latest revenue snapshot per platform, joined with release info."""
+    with get_db() as conn:
+        rows = conn.execute(
+            """SELECT r.platform, r.views, r.revenue_usd, r.likes, r.comments,
+                      r.shares, r.date, r.fetched_at,
+                      rel.platform_id, rel.status AS release_status, rel.uploaded_at
+               FROM revenue r
+               LEFT JOIN releases rel
+                 ON r.imdb_id = rel.imdb_id AND r.platform = rel.platform
+               WHERE r.imdb_id = ?
+                 AND r.date = (
+                   SELECT MAX(r2.date) FROM revenue r2
+                   WHERE r2.imdb_id = r.imdb_id AND r2.platform = r.platform
+                 )
+               ORDER BY r.platform""",
+            (imdb_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]

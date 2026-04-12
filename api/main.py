@@ -24,12 +24,15 @@ from api.database import (  # noqa: E402
     get_alerts,
     get_costs,
     get_job,
+    get_platform_stats,
     get_releases,
     get_revenue,
     get_steps,
     init_db,
     list_jobs,
     upsert_job,
+    upsert_release,
+    upsert_revenue,
 )
 from api.pipeline import get_client, run_pipeline  # noqa: E402
 from src.data.opensubtitles import safe_imdb_id  # noqa: E402
@@ -223,6 +226,13 @@ async def get_job_releases(imdb_id: str):
 @app.get("/api/leaderboard")
 async def leaderboard():
     jobs = list_jobs(limit=500, status="done")
+
+    # Batch-fetch all releases so we don't hit the DB per-job
+    all_releases = get_releases()
+    releases_by_imdb: dict[str, list] = {}
+    for r in all_releases:
+        releases_by_imdb.setdefault(r["imdb_id"], []).append(r)
+
     ranked = []
     for j in jobs:
         analysis = j.get("analysis_json")
@@ -231,8 +241,39 @@ async def leaderboard():
         summary = analysis.get("summary") if isinstance(analysis, dict) else {}
         if not summary:
             continue
+
+        imdb_id = j["imdb_id"]
+
+        # Build per-platform release info
+        platforms: dict[str, dict] = {}
+        for rel in releases_by_imdb.get(imdb_id, []):
+            platforms[rel["platform"]] = {
+                "status": rel["status"],
+                "platform_id": rel.get("platform_id"),
+                "uploaded_at": rel.get("uploaded_at"),
+                "views": 0,
+                "likes": 0,
+                "comments": 0,
+                "shares": 0,
+                "revenue_usd": 0.0,
+            }
+
+        # Overlay latest revenue stats
+        for stat in get_platform_stats(imdb_id):
+            p = stat["platform"]
+            if p in platforms:
+                platforms[p].update({
+                    "views": stat.get("views", 0),
+                    "likes": stat.get("likes", 0),
+                    "comments": stat.get("comments", 0),
+                    "shares": stat.get("shares", 0),
+                    "revenue_usd": stat.get("revenue_usd", 0.0),
+                })
+
+        total_views = sum(p.get("views", 0) for p in platforms.values())
+
         ranked.append({
-            "imdb_id": j["imdb_id"],
+            "imdb_id": imdb_id,
             "label": j["label"],
             "rating": summary.get("rating", "N/A"),
             "hard": summary.get("total_hard", 0),
@@ -240,12 +281,127 @@ async def leaderboard():
             "f_bombs": summary.get("total_f_bombs", 0),
             "peak_score": summary.get("peak_score", 0),
             "peak_minute": summary.get("peak_minute", 0),
+            "platforms": platforms,
+            "total_views": total_views,
         })
+
     ranked.sort(
         key=lambda j: (j.get("hard", 0), j.get("f_bombs", 0)),
         reverse=True,
     )
     return ranked
+
+
+# ─── Publishing ───────────────────────────────────────
+
+SUPPORTED_PLATFORMS = {"youtube", "tiktok", "instagram"}
+
+
+@app.post("/api/jobs/{imdb_id}/publish/{platform}")
+async def publish_video(imdb_id: str, platform: str):
+    """Trigger upload of a completed job's video to a platform."""
+    if platform not in SUPPORTED_PLATFORMS:
+        raise HTTPException(400, f"platform must be one of: {', '.join(sorted(SUPPORTED_PLATFORMS))}")
+
+    job = get_job(imdb_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    if job.get("status") != "done":
+        raise HTTPException(400, "Job must be completed (status=done) before publishing")
+
+    video_path = BASE_DIR / "output" / imdb_id / "final.mp4"
+    if not video_path.exists():
+        raise HTTPException(404, "Video file not found")
+
+    analysis = job.get("analysis_json") or {}
+    summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
+    from src.publishing.metadata import generate_metadata
+    meta = generate_metadata(job["label"], summary)
+
+    upsert_release(imdb_id, platform, status="pending", metadata=meta)
+    asyncio.create_task(_do_publish(imdb_id, platform, video_path, meta))
+    return {"status": "publishing", "platform": platform, "imdb_id": imdb_id}
+
+
+async def _do_publish(imdb_id: str, platform: str, video_path: Path, meta: dict):
+    try:
+        if platform == "youtube":
+            from src.publishing.youtube import YouTubeClient
+            client = YouTubeClient()
+            vid_id = await asyncio.to_thread(
+                client.upload, video_path,
+                meta["video_title"], meta["description"], meta["tags"],
+            )
+        elif platform == "tiktok":
+            from src.publishing.tiktok import TikTokClient
+            client = TikTokClient()
+            vid_id = await asyncio.to_thread(
+                client.upload, video_path,
+                meta["video_title"], " ".join(meta["hashtags"]),
+            )
+        else:  # instagram
+            from src.publishing.instagram import InstagramClient
+            client = InstagramClient()
+            vid_id = await asyncio.to_thread(
+                client.upload, video_path,
+                meta["video_title"], " ".join(meta["hashtags"]),
+            )
+        upsert_release(imdb_id, platform, status="uploaded", platform_id=vid_id, metadata=meta)
+    except Exception as exc:
+        upsert_release(imdb_id, platform, status="failed", error=str(exc))
+
+
+# ─── Stats Refresh ────────────────────────────────────
+
+@app.post("/api/jobs/{imdb_id}/stats/refresh")
+async def refresh_stats(imdb_id: str):
+    """Pull latest stats from every platform this video has been published on."""
+    job = get_job(imdb_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    releases = get_releases(imdb_id=imdb_id)
+    published = [r for r in releases if r.get("status") == "uploaded" and r.get("platform_id")]
+    if not published:
+        raise HTTPException(400, "No uploaded releases found for this job")
+
+    asyncio.create_task(_do_refresh_stats(imdb_id, published))
+    return {"status": "refreshing", "platforms": [r["platform"] for r in published]}
+
+
+async def _do_refresh_stats(imdb_id: str, releases: list[dict]):
+    from datetime import date as _date
+    today = _date.today().isoformat()
+
+    for release in releases:
+        platform = release["platform"]
+        platform_id = release["platform_id"]
+        try:
+            if platform == "youtube":
+                from src.publishing.youtube import YouTubeClient
+                stats = await asyncio.to_thread(YouTubeClient().get_video_stats, platform_id)
+            elif platform == "tiktok":
+                from src.publishing.tiktok import TikTokClient
+                stats = await asyncio.to_thread(TikTokClient().get_video_stats, platform_id)
+            elif platform == "instagram":
+                from src.publishing.instagram import InstagramClient
+                stats = await asyncio.to_thread(InstagramClient().get_video_stats, platform_id)
+            else:
+                continue
+            upsert_revenue(imdb_id, platform, today, **stats)
+        except Exception:
+            pass
+
+
+# ─── Per-job Platform Stats ───────────────────────────
+
+@app.get("/api/jobs/{imdb_id}/platform-stats")
+async def job_platform_stats(imdb_id: str):
+    """Return latest stats snapshot per platform for a job."""
+    job = get_job(imdb_id)
+    if not job:
+        raise HTTPException(404, "Job not found")
+    return get_platform_stats(imdb_id)
 
 
 # ─── Alerts ────────────────────────────────────────────

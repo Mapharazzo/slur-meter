@@ -48,11 +48,22 @@ export const api = {
     return request('/releases')
   },
 
-  // Revenue (stubbed)
+  // Revenue
   getRevenue: (imdbId) => {
     const q = imdbId ? `?imdb_id=${imdbId}` : ''
     return request(`/revenue${q}`)
   },
+
+  // Publishing
+  publishVideo: (imdbId, platform) =>
+    request(`/jobs/${imdbId}/publish/${platform}`, { method: 'POST' }),
+
+  // Stats refresh (pulls latest from each platform)
+  refreshStats: (imdbId) =>
+    request(`/jobs/${imdbId}/stats/refresh`, { method: 'POST' }),
+
+  // Per-job platform stats breakdown
+  getPlatformStats: (imdbId) => request(`/jobs/${imdbId}/platform-stats`),
 
   // Analysis
   getAnalysis: (id) => request(`/analysis/${id}`),
