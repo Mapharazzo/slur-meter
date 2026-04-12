@@ -8,6 +8,7 @@ Fixes vs the old inline run_pipeline():
   5. Records per-step timing and costs to SQLite
 """
 
+import asyncio
 import json
 import os
 import re
@@ -74,6 +75,17 @@ async def fetch_movie_info(imdb_id: str, output_dir: Path) -> tuple[dict, "Path 
         return {}, None
 
     tt_id = safe_imdb_id(imdb_id)
+
+    cache_file = BASE_DIR / "results" / f"tmdb_{tt_id}.json"
+    cached_poster_path = output_dir / "poster.jpg"
+    if cache_file.exists():
+        try:
+            info = json.loads(cache_file.read_text())
+            if cached_poster_path.exists():
+                return info, cached_poster_path
+        except Exception:
+            pass
+
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     loop = asyncio.get_event_loop()
 
@@ -143,6 +155,8 @@ async def fetch_movie_info(imdb_id: str, output_dir: Path) -> tuple[dict, "Path 
     if not info:
         return {}, None
 
+    cache_file.write_text(json.dumps(info))
+
     poster_path = None
     raw_poster = info.get("poster_path", "")
     if raw_poster:
@@ -185,34 +199,37 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
 
         sub_results = []
         srt_path = None
+        real_imdb_id: str | None = None  # actual tt-id from subtitle results
 
         if imdb_id_input:
+            real_imdb_id = imdb_id_input
             cached = cache.has(imdb_id_input)
             if cached:
                 srt_path = cached
             else:
-                sub_results = client.search(imdb_id=imdb_id_input, language="en", limit=8)
+                sub_results = await asyncio.to_thread(client.search, imdb_id=imdb_id_input, language="en", limit=8)
                 if not sub_results:
                     _step(imdb_id, "fetch", "failed", "No subtitles found")
                     update_job(imdb_id, status="failed", error="No subtitles found!")
                     return
                 best = sub_results[0]
                 update_job(imdb_id, label=f"{best.movie_title} ({best.movie_year})")
-                srt_path = client.download(best.file_id, dest_dir=str(tmp_dir))
+                srt_path = await asyncio.to_thread(client.download, best.file_id, dest_dir=str(tmp_dir))
                 srt_path = cache.store(imdb_id_input, srt_path)
         elif query:
-            sub_results = client.search(query=query, language="en", limit=8)
+            sub_results = await asyncio.to_thread(client.search, query=query, language="en", limit=8)
             if not sub_results:
                 _step(imdb_id, "fetch", "failed", "No subtitles found")
                 update_job(imdb_id, status="failed", error="No subtitles found!")
                 return
             best = sub_results[0]
+            real_imdb_id = best.imdb_id or None
             update_job(imdb_id, label=f"{best.movie_title} ({best.movie_year})")
             cached = cache.has(best.imdb_id) if best.imdb_id else None
             if cached:
                 srt_path = cached
             else:
-                srt_path = client.download(best.file_id, dest_dir=str(tmp_dir))
+                srt_path = await asyncio.to_thread(client.download, best.file_id, dest_dir=str(tmp_dir))
                 if best.imdb_id:
                     srt_path = cache.store(best.imdb_id, srt_path)
 
@@ -230,7 +247,7 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
         update_job(imdb_id, status="analysing", progress=35, message="Scanning for profanity…")
 
         engine = ProfanityEngine(cfg)
-        analysis = engine.analyse_srt(srt_path)
+        analysis = await asyncio.to_thread(engine.analyse_srt, srt_path)
 
         job = update_job(imdb_id, progress=35)
         label = job["label"] if job else imdb_id
@@ -248,10 +265,11 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
         with open(analysis_file, "w") as f:
             json.dump(analysis, f, indent=2, default=str)
 
+        _step(imdb_id, "analyse", "running", "Fetching movie info…")
         update_job(imdb_id, progress=55, message="Analysis complete — fetching movie info…")
 
         # ── Fetch poster + movie info ──
-        movie_info, poster_path = await fetch_movie_info(imdb_id, output_dir)
+        movie_info, poster_path = await fetch_movie_info(real_imdb_id or imdb_id, output_dir)
 
         tmdb_calls = 3 if movie_info else 1  # find + details + credits
         record_cost(imdb_id, "api_tmdb", "tmdb", amount_usd=0.0, units=tmdb_calls,
@@ -274,8 +292,8 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
                 )
                 for candidate in sub_results[1:]:
                     try:
-                        new_srt = client.download(candidate.file_id, dest_dir=str(tmp_dir))
-                        new_analysis = engine.analyse_srt(new_srt)
+                        new_srt = await asyncio.to_thread(client.download, candidate.file_id, dest_dir=str(tmp_dir))
+                        new_analysis = await asyncio.to_thread(engine.analyse_srt, new_srt)
                         new_binned = new_analysis.get("binned", [])
                         new_dur = max((b["minute"] for b in new_binned), default=0.0)
                         if new_dur > sub_dur:
@@ -312,34 +330,43 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
 
         # ── Step 3: Generate graph frames ──
         t0 = time.monotonic()
-        _step(imdb_id, "graph", "running", "Generating rage graph frames…")
-        update_job(imdb_id, status="rendering", progress=60,
-                   message="Drawing rage graph…")
-
-        plotter = RagePlotter(cfg)
         frames_dir = output_dir / "graph_frames"
-        runtime_str = movie_info.get("Runtime", "")
-        plot_runtime = None
-        if runtime_str:
-            m = re.search(r"(\d+)", runtime_str)
-            if m:
-                plot_runtime = float(m.group(1))
-        frames = plotter.generate_frames(
-            analysis.get("binned", []),
-            frames_dir,
-            n_frames=450,
-            runtime_min=plot_runtime,
-        )
+        existing_frames = sorted(frames_dir.glob("frame_*.png")) if frames_dir.exists() else []
+        if len(existing_frames) == 450:
+            frames = existing_frames
+            _step(imdb_id, "graph", "done", f"{len(frames)} frames (cached)",
+                  finished_at=_now(), duration_ms=0)
+        else:
+            _step(imdb_id, "graph", "running", "Generating rage graph frames…")
+            update_job(imdb_id, status="rendering", progress=60,
+                       message="Drawing rage graph…")
 
-        dt_graph = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "graph", "done", f"{len(frames)} frames generated",
-              finished_at=_now(), duration_ms=dt_graph)
+            plotter = RagePlotter(cfg)
+            runtime_str = movie_info.get("Runtime", "")
+            plot_runtime = None
+            if runtime_str:
+                m = re.search(r"(\d+)", runtime_str)
+                if m:
+                    plot_runtime = float(m.group(1))
+
+            def graph_cb(msg: str, curr: int, total: int):
+                _step(imdb_id, "graph", "running", f"Generating rage graph frames… [{curr}/{total}]")
+
+            frames = await asyncio.to_thread(
+                plotter.generate_frames,
+                analysis.get("binned", []),
+                frames_dir,
+                n_frames=450,
+                runtime_min=plot_runtime,
+                progress_cb=graph_cb,
+            )
+
+            dt_graph = int((time.monotonic() - t0) * 1000)
+            _step(imdb_id, "graph", "done", f"{len(frames)} frames generated",
+                  finished_at=_now(), duration_ms=dt_graph)
 
         # ── Step 4: Composite video segments ──
         t0 = time.monotonic()
-        _step(imdb_id, "composite", "running", "Compositing video segments…")
-        update_job(imdb_id, progress=75, message="Compositing video…")
-
         title = label.split("(")[0].strip()
         year = ""
         if "(" in label and ")" in label:
@@ -347,26 +374,65 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
 
         day_number = len(list(results_dir.glob("*.json")))
 
-        compositor = VideoCompositor(cfg)
-        render_result = compositor.render_all(
-            output_dir=output_dir / "render",
-            title=title,
-            year=year,
-            plotter_frames=frames,
-            summary=analysis.get("summary", {}),
-            poster_path=poster_path,
-            movie_info=movie_info,
-            day_number=day_number,
+        render_dir = output_dir / "render"
+        _SEGMENTS = ["intro_hold", "intro_transition", "graph", "verdict"]
+        cached_render = render_dir.exists() and all(
+            any((render_dir / seg).glob("*.png")) for seg in _SEGMENTS
         )
-        segment_timing = render_result["timing"]
-        total_frames = render_result["total_frames"]
+        if cached_render:
+            # Reconstruct timing from existing frame counts
+            fps = cfg.get("video", {}).get("fps", 30)
+            segment_timing: dict = {}
+            global_idx = 0
+            for seg in _SEGMENTS:
+                seg_frames = sorted((render_dir / seg).glob("*.png"))
+                n = len(seg_frames)
+                segment_timing[seg] = {
+                    "start_frame": global_idx,
+                    "end_frame": global_idx + n - 1,
+                    "start_time": global_idx / fps,
+                    "end_time": (global_idx + n) / fps,
+                    "num_frames": n,
+                }
+                global_idx += n
+            total_frames = global_idx
+            update_job(imdb_id, segment_timing=segment_timing)
+            _step(imdb_id, "composite", "done",
+                  f"{total_frames} frames (cached)", finished_at=_now(), duration_ms=0)
+        else:
+            _step(imdb_id, "composite", "running", "Compositing video segments…")
+            update_job(imdb_id, progress=75, message="Compositing video…")
 
-        update_job(imdb_id, segment_timing=segment_timing)
+            compositor = VideoCompositor(cfg)
 
-        dt_composite = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "composite", "done",
-              f"{total_frames} frames composited",
-              finished_at=_now(), duration_ms=dt_composite)
+            def render_cb(seg_name: str, curr: int = 0, tot: int = 1):
+                prog = f" [{curr}/{tot}]" if tot > 1 else ""
+                msg = f"Compositing {seg_name.replace('_', ' ')}…{prog}"
+                _step(imdb_id, "composite", "running", msg)
+                if tot <= 1 or curr % 15 == 0:
+                    update_job(imdb_id, message=msg)
+
+            render_result = await asyncio.to_thread(
+                compositor.render_all,
+                output_dir=render_dir,
+                title=title,
+                year=year,
+                plotter_frames=frames,
+                summary=analysis.get("summary", {}),
+                poster_path=poster_path,
+                movie_info=movie_info,
+                day_number=day_number,
+                progress_cb=render_cb,
+            )
+            segment_timing = render_result["timing"]
+            total_frames = render_result["total_frames"]
+
+            update_job(imdb_id, segment_timing=segment_timing)
+
+            dt_composite = int((time.monotonic() - t0) * 1000)
+            _step(imdb_id, "composite", "done",
+                  f"{total_frames} frames composited",
+                  finished_at=_now(), duration_ms=dt_composite)
 
         # ── Step 5: Audio pipeline ──
         t0 = time.monotonic()
@@ -377,10 +443,14 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
         summary = analysis.get("summary", {})
 
         pipeline = AudioPipeline(cfg, audio_dir, segment_timing)
-        pipeline.build_layers(title, year, summary)
-        pipeline.generate_all()
         mixed_audio = audio_dir / "mixed.m4a"
-        pipeline.mix(mixed_audio)
+        
+        def _do_audio():
+            pipeline.build_layers(title, year, summary)
+            pipeline.generate_all()
+            pipeline.mix(mixed_audio)
+            
+        await asyncio.to_thread(_do_audio)
 
         # Track TTS cost
         for layer in pipeline.timeline.layers:
@@ -427,7 +497,8 @@ async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: st
         ]
 
         if shutil.which("ffmpeg"):
-            subprocess.run(
+            await asyncio.to_thread(
+                subprocess.run,
                 ffmpeg_cmd, check=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             )

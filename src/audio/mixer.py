@@ -180,33 +180,37 @@ class AudioMixer:
             if layer.duck_others:
                 continue  # don't duck the ducker
 
-            # Check if any ducker overlaps this layer
+            # Collect all overlapping duck windows for this layer
+            windows: list[tuple[float, float, float]] = []  # (start, end, vol)
             for ducker in duckers:
                 d_start = ducker.start
-                d_end = ducker.end or (d_start + 10.0)  # estimate TTS length
+                d_end = ducker.end or (d_start + 10.0)
                 l_start = layer.start
                 l_end = layer.end or total_dur
-
-                # Overlap?
                 if d_start < l_end and d_end > l_start:
-                    # Re-label the layer output with a ducked version
-                    old_label = f"[a{layer_idx}]"
-                    ducked_label = f"[a{layer_idx}d]"
+                    windows.append((d_start, d_end, ducker.duck_amount))
 
-                    # Volume filter with enable window
-                    duck_vol = ducker.duck_amount
-                    duck_filter = (
-                        f"{old_label}"
-                        f"volume=volume={duck_vol:.2f}"
-                        f":enable='between(t,{d_start:.2f},{d_end:.2f})'"
-                        f"{ducked_label}"
-                    )
-                    new_parts.append(duck_filter)
+            if not windows:
+                continue
 
-                    # Swap in the ducked label
-                    for j, inp in enumerate(new_inputs):
-                        if inp == old_label:
-                            new_inputs[j] = ducked_label
+            # Chain filters so each step consumes the previous output label
+            current_label = f"[a{layer_idx}]"
+            for win_idx, (d_start, d_end, duck_vol) in enumerate(windows):
+                is_last = win_idx == len(windows) - 1
+                next_label = f"[a{layer_idx}d]" if is_last else f"[a{layer_idx}d{win_idx}]"
+                new_parts.append(
+                    f"{current_label}"
+                    f"volume=volume={duck_vol:.2f}"
+                    f":enable='between(t,{d_start:.2f},{d_end:.2f})'"
+                    f"{next_label}"
+                )
+                current_label = next_label
+
+            # Swap in the final ducked label in mix_inputs
+            base_label = f"[a{layer_idx}]"
+            for j, inp in enumerate(new_inputs):
+                if inp == base_label:
+                    new_inputs[j] = current_label
 
         return new_parts, new_inputs
 

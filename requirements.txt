@@ -21,6 +21,7 @@ Pillow>=10.0.0
 
 # TTS
 edge-tts>=6.1.9
+elevenlabs>=1.0.0
 
 # Publishing
 google-api-python-client>=2.108.0

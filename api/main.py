@@ -31,7 +31,7 @@ from api.database import (  # noqa: E402
     list_jobs,
     upsert_job,
 )
-from api.pipeline import run_pipeline  # noqa: E402
+from api.pipeline import get_client, run_pipeline  # noqa: E402
 from src.data.opensubtitles import safe_imdb_id  # noqa: E402
 
 # ─── App ───────────────────────────────────────────────
@@ -69,27 +69,42 @@ class SubmitRequest(BaseModel):
 async def submit_job(req: SubmitRequest):
     """Submit a movie for full pipeline processing.
 
-    If imdb_id is provided, the job is keyed on it (upsert).
-    If only query is given, a search is done first to resolve the IMDB ID.
+    If imdb_id is provided, the job is keyed on it.
+    If only query is given, a subtitle search is done first to resolve the IMDB ID.
     """
     if not req.imdb_id and not req.query:
         raise HTTPException(status_code=400, detail="Provide either imdb_id or query")
 
-    # Normalise IMDB ID
     imdb_id = safe_imdb_id(req.imdb_id) if req.imdb_id else ""
-
-    # For query-only submissions, use query as temporary key until pipeline resolves
-    if not imdb_id:
-        # Temporary key — pipeline will update label once IMDB ID is found
-        import hashlib
-        imdb_id = "q_" + hashlib.md5(req.query.encode()).hexdigest()[:10]
-
+    resolved_imdb_id: str | None = req.imdb_id or None  # passed to pipeline as imdb_id_input
     label = req.query or imdb_id
+
+    if not imdb_id and req.query:
+        # Resolve query → real IMDB ID via subtitle search
+        try:
+            client = get_client()
+            results = await asyncio.to_thread(client.search, query=req.query, language="en", limit=1)
+            if results and results[0].imdb_id:
+                best = results[0]
+                imdb_id = safe_imdb_id(best.imdb_id)
+                resolved_imdb_id = best.imdb_id
+                label = f"{best.movie_title} ({best.movie_year})"
+        except Exception:
+            pass
+
+        if not imdb_id:
+            # Fallback if search failed
+            import hashlib
+            imdb_id = "q_" + hashlib.md5(req.query.encode()).hexdigest()[:10]
+
+    existing = get_job(imdb_id)
+    if existing and existing.get("status") in ["queued", "fetching", "analysing", "rendering", "encoding"]:
+        return existing
+
     job = upsert_job(imdb_id=imdb_id, label=label, query=req.query or "")
 
-    # Fire off pipeline in background
     asyncio.create_task(
-        run_pipeline(imdb_id, query=req.query, imdb_id_input=req.imdb_id)
+        run_pipeline(imdb_id, query=req.query, imdb_id_input=resolved_imdb_id)
     )
     return job
 
@@ -171,6 +186,16 @@ async def serve_frame(imdb_id: str, segment: str, frame_num: int):
 
 
 # ─── Costs ─────────────────────────────────────────────
+
+@app.get("/api/jobs/{imdb_id}/preview")
+async def serve_preview_frame(imdb_id: str):
+    from fastapi.responses import Response
+    preview_path = BASE_DIR / "output" / imdb_id / "preview.png"
+    if preview_path.exists():
+        data = preview_path.read_bytes()
+        return Response(content=data, media_type="image/png",
+                        headers={"Cache-Control": "no-store"})
+    raise HTTPException(status_code=404, detail="Preview not ready")
 
 @app.get("/api/costs")
 async def aggregate_costs(

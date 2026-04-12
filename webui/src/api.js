@@ -26,6 +26,7 @@ export const api = {
 
   // Videos & Frames
   videoUrl: (id) => `${API}/videos/${id}`,
+  previewUrl: (id) => `${API}/jobs/${id}/preview`,
   getSegmentInfo: (id, segment) => request(`/videos/${id}/segments/${segment}`),
   frameUrl: (id, segment, frame) => `${API}/videos/${id}/frames/${segment}/${frame}`,
 

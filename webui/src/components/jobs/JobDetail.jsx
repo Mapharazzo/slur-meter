@@ -88,7 +88,7 @@ export default function JobDetail() {
       </div>
 
       {/* Pipeline steps */}
-      <PipelineSteps steps={job.steps || []} />
+      <PipelineSteps steps={job.steps || []} imdbId={imdbId} isActive={isActive} />
 
       {/* Results */}
       {isDone && (

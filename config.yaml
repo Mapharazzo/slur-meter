@@ -68,10 +68,10 @@ audio:
   # Intro voiceover (plays during intro_hold / intro_transition)
   intro_tts:
     enabled: true
-    provider: "edge"           # "edge" | "file" | "silence"
+    provider: "elevenlabs"     # "edge" | "file" | "silence" | "elevenlabs"
     provider_config:
-      voice: "en-US-GuyNeural"
-      speed: 1.0
+      voice_id: "pNInz6obpgDQGcFmaJgB"
+
     # text: ""                 # leave blank for auto-generated text
     volume: 1.0
     fade_out: 0.3
@@ -80,10 +80,10 @@ audio:
   # Outro voiceover (plays during verdict segment)
   outro_tts:
     enabled: true
-    provider: "edge"
+    provider: "elevenlabs"
     provider_config:
-      voice: "en-US-GuyNeural"
-      speed: 1.0
+      voice_id: "pNInz6obpgDQGcFmaJgB"
+
     # text: ""                 # leave blank for default outro text
     volume: 1.0
     fade_out: 0.5
@@ -93,7 +93,7 @@ audio:
   # Background music (loops for full video duration)
   # provider: "file" for a local mp3, "lyria" for AI-generated per-movie
   background_music:
-    enabled: false
+    enabled: true
     provider: "lyria"
     provider_config:
       api_key_env: "OPENROUTER_API_KEY"

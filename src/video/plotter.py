@@ -50,6 +50,7 @@ class RagePlotter:
         output_dir: str | Path,
         n_frames: int = 450,
         runtime_min: "float | None" = None,
+        progress_cb=None,
     ) -> list[Path]:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -65,6 +66,11 @@ class RagePlotter:
             path = self._stamp_progress(base, max_x, display_max, progress,
                                         output_dir / f"frame_{i:05d}.png")
             frames.append(path)
+            if i % 15 == 0:
+                import shutil
+                shutil.copy(path, output_dir.parent / "preview.png")
+                if progress_cb: progress_cb("Generating...", i, n_frames)
+        if progress_cb: progress_cb("Generating...", n_frames, n_frames)
         return frames
 
     def generate_specific_frames(

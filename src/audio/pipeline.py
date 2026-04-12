@@ -245,6 +245,22 @@ class AudioPipeline:
             )
             layer.file = output_file
 
+            # For TTS layers that duck others, set end from actual audio duration
+            # so the duck window matches the real voiceover length.
+            if layer.duck_others and layer.end is None and output_file.exists():
+                import json as _json
+                import subprocess as _sp
+                try:
+                    r = _sp.run(
+                        ["ffprobe", "-v", "quiet", "-print_format", "json",
+                         "-show_streams", str(output_file)],
+                        capture_output=True, text=True, check=True,
+                    )
+                    dur = float(_json.loads(r.stdout)["streams"][0]["duration"])
+                    layer.end = layer.start + dur
+                except Exception:
+                    pass
+
     # ─────────────────────────────────────────────
     #  Mix down to final audio track
     # ─────────────────────────────────────────────

@@ -59,6 +59,7 @@ class VideoCompositor:
     ) -> Image.Image:
         """Return a 1080×640 PIL image: brand banner + movie info card."""
         img = Image.new("RGB", (self.width, POSTER_H), self._hex(self.colors["bg"]))
+            
         draw = ImageDraw.Draw(img)
 
         info     = movie_info or {}
@@ -337,9 +338,10 @@ class VideoCompositor:
             return [self._make_frame(bg, poster_area)] * n
 
         frames = []
+        last = len(plotter_frames) - 1
         for i in range(n):
             content = bg.copy()
-            graph_png = Image.open(str(plotter_frames[i % len(plotter_frames)])).convert("RGBA")
+            graph_png = Image.open(str(plotter_frames[min(i, last)])).convert("RGBA")
             graph_png = graph_png.resize((self.width, GRAPH_H), Image.LANCZOS)
             content.paste(graph_png, (0, 0), mask=graph_png.split()[3])
             frames.append(self._make_frame(content, poster_area))
@@ -486,17 +488,26 @@ class VideoCompositor:
         poster_path: "Path | None" = None,
         movie_info: "dict | None" = None,
         day_number: "int | None" = None,
+        progress_cb=None,
     ) -> dict:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
         poster_area = self.render_poster_area(title, year, poster_path, movie_info, day_number)
 
+        if progress_cb: progress_cb("intro_hold", 0, 1)
         intro_hold       = self.render_intro_hold(title, poster_path, day_number)
+        
+        if progress_cb: progress_cb("intro_transition", 0, 1)
         intro_transition = self.render_intro_transition(
             poster_path, poster_area, plotter_frames or []
         )
-        graph   = self.render_graph_segment(plotter_frames or [], poster_area, poster_path)
+        
+        if progress_cb: progress_cb("graph", 0, 1)
+        graph_duration = (len(plotter_frames) / self.fps + 1.0) if plotter_frames else 47.0
+        graph   = self.render_graph_segment(plotter_frames or [], poster_area, poster_path, duration=graph_duration)
+        
+        if progress_cb: progress_cb("verdict", 0, 1)
         verdict = self.render_verdict(title, summary or {}, poster_area)
 
         segments = {
@@ -514,11 +525,20 @@ class VideoCompositor:
             seg_dir = output_dir / seg_name
             seg_dir.mkdir(parents=True, exist_ok=True)
             start_frame = global_idx
+            
+            total_seg = len(segments[seg_name])
             for idx, frame in enumerate(segments[seg_name]):
                 img = Image.fromarray(frame)
                 img.save(seg_dir / f"{idx:05d}.png")
                 img.save(all_dir / f"{global_idx:05d}.png")
+                if global_idx % 15 == 0:
+                    img.save(output_dir.parent / "preview.png")
+                    if progress_cb: progress_cb(seg_name, idx, total_seg)
                 global_idx += 1
+                
+            if progress_cb and total_seg > 0:
+                progress_cb(seg_name, total_seg, total_seg)
+                
             segment_timing[seg_name] = {
                 "start_frame": start_frame,
                 "end_frame": global_idx - 1,

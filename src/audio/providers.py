@@ -137,6 +137,8 @@ class ElevenLabsProvider(AudioProvider):
         import os
 
         import requests
+        from dotenv import load_dotenv
+        load_dotenv(override=True)
 
         api_key_env = kwargs.get("api_key_env") or self.config.get("api_key_env", "ELEVENLABS_API_KEY")
         api_key = os.environ.get(api_key_env)

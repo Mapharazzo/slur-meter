@@ -126,6 +126,19 @@ CREATE INDEX IF NOT EXISTS idx_revenue_imdb ON revenue(imdb_id);
 def init_db():
     with get_db() as conn:
         conn.executescript(_SCHEMA)
+        now = _now()
+        conn.execute(
+            """UPDATE jobs 
+               SET status = 'failed', error = 'Interrupted by server restart', updated_at = ?
+               WHERE status IN ('queued', 'fetching', 'analysing', 'rendering', 'encoding', 'running')""",
+            (now,)
+        )
+        conn.execute(
+            """UPDATE job_steps 
+               SET status = 'failed', message = 'Interrupted by server restart', finished_at = ?
+               WHERE status IN ('pending', 'running')""",
+            (now,)
+        )
 
 
 # ─── Jobs CRUD ───────────────────────────────────────
