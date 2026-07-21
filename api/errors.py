@@ -12,12 +12,24 @@ from api.domain import FailureCategory
 if TYPE_CHECKING:
     from api.settings import Settings
 
+try:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+    from requests.exceptions import ReadTimeout
+except ImportError:  # pragma: no cover - requests is an application dependency.
+    _REQUESTS_TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = ()
+else:
+    _REQUESTS_TRANSIENT_EXCEPTIONS = (ReadTimeout, RequestsConnectionError)
+
 
 _BEARER_RE = re.compile(r"\bbearer\s+[^\s,;]+", re.IGNORECASE)
-_COOKIE_RE = re.compile(r"\b(set-cookie|cookie)\s*:\s*[^;\r\n]+", re.IGNORECASE)
+_COOKIE_HEADER_RE = re.compile(
+    r"^(?P<name>set-cookie|cookie)\s*:\s*[^\r\n]*", re.IGNORECASE | re.MULTILINE
+)
 _COOKIE_VALUE_RE = re.compile(r"\b(?:session|cookie|auth(?:entication)?)\w*=[^;\s,&]+", re.IGNORECASE)
 _QUERY_SECRET_RE = re.compile(
-    r"([?&](?:access_token|api[_-]?key|token|secret|password|credential)=[^&#\s]+)",
+    r"(?P<prefix>[?&])(?P<name>[A-Za-z0-9_-]*(?:access[_-]?token|refresh[_-]?token|"
+    r"id[_-]?token|api[_-]?key|token|secret|password|passwd|passphrase|credential|"
+    r"auth(?:entication|orization)?|cookie|session)[A-Za-z0-9_-]*)=(?P<value>[^&#\s]*)",
     re.IGNORECASE,
 )
 _HOME_PATH_RE = re.compile(r"/(?:home|Users)/[^/\s]+(?:/[^\s]*)?")
@@ -79,6 +91,30 @@ class AttentionRequired(OperationalError):  # noqa: N818 - public domain interfa
         )
 
 
+class ConfigurationRequired(AttentionRequired):  # noqa: N818 - public domain interface
+    """Configuration is missing or invalid and requires operator intervention."""
+
+    def __init__(
+        self,
+        message: str = "Required configuration is missing or invalid.",
+        *,
+        code: str = "configuration_required",
+        technical_detail: object = "",
+        actions: Iterable[str] = ("fix_configuration",),
+        status_code: int = 422,
+        settings: Settings | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            code=code,
+            category=FailureCategory.CONFIGURATION,
+            technical_detail=technical_detail,
+            actions=actions,
+            status_code=status_code,
+            settings=settings,
+        )
+
+
 class TransientFailure(OperationalError):  # noqa: N818 - public domain interface
     """A bounded-retry external failure."""
 
@@ -125,7 +161,11 @@ class AmbiguousPublishOutcome(AttentionRequired):
         )
 
 
-def classify_exception(exc: Exception, operation: str) -> OperationalError:
+def classify_exception(
+    exc: Exception,
+    operation: str,
+    settings: Settings | None = None,
+) -> OperationalError:
     """Map known transient/deterministic exceptions to safe operation errors."""
     if isinstance(exc, OperationalError):
         return exc
@@ -135,6 +175,14 @@ def classify_exception(exc: Exception, operation: str) -> OperationalError:
             f"{operation.capitalize()} could not be completed due to a temporary service failure.",
             code="transient_operation_failure",
             technical_detail=technical_detail,
+            settings=settings,
+        )
+    if isinstance(exc, KeyError):
+        return ConfigurationRequired(
+            f"{operation.capitalize()} needs required configuration before it can run.",
+            code="operation_configuration_required",
+            technical_detail="A required configuration value is missing.",
+            settings=settings,
         )
     if isinstance(exc, ValueError):
         return AttentionRequired(
@@ -143,14 +191,14 @@ def classify_exception(exc: Exception, operation: str) -> OperationalError:
             category=FailureCategory.VALIDATION,
             technical_detail=technical_detail,
             actions=("fix_input", "retry"),
+            settings=settings,
         )
     if isinstance(exc, (FileNotFoundError, PermissionError)):
-        return AttentionRequired(
+        return ConfigurationRequired(
             f"{operation.capitalize()} needs operator attention because required configuration or files are unavailable.",
             code="operation_configuration_required",
-            category=FailureCategory.CONFIGURATION,
             technical_detail=technical_detail,
-            actions=("fix_configuration", "retry"),
+            settings=settings,
         )
     return AttentionRequired(
         f"{operation.capitalize()} stopped because of an unexpected error.",
@@ -158,22 +206,19 @@ def classify_exception(exc: Exception, operation: str) -> OperationalError:
         category=FailureCategory.UNEXPECTED,
         technical_detail=technical_detail,
         actions=("retry",),
+        settings=settings,
     )
 
 
 def sanitize_text(value: object, settings: Settings | None = None) -> str:
     """Remove credentials and workspace paths before diagnostics leave process memory."""
     text = "" if value is None else str(value)
-    for secret in _environment_secrets():
-        text = text.replace(secret, "[REDACTED]")
+    for sensitive_value in (*_environment_secrets(), *_configured_sensitive_values(settings)):
+        text = text.replace(sensitive_value, "[REDACTED]")
     text = _BEARER_RE.sub("Bearer [REDACTED]", text)
-    text = _COOKIE_RE.sub(lambda match: f"{match.group(1)}: [REDACTED]", text)
+    text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group('name')}: [REDACTED]", text)
     text = _COOKIE_VALUE_RE.sub("[REDACTED]", text)
     text = _QUERY_SECRET_RE.sub(_redact_query_secret, text)
-    if settings is not None:
-        workspace = str(settings.base_dir)
-        if workspace:
-            text = text.replace(workspace, "[WORKSPACE]")
     return _HOME_PATH_RE.sub("[WORKSPACE_PATH]", text)
 
 
@@ -198,8 +243,20 @@ def _environment_secrets() -> tuple[str, ...]:
     )
 
 
+def _configured_sensitive_values(settings: Settings | None) -> tuple[str, ...]:
+    if settings is None:
+        return ()
+    values = [settings.admin_api_token]
+    values.extend(
+        str(path)
+        for path in (settings.base_dir, settings.data_dir, settings.output_dir, settings.results_dir)
+        if path is not None
+    )
+    return tuple(sorted((value for value in values if value), key=len, reverse=True))
+
+
 def _is_transient_exception(exc: Exception) -> bool:
-    if isinstance(exc, (TimeoutError, ConnectionError)):
+    if isinstance(exc, (TimeoutError, ConnectionError, *_REQUESTS_TRANSIENT_EXCEPTIONS)):
         return True
     status_code = getattr(exc, "status_code", None)
     response = getattr(exc, "response", None)
@@ -209,5 +266,4 @@ def _is_transient_exception(exc: Exception) -> bool:
 
 
 def _redact_query_secret(match: re.Match[str]) -> str:
-    name = match.group(1).split("=", 1)[0]
-    return f"{name}=[REDACTED]"
+    return f"{match.group('prefix')}{match.group('name')}=[REDACTED]"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -36,8 +37,8 @@ class Settings:
         delays = tuple(float(delay) for delay in self.retry_delays)
         if not origins:
             raise ValueError("At least one allowed origin is required")
-        if any(delay < 0 for delay in delays):
-            raise ValueError("Retry delays cannot be negative")
+        if any(not isfinite(delay) or delay < 0 for delay in delays):
+            raise ValueError("Retry delays must be finite and non-negative")
         if not 0 < self.subtitle_coverage_threshold <= 1:
             raise ValueError("Subtitle coverage threshold must be between 0 and 1")
         if self.subtitle_candidates_per_cycle < 1:

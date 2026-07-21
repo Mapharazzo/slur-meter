@@ -21,6 +21,14 @@ def test_running_run_cannot_skip_to_queued_without_recovery():
         assert_job_transition(JobState.RUNNING, JobState.QUEUED)
 
 
+def test_restart_recovery_can_requeue_a_running_job():
+    assert_job_transition(
+        JobState.RUNNING,
+        JobState.QUEUED,
+        trigger=AttemptTrigger.RESTART_RECOVERY,
+    )
+
+
 def test_queued_job_can_start_running():
     assert_job_transition(JobState.QUEUED, JobState.RUNNING)
 

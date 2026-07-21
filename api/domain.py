@@ -89,8 +89,18 @@ _STAGE_TRANSITIONS: dict[StageState, frozenset[StageState]] = {
 }
 
 
-def assert_job_transition(old: JobState, new: JobState) -> None:
+def assert_job_transition(
+    old: JobState,
+    new: JobState,
+    trigger: AttemptTrigger | None = None,
+) -> None:
     """Assert that a job state update is one of the allowed durable moves."""
+    if (
+        old is JobState.RUNNING
+        and new is JobState.QUEUED
+        and trigger is AttemptTrigger.RESTART_RECOVERY
+    ):
+        return
     _assert_transition(old, new, _JOB_TRANSITIONS, "job")
 
 
