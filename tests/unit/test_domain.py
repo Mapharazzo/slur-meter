@@ -37,6 +37,19 @@ def test_stage_can_complete_from_running():
     assert_stage_transition(StageState.RUNNING, StageState.COMPLETED)
 
 
+def test_running_stage_cannot_requeue_without_recovery():
+    with pytest.raises(InvalidTransition):
+        assert_stage_transition(StageState.RUNNING, StageState.QUEUED)
+
+
+def test_restart_recovery_can_requeue_a_running_stage():
+    assert_stage_transition(
+        StageState.RUNNING,
+        StageState.QUEUED,
+        trigger=AttemptTrigger.RESTART_RECOVERY,
+    )
+
+
 def test_stage_cannot_complete_before_running():
     with pytest.raises(InvalidTransition):
         assert_stage_transition(StageState.PENDING, StageState.COMPLETED)

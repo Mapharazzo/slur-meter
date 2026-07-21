@@ -104,8 +104,18 @@ def assert_job_transition(
     _assert_transition(old, new, _JOB_TRANSITIONS, "job")
 
 
-def assert_stage_transition(old: StageState, new: StageState) -> None:
+def assert_stage_transition(
+    old: StageState,
+    new: StageState,
+    trigger: AttemptTrigger | None = None,
+) -> None:
     """Assert that a stage state update is one of the allowed durable moves."""
+    if (
+        old is StageState.RUNNING
+        and new is StageState.QUEUED
+        and trigger is AttemptTrigger.RESTART_RECOVERY
+    ):
+        return
     _assert_transition(old, new, _STAGE_TRANSITIONS, "stage")
 
 
