@@ -31,10 +31,12 @@ class ProfanityEngine:
 
         subs = pysrt.open(str(srt_path))
         events: list[dict] = []
+        final_cue_seconds = 0.0
 
         for sub in subs:
             text = sub.text.lower()
             start_sec = sub.start.ordinal / 1000.0
+            final_cue_seconds = max(final_cue_seconds, sub.end.ordinal / 1000.0)
             matches = self._scan_line(text)
             for word, tier in matches:
                 events.append(
@@ -44,10 +46,10 @@ class ProfanityEngine:
         df = pd.DataFrame(events, columns=["time", "word", "tier"])
 
         if df.empty:
-            return _empty_summary()
+            return _empty_summary(final_cue_seconds)
 
         binned = self._bin_by_minute(df)
-        summary = self._summarise(df, binned)
+        summary = self._summarise(df, binned, final_cue_seconds)
 
         return {
             "events": df.to_dict(orient="records"),
@@ -91,7 +93,9 @@ class ProfanityEngine:
         pivot = pivot[["hard", "soft", "f_bombs"]]
         return pivot.reset_index().rename(columns={"minute": "minute"})
 
-    def _summarise(self, df: pd.DataFrame, binned: pd.DataFrame) -> dict:
+    def _summarise(
+        self, df: pd.DataFrame, binned: pd.DataFrame, final_cue_seconds: float
+    ) -> dict:
         total_hard = int(df["tier"].eq("hard").sum())
         total_soft = int(df["tier"].eq("soft").sum())
         total_f = int(df["tier"].eq("f_bombs").sum())
@@ -106,7 +110,7 @@ class ProfanityEngine:
         peak_idx = binned["score"].idxmax()
         peak_minute = int(binned.loc[peak_idx, "minute"])
         score_at_peak = int(binned["score"].max())
-        runtime_minutes = int(df["time"].max() / 60)
+        runtime_minutes = int(final_cue_seconds / 60)
 
         return {
             "total_hard": total_hard,
@@ -137,7 +141,7 @@ def _generate_rating(hard: int, soft: int, f: int) -> str:
     return "💀 CALL THE HAZMAT TEAM"
 
 
-def _empty_summary() -> dict:
+def _empty_summary(final_cue_seconds: float = 0.0) -> dict:
     return {
         "events": [],
         "binned": [],
@@ -147,7 +151,7 @@ def _empty_summary() -> dict:
             "total_f_bombs": 0,
             "peak_minute": 0,
             "peak_score": 0,
-            "runtime_minutes": 0,
+            "runtime_minutes": int(final_cue_seconds / 60),
             "total_words_counted": 0,
             "rating": "⭐ NO DATA — MOVIE IS TOO QUIET",
         },

@@ -1,5 +1,8 @@
 """Unit tests — data fetching module."""
 
+import io
+import zipfile
+from contextlib import contextmanager
 from unittest.mock import patch
 
 import pytest
@@ -8,11 +11,38 @@ from src.data.opensubtitles import (
     OpenSubtitlesClient,
     SubtitleCache,
     SubtitleResult,
+    UnsafeArchiveError,
     _clean_title,
     _safe_float,
     _to_srt_name,
     safe_imdb_id,
 )
+
+VALID_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+
+
+def zip_response(members):
+    body = io.BytesIO()
+    with zipfile.ZipFile(body, "w") as archive:
+        for name, value in members.items():
+            archive.writestr(name, value)
+    response = type("Response", (), {})()
+    response.headers = {"content-length": str(len(body.getvalue()))}
+    response.iter_content = lambda chunk_size: [body.getvalue()]
+    response.raise_for_status = lambda: None
+    return response
+
+
+@contextmanager
+def stub_download(client, response, *, file_name="provider.zip"):
+    link_response = type("LinkResponse", (), {})()
+    link_response.status_code = 200
+    link_response.json = lambda: {"link": "https://example.invalid/file", "file_name": file_name}
+    link_response.raise_for_status = lambda: None
+    with patch.object(client.session, "post", return_value=link_response), patch(
+        "src.data.opensubtitles.requests.get", return_value=response
+    ):
+        yield
 
 
 class TestHelpers:
@@ -142,6 +172,36 @@ class TestOpenSubtitlesClient:
         mock_get.return_value.raise_for_status = lambda: None
         results = client.search(query="Nonexistent")
         assert results == []
+
+    def test_zip_traversal_member_is_rejected(self, client, tmp_path):
+        response = zip_response({"../../escaped.srt": VALID_SRT})
+        with stub_download(client, response), pytest.raises(UnsafeArchiveError):
+            client.download("42", tmp_path / "candidate.srt")
+        assert not (tmp_path.parent / "escaped.srt").exists()
+
+    def test_download_uses_caller_generated_path_not_provider_filename(self, client, tmp_path):
+        destination = tmp_path / "generated" / "candidate.srt"
+        response = zip_response({"nested/subtitle.srt": VALID_SRT})
+        with stub_download(client, response, file_name="/absolute/provider-name.zip"):
+            result = client.download("42", destination)
+        assert result == destination.resolve()
+        assert result.read_bytes() == VALID_SRT
+
+    def test_archive_without_srt_is_rejected(self, client, tmp_path):
+        response = zip_response({"notes.txt": b"not subtitles"})
+        with stub_download(client, response), pytest.raises(UnsafeArchiveError, match="SRT"):
+            client.download("42", tmp_path / "candidate.srt")
+
+    def test_nested_archive_without_direct_srt_is_rejected(self, client, tmp_path):
+        response = zip_response({"nested/archive.zip": b"nested archive bytes"})
+        with stub_download(client, response), pytest.raises(UnsafeArchiveError, match="SRT"):
+            client.download("42", tmp_path / "candidate.srt")
+
+    def test_download_rejects_response_over_size_cap(self, client, tmp_path):
+        response = zip_response({"subtitle.srt": VALID_SRT})
+        response.headers = {"content-length": "999999999"}
+        with stub_download(client, response), pytest.raises(UnsafeArchiveError, match="size"):
+            client.download("42", tmp_path / "candidate.srt")
 
 
 class TestSubtitleCache:

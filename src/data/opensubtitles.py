@@ -1,37 +1,44 @@
-"""OpenSubtitles API v1 client — search & download subtitle files.
+"""Bounded OpenSubtitles search and safe subtitle download helpers."""
 
-OpenSubtitles requires:
-  • An API key (free sign-up at https://www.opensubtitles.com/en/api-docs)
-  • A User-Agent header with app name + version
-"""
+from __future__ import annotations
 
+import io
 import os
 import re
-import time
+import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 
-import requests
 import rarfile
+import requests
 
 
-@dataclass
+class UnsafeArchiveError(ValueError):
+    """Raised when remote subtitle content cannot be safely used."""
+
+
+@dataclass(frozen=True)
 class SubtitleResult:
-    """Single subtitle search hit from OpenSubtitles."""
+    """Provider metadata for a possible subtitle; filenames are never paths."""
 
     file_id: str
     file_name: str
-    movie_title: str  # cleaned
+    movie_title: str
     movie_year: str | None
     language: str
     fps: float | None
     imdb_id: str | None
+    provider_rating: float | None = None
+    download_count: int | None = None
+    runtime_seconds: float | None = None
 
 
 class OpenSubtitlesClient:
-    """Thin wrapper around the OpenSubtitles REST API v1."""
+    """Small API client with bounded network and extraction behavior."""
 
     BASE_URL = "https://api.opensubtitles.com/api/v1"
+    DEFAULT_TIMEOUT = (3.05, 15.0)
+    MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024
 
     def __init__(
         self,
@@ -40,38 +47,31 @@ class OpenSubtitlesClient:
         jwt: str | None = None,
         username: str | None = None,
         password: str | None = None,
+        *,
+        timeout: tuple[float, float] = DEFAULT_TIMEOUT,
+        max_download_bytes: int = MAX_DOWNLOAD_BYTES,
     ):
         self.api_key = api_key
         self.user_agent = user_agent
         self.jwt = jwt
         self.username = username
         self.password = password
+        self.timeout = timeout
+        self.max_download_bytes = int(max_download_bytes)
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Api-Key": api_key,
-                "User-Agent": user_agent,
-            }
-        )
+        self.session.headers.update({"Api-Key": api_key, "User-Agent": user_agent})
 
     def login(self) -> str:
-        """Authenticate with OpenSubtitles and return a JWT."""
         if not self.username or not self.password:
             raise ValueError("Username and password are required for login")
-
-        resp = self.session.post(
+        response = self.session.post(
             f"{self.BASE_URL}/login",
-            json={
-                "username": self.username,
-                "password": self.password,
-            },
+            json={"username": self.username, "password": self.password},
+            timeout=self.timeout,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        self.jwt = data["token"]
+        response.raise_for_status()
+        self.jwt = response.json()["token"]
         return self.jwt
-
-    # ──────────────────── Search ────────────────────
 
     def search(
         self,
@@ -80,141 +80,110 @@ class OpenSubtitlesClient:
         language: str = "en",
         limit: int = 5,
     ) -> list[SubtitleResult]:
-        """Search for subtitles. One of query or imdb_id is required."""
-
-        params: dict = {"languages": language, "limit": limit}
-
+        """Search provider metadata using a bounded request."""
+        params: dict[str, object] = {"languages": language, "limit": limit}
         if imdb_id:
-            params["imdb_id"] = imdb_id.lstrip("t")  # strip leading 'tt'
+            params["imdb_id"] = imdb_id.lstrip("t")
         elif query:
             params["query"] = query
         else:
             raise ValueError("Provide either query or imdb_id")
-
-        resp = self.session.get(f"{self.BASE_URL}/subtitles", params=params)
-        resp.raise_for_status()
-        data = resp.json()
-
+        response = self.session.get(
+            f"{self.BASE_URL}/subtitles", params=params, timeout=self.timeout
+        )
+        response.raise_for_status()
         results: list[SubtitleResult] = []
-        for item in data.get("data", []):
+        for item in response.json().get("data", []):
             attrs = item.get("attributes", {})
             files = attrs.get("files", [])
             if not files:
                 continue
+            details = attrs.get("feature_details", {})
+            file = files[0]
             results.append(
                 SubtitleResult(
-                    file_id=str(files[0].get("file_id", item["id"])),
-                    file_name=files[0].get("file_name", "unknown.srt"),
-                    movie_title=_clean_title(attrs.get("feature_details", {}).get("title", "Unknown")),
-                    movie_year=str(attrs.get("feature_details", {}).get("year", "")) or None,
-                    language=attrs.get("language", language),
+                    file_id=str(file.get("file_id", item["id"])),
+                    file_name=str(file.get("file_name", "unknown.srt")),
+                    movie_title=_clean_title(details.get("title", "Unknown")),
+                    movie_year=str(details.get("year", "")) or None,
+                    language=str(attrs.get("language", language)),
                     fps=_safe_float(attrs.get("fps")),
-                    imdb_id=safe_imdb_id(attrs.get("feature_details", {}).get("imdb_id")),
+                    imdb_id=safe_imdb_id(details.get("imdb_id")),
+                    provider_rating=_safe_float(attrs.get("ratings") or attrs.get("rating")),
+                    download_count=_safe_int(attrs.get("download_count")),
+                    runtime_seconds=_safe_duration(details.get("duration")),
                 )
             )
         return results
 
-    # ──────────────────── Download ────────────────────
+    def download(
+        self,
+        file_id: str,
+        destination: str | Path | None = None,
+        *,
+        dest_dir: str | Path | None = None,
+    ) -> Path:
+        """Write the first safe SRT to a caller-generated destination path."""
+        if destination is None:
+            if dest_dir is None:
+                raise ValueError("A generated subtitle destination is required")
+            destination = Path(dest_dir) / f"{file_id}.srt"
+        if dest_dir is not None:
+            raise ValueError("Use destination rather than both destination and dest_dir")
+        target = Path(destination).resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        response = self._download_link(file_id)
+        response.raise_for_status()
+        data = response.json()
+        remote = requests.get(data["link"], stream=True, timeout=self.timeout)
+        remote.raise_for_status()
+        content = self._read_bounded(remote)
+        name = str(data.get("file_name", "")).lower()
+        if name.endswith(".srt"):
+            target.write_bytes(content)
+            return target
+        subtitle = _archive_subtitle(content)
+        target.write_bytes(subtitle)
+        return target
 
-    def download(self, file_id: str, dest_dir: str | Path = "tmp") -> Path:
-        """Request a download URL, fetch the .srt, and return its local path.
-
-        OpenSubtitles files come zipped or rar'd, so we extract the first .srt.
-        """
-
-        dest_dir = Path(dest_dir)
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Step 1 — get download link
-        payload = {"file_id": file_id}
-        
-        def _get_link():
-            headers = {"Authorization": f"Bearer {self.jwt}"} if self.jwt else {}
+    def _download_link(self, file_id: str):
+        def request_link(headers: dict[str, str]):
             return self.session.post(
                 f"{self.BASE_URL}/download",
-                json=payload,
+                json={"file_id": file_id},
                 headers=headers,
+                timeout=self.timeout,
             )
 
-        resp = _get_link()
-        
-        if resp.status_code == 401:
-            # 1. Try to refresh the token if we have credentials
-            if self.username and self.password:
-                try:
-                    self.login()
-                    resp = _get_link()
-                except Exception:
-                    pass
-            
-            # 2. If still 401, try anonymous download (omitting the Bearer token)
-            if resp.status_code == 401:
-                resp = self.session.post(
-                    f"{self.BASE_URL}/download",
-                    json=payload,
-                    headers={}, # Explicitly empty headers to bypass the stale session JWT if any
-                )
+        response = request_link({"Authorization": f"Bearer {self.jwt}"} if self.jwt else {})
+        if response.status_code != 401:
+            return response
+        if self.username and self.password:
+            try:
+                self.login()
+                response = request_link({"Authorization": f"Bearer {self.jwt}"})
+            except requests.RequestException:
+                pass
+        return request_link({}) if response.status_code == 401 else response
 
-        resp.raise_for_status()
-        dl_data = resp.json()
-        url = dl_data["link"]
-        file_name = dl_data.get("file_name", f"{file_id}.srt")
-
-        # Step 2 — fetch the archive
-        archive_path = dest_dir / file_name
-        archive_resp = requests.get(url)
-        archive_resp.raise_for_status()
-        archive_path.write_bytes(archive_resp.content)
-
-        # Step 3 — extract .srt if compressed
-        lower = file_name.lower()
-        srt_path = dest_dir / _to_srt_name(file_name)
-
-        if lower.endswith(".srt"):
-            return archive_path.resolve()
-
-        try:
-            # Try ZIP
-            import zipfile
-            with zipfile.ZipFile(archive_path) as zf:
-                for member in zf.namelist():
-                    if member.lower().endswith(".srt"):
-                        zf.extract(member, dest_dir)
-                        extracted = dest_dir / member
-                        # Flatten nested dirs
-                        return self._flatten_and_rename(extracted, srt_path)
-        except zipfile.BadZipFile:
-            pass
-
-        try:
-            # Try RAR
-            with rarfile.RarFile(str(archive_path)) as rf:
-                for member in rf.namelist():
-                    if member.lower().endswith(".srt"):
-                        rf.extract(member, dest_dir)
-                        extracted = dest_dir / member
-                        return self._flatten_and_rename(extracted, srt_path)
-        except rarfile.BadRarFile:
-            pass
-
-        # Fallback: assume it's already an SRT
-        if srt_path.exists():
-            return srt_path.resolve()
-
-        return archive_path.resolve()
-
-    # ──────────────────── Helpers ────────────────────
-
-    def _flatten_and_rename(self, extracted: Path, target: Path) -> Path:
-        """Move/symlink a deeply-nested extracted .srt to the target filename."""
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if str(extracted.name).lower() != str(target.name).lower():
-            extracted.rename(target)
-        return target.resolve()
+    def _read_bounded(self, response) -> bytes:
+        length = response.headers.get("content-length")
+        if length and int(length) > self.max_download_bytes:
+            raise UnsafeArchiveError("Subtitle download exceeds the size limit")
+        chunks: list[bytes] = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            size += len(chunk)
+            if size > self.max_download_bytes:
+                raise UnsafeArchiveError("Subtitle download exceeds the size limit")
+            chunks.append(chunk)
+        return b"".join(chunks)
 
 
 class SubtitleCache:
-    """Simple file-system cache so we never re-download the same movie."""
+    """Small content cache with explicit promotion after validation."""
 
     def __init__(self, cache_dir: str | Path = "results"):
         self._dir = Path(cache_dir) / "subtitles"
@@ -227,43 +196,82 @@ class SubtitleCache:
         path = self._dir / f"{self.key(imdb_id)}.srt"
         return path if path.exists() else None
 
-    def store(self, imdb_id: str, srt_path: Path) -> Path:
+    def store(self, imdb_id: str, srt_path: Path, *, replace: bool = False) -> Path:
         dest = self._dir / f"{self.key(imdb_id)}.srt"
-        if not dest.exists():
-            dest.write_bytes(srt_path.read_bytes())
+        if replace or not dest.exists():
+            partial = dest.with_suffix(".partial")
+            partial.write_bytes(srt_path.read_bytes())
+            partial.replace(dest)
         return dest.resolve()
 
 
-# ──────────────────── Pure helpers ────────────────────
+def _archive_subtitle(content: bytes) -> bytes:
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            return _read_safe_member(archive, archive.infolist())
+    except zipfile.BadZipFile:
+        pass
+    try:
+        with rarfile.RarFile(io.BytesIO(content)) as archive:
+            return _read_safe_member(archive, archive.infolist())
+    except (rarfile.BadRarFile, rarfile.NeedFirstVolume):
+        pass
+    raise UnsafeArchiveError("Subtitle archive has no safe SRT member")
+
+
+def _read_safe_member(archive, members) -> bytes:
+    for member in members:
+        name = member.filename
+        path = Path(name)
+        if path.is_absolute() or ".." in path.parts:
+            raise UnsafeArchiveError("Subtitle archive member escapes its destination")
+        if not name.lower().endswith(".srt"):
+            continue
+        if getattr(member, "file_size", 0) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES:
+            raise UnsafeArchiveError("Subtitle archive member exceeds the size limit")
+        with archive.open(member) as stream:
+            data = stream.read(OpenSubtitlesClient.MAX_DOWNLOAD_BYTES + 1)
+        if len(data) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES:
+            raise UnsafeArchiveError("Subtitle archive member exceeds the size limit")
+        return data
+    raise UnsafeArchiveError("Subtitle archive has no SRT member")
+
 
 def _clean_title(raw: str) -> str:
     return re.sub(r"\s+", " ", raw.strip())
 
 
-def _safe_float(val: str | None) -> float | None:
-    if val is None:
-        return None
+def _safe_float(val: object) -> float | None:
     try:
-        return float(val)
+        return None if val is None else float(val)
     except (ValueError, TypeError):
         return None
 
 
-def safe_imdb_id(val) -> str | None:
+def _safe_int(val: object) -> int | None:
+    try:
+        return None if val is None else int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_duration(value: object) -> float | None:
+    number = _safe_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def safe_imdb_id(val: object) -> str | None:
     if val is None or val == "":
         return None
-    s_val = str(val).strip()
-    if not s_val:
+    text = str(val).strip()
+    if not text:
         return None
-    # If it's already 'tt12345', return it
-    if s_val.lower().startswith("tt"):
-        return s_val
+    if text.lower().startswith("tt"):
+        return text
     try:
-        # Standard numeric ID
-        return f"tt{int(s_val):07d}"
+        return f"tt{int(text):07d}"
     except (ValueError, TypeError):
-        # Could be 'q_4fed600a11' or similar; return it as is
-        return s_val
+        return text
 
 
 def _to_srt_name(file_name: str) -> str:
