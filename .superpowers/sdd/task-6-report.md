@@ -105,6 +105,13 @@ construction), before any network or browser launch.
   remaining Critical or Important findings.
 - The expanded controller-focused migration/service/store/client group reached
   138/138 passing cases before the final repository gates.
+- Final controller review found native YouTube count coercion still accepted floats,
+  booleans, and signed numeric strings before service validation. Ten intended REDs
+  reproduced acceptance across all three native count fields and last-good snapshot
+  replacement. GREEN requires either a non-boolean non-negative integer or an ASCII
+  digit-only string before conversion; 34 native-count cases cover invalid signed,
+  decimal, exponent, and non-digit forms plus valid integers/digit strings and exact
+  last-good preservation through `PublishingService`.
 
 ## Contract/self-review
 
@@ -146,9 +153,10 @@ the commit gate.
 
 ## Final post-review gate
 
-- Required focused command: `132 passed in 3.20s`.
-- Required unit plus job-submission command: `312 passed, 22 warnings in 11.58s`.
-- Required repository-wide command: `345 passed, 1 failed, 26 warnings in 19.05s`.
+- Focused platform-client/service command: `121 passed in 1.70s`.
+- Required focused command: `166 passed in 3.21s`.
+- Required unit plus job-submission command: `346 passed, 22 warnings in 10.66s`.
+- Required repository-wide command: `379 passed, 1 failed, 26 warnings in 16.17s`.
   The sole failure remained the documented Task 8 Django SRT fixture conflict
   (`total_f_bombs`, expected 100 vs actual 200); Task 6 did not modify it.
 - Independent final review: no Critical or Important findings; ready.

@@ -319,6 +319,100 @@ def test_youtube_partial_stats_raise_instead_of_synthesizing_zero(missing_field)
         client.get_video_stats("remote-1")
 
 
+@pytest.mark.parametrize("field", ["viewCount", "likeCount", "commentCount"])
+@pytest.mark.parametrize(
+    "raw_count",
+    [1.9, True, "-1", "+1", "1.9", "1e2", "not-a-count"],
+)
+def test_youtube_native_stats_reject_noncanonical_counts(field, raw_count):
+    statistics = {"viewCount": "10", "likeCount": "2", "commentCount": "1"}
+    statistics[field] = raw_count
+    client = YouTubeClient(
+        youtube=FakeYouTubeService(
+            FakeYouTubeVideos(
+                stats_result={"items": [{"statistics": statistics}]}
+            )
+        ),
+        supplemental_stats=lambda remote_id: {"shares": 0, "revenue_usd": 0.0},
+    )
+
+    with pytest.raises(PlatformStatsError):
+        client.get_video_stats("remote-1")
+
+
+@pytest.mark.parametrize("field", ["viewCount", "likeCount", "commentCount"])
+@pytest.mark.parametrize("raw_count", [0, 12, "0", "12"])
+def test_youtube_native_stats_accept_digit_strings_and_nonboolean_ints(
+    field, raw_count
+):
+    statistics = {"viewCount": "10", "likeCount": "2", "commentCount": "1"}
+    statistics[field] = raw_count
+    client = YouTubeClient(
+        youtube=FakeYouTubeService(
+            FakeYouTubeVideos(
+                stats_result={"items": [{"statistics": statistics}]}
+            )
+        ),
+        supplemental_stats=lambda remote_id: {"shares": 0, "revenue_usd": 0.0},
+    )
+
+    snapshot = client.get_video_stats("remote-1")
+
+    result_field = {
+        "viewCount": "views",
+        "likeCount": "likes",
+        "commentCount": "comments",
+    }[field]
+    assert snapshot[result_field] == int(raw_count)
+
+
+def test_youtube_native_stats_failure_preserves_last_good_through_service(tmp_path):
+    videos = FakeYouTubeVideos(
+        stats_result={
+            "items": [
+                {
+                    "statistics": {
+                        "viewCount": "10",
+                        "likeCount": "2",
+                        "commentCount": "1",
+                    }
+                }
+            ]
+        }
+    )
+    client = YouTubeClient(
+        youtube=FakeYouTubeService(videos),
+        supplemental_stats=lambda remote_id: {"shares": 0, "revenue_usd": 1.25},
+    )
+    store = OperationStore(tmp_path / "youtube-native-stats.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.upsert_release(
+        job["id"], "youtube", status="uploaded", remote_id="remote-1"
+    )
+    service = PublishingService(
+        store, {"youtube": client}, date_factory=lambda: "2026-07-22"
+    )
+    service.refresh_stats(job["id"], "youtube")
+    before = store.list_revenue(job["id"])
+    videos.stats_result = {
+        "items": [
+            {
+                "statistics": {
+                    "viewCount": 1.9,
+                    "likeCount": "2",
+                    "commentCount": "1",
+                }
+            }
+        ]
+    }
+
+    with pytest.raises(PlatformStatsError):
+        service.refresh_stats(job["id"], "youtube")
+
+    assert store.list_revenue(job["id"]) == before
+
+
 def test_youtube_generic_stats_failure_is_typed():
     videos = FakeYouTubeVideos(stats_result=RuntimeError("raw upstream body"))
     client = YouTubeClient(

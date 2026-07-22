@@ -188,16 +188,14 @@ class YouTubeClient:
             )
         try:
             stats = items[0]["statistics"]
-            views = int(stats["viewCount"])
-            likes = int(stats["likeCount"])
-            comments = int(stats["commentCount"])
+            views = _native_count(stats["viewCount"])
+            likes = _native_count(stats["likeCount"])
+            comments = _native_count(stats["commentCount"])
         except (KeyError, TypeError, ValueError, IndexError) as exc:
             raise PlatformStatsError(
                 "YouTube returned an invalid statistics snapshot.",
                 technical_detail=type(exc).__name__,
             ) from None
-        if min(views, likes, comments) < 0:
-            raise PlatformStatsError("YouTube returned negative statistics.")
         supplemental = _verified_supplemental_stats(
             self._supplemental_stats, normalized, ("shares", "revenue_usd")
         )
@@ -212,6 +210,18 @@ class YouTubeClient:
     @staticmethod
     def get_video_url(video_id: str) -> str:
         return f"https://www.youtube.com/shorts/{video_id}"
+
+
+def _native_count(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Boolean values are not counts")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError("Counts cannot be negative")
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise ValueError("Counts must be integers or digit-only strings")
 
 
 def _verified_supplemental_stats(
