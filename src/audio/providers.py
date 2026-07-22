@@ -11,7 +11,9 @@ import abc
 import asyncio
 import hashlib
 import json
+import os
 import shutil
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,13 @@ def _cache_key(provider_name: str, text: str, **params: Any) -> str:
     the key when they're omitted.
     """
     blob = json.dumps(
-        {"p": provider_name, "t": text, **{k: v for k, v in sorted(params.items()) if v is not None}},
+        {
+            "p": provider_name,
+            "t": text,
+            **{k: v for k, v in sorted(params.items()) if v is not None},
+        },
         sort_keys=True,
+        default=str,
     )
     return hashlib.sha256(blob.encode()).hexdigest()
 
@@ -62,7 +69,11 @@ class AudioProvider(abc.ABC):
 
         Override in subclasses to include voice, model, speed, etc.
         """
-        return {}
+        return {
+            key: value
+            for key, value in self.config.items()
+            if key not in {"cache_dir", "api_key_env"}
+        }
 
     def _cached_generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
         params = self._cache_params(**kwargs)
@@ -70,15 +81,20 @@ class AudioProvider(abc.ABC):
         ext = output_path.suffix or ".mp3"
         cached = self.cache_dir / f"{key}{ext}"
 
-        if cached.exists():
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cached, output_path)
+        if cached.is_file() and cached.stat().st_size > 0:
+            _atomic_copy(cached, output_path)
             return output_path
 
-        # Generate, then store in cache
-        self._generate(text, output_path, **kwargs)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output_path, cached)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        staged = _partial_path(output_path)
+        try:
+            self._generate(text, staged, **kwargs)
+            if not staged.is_file() or staged.stat().st_size <= 0:
+                raise RuntimeError(f"{self.__class__.__name__} produced empty audio")
+            os.replace(staged, output_path)
+            _atomic_copy(output_path, cached)
+        finally:
+            staged.unlink(missing_ok=True)
         return output_path
 
     def __repr__(self) -> str:
@@ -96,6 +112,7 @@ class EdgeTTSProvider(AudioProvider):
 
     def _cache_params(self, **kwargs: Any) -> dict[str, Any]:
         return {
+            **super()._cache_params(**kwargs),
             "voice": kwargs.get("voice") or self.config.get("voice", "en-US-GuyNeural"),
             "speed": kwargs.get("speed") or self.config.get("speed", 1.0),
         }
@@ -129,18 +146,25 @@ class ElevenLabsProvider(AudioProvider):
 
     def _cache_params(self, **kwargs: Any) -> dict[str, Any]:
         return {
+            **super()._cache_params(**kwargs),
             "voice_id": kwargs.get("voice_id") or self.config.get("voice_id"),
-            "model_id": kwargs.get("model_id") or self.config.get("model_id", "eleven_multilingual_v2"),
+            "model_id": kwargs.get("model_id")
+            or self.config.get("model_id", "eleven_multilingual_v2"),
+            "stability": kwargs.get("stability", self.config.get("stability", 0.5)),
+            "similarity_boost": kwargs.get(
+                "similarity_boost", self.config.get("similarity_boost", 0.75)
+            ),
         }
 
     def _generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
-        import os
-
         import requests
         from dotenv import load_dotenv
-        load_dotenv(override=True)
 
-        api_key_env = kwargs.get("api_key_env") or self.config.get("api_key_env", "ELEVENLABS_API_KEY")
+        load_dotenv(override=False)
+
+        api_key_env = kwargs.get("api_key_env") or self.config.get(
+            "api_key_env", "ELEVENLABS_API_KEY"
+        )
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(
@@ -151,7 +175,9 @@ class ElevenLabsProvider(AudioProvider):
         if not voice_id:
             raise ValueError("ElevenLabsProvider: voice_id is required")
 
-        model_id = kwargs.get("model_id") or self.config.get("model_id", "eleven_multilingual_v2")
+        model_id = kwargs.get("model_id") or self.config.get(
+            "model_id", "eleven_multilingual_v2"
+        )
 
         resp = requests.post(
             f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}",
@@ -163,8 +189,12 @@ class ElevenLabsProvider(AudioProvider):
                 "text": text,
                 "model_id": model_id,
                 "voice_settings": {
-                    "stability": self.config.get("stability", 0.5),
-                    "similarity_boost": self.config.get("similarity_boost", 0.75),
+                    "stability": kwargs.get(
+                        "stability", self.config.get("stability", 0.5)
+                    ),
+                    "similarity_boost": kwargs.get(
+                        "similarity_boost", self.config.get("similarity_boost", 0.75)
+                    ),
                 },
             },
             timeout=30,
@@ -206,14 +236,23 @@ class SilenceProvider(AudioProvider):
         output_path.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
             [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
-                "-t", str(duration),
-                "-c:a", "aac", "-b:a", "128k",
+                "ffmpeg",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=stereo",
+                "-t",
+                str(duration),
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
                 str(output_path),
             ],
             check=True,
             capture_output=True,
+            shell=False,
         )
         return output_path
 
@@ -233,37 +272,30 @@ class LyriaProvider(AudioProvider):
 
     def _cache_params(self, **kwargs: Any) -> dict[str, Any]:
         return {
-            "model": kwargs.get("model") or self.config.get("model", "google/lyria-3-pro-preview"),
+            **super()._cache_params(**kwargs),
+            "model": kwargs.get("model")
+            or self.config.get("model", "google/lyria-3-pro-preview"),
         }
 
     def _cached_generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
-        """Cache keyed on first 64 chars of the prompt hash."""
-        params = self._cache_params(**kwargs)
-        key = _cache_key(self.name, text, **params)[:64]
-        cached = self.cache_dir / f"{key}.wav"
-
-        if cached.exists():
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(cached, output_path)
-            return output_path
-
-        self._generate(text, output_path, **kwargs)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(output_path, cached)
-        return output_path
+        """Use the same atomic content cache as other remote providers."""
+        return super()._cached_generate(text, output_path, **kwargs)
 
     def _generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
         import base64
-        import os
 
         import requests
 
-        api_key_env = kwargs.get("api_key_env") or self.config.get("api_key_env", "OPENROUTER_API_KEY")
+        api_key_env = kwargs.get("api_key_env") or self.config.get(
+            "api_key_env", "OPENROUTER_API_KEY"
+        )
         api_key = os.environ.get(api_key_env)
         if not api_key:
             raise RuntimeError(f"LyriaProvider: set ${api_key_env} in your environment")
 
-        model = kwargs.get("model") or self.config.get("model", "google/lyria-3-pro-preview")
+        model = kwargs.get("model") or self.config.get(
+            "model", "google/lyria-3-pro-preview"
+        )
 
         resp = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
@@ -306,7 +338,11 @@ class LyriaProvider(AudioProvider):
                 content = delta.get("content")
                 if isinstance(content, list):
                     for part in content:
-                        if isinstance(part, dict) and part.get("type") == "audio" and "data" in part:
+                        if (
+                            isinstance(part, dict)
+                            and part.get("type") == "audio"
+                            and "data" in part
+                        ):
                             audio_chunks.append(part["data"])
             except json.JSONDecodeError:
                 continue
@@ -339,3 +375,20 @@ def get_provider(name: str, config: dict[str, Any] | None = None) -> AudioProvid
             f"Available: {', '.join(PROVIDER_REGISTRY)}"
         )
     return cls(config)
+
+
+def _partial_path(path: Path) -> Path:
+    suffix = path.suffix
+    return path.with_name(f".{path.stem}.{uuid.uuid4().hex}.partial{suffix}")
+
+
+def _atomic_copy(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(destination)
+    try:
+        shutil.copy2(source, partial)
+        if partial.stat().st_size <= 0:
+            raise RuntimeError("Audio cache entry is empty")
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)

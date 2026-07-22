@@ -3,7 +3,6 @@
 import asyncio
 import json
 import sys
-from collections.abc import Callable
 from pathlib import Path
 
 import uvicorn
@@ -37,9 +36,9 @@ from api.database import (  # noqa: E402
 )
 from api.dispatcher import JobDispatcher  # noqa: E402
 from api.pipeline import (  # noqa: E402
+    GenerationPipelineServices,
     PipelineRunner,
     PipelineServices,
-    UnavailablePipelineServices,
 )
 from api.settings import Settings  # noqa: E402
 from src.data.opensubtitles import safe_imdb_id  # noqa: E402
@@ -62,7 +61,10 @@ app.add_middleware(
 
 runtime_settings = Settings.from_env(BASE_DIR)
 operation_store = OperationStore(DB_PATH)
-pipeline_services_factory: Callable[[], PipelineServices] = UnavailablePipelineServices
+
+
+def pipeline_services_factory() -> PipelineServices:
+    return GenerationPipelineServices(operation_store, runtime_settings)
 
 
 def _runner_factory() -> PipelineRunner:

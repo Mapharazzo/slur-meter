@@ -9,6 +9,9 @@ Usage in the render pipeline:
 
 from __future__ import annotations
 
+import json
+import subprocess
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -25,17 +28,19 @@ class AudioPipeline:
         config: dict[str, Any],
         audio_dir: Path,
         segment_timing: dict[str, dict],
+        warning_callback: Callable[[str], None] | None = None,
     ):
         self.config = config
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.timing = segment_timing
         self.audio_cfg = config.get("audio", {})
+        self.warning_callback = warning_callback
         self.fps = config.get("video", {}).get("fps", 30)
 
-        total_frames = max(
-            (seg["end_frame"] for seg in segment_timing.values()), default=0
-        ) + 1
+        total_frames = (
+            max((seg["end_frame"] for seg in segment_timing.values()), default=0) + 1
+        )
         self.total_duration = total_frames / self.fps
 
         self.timeline = AudioTimeline(total_duration=self.total_duration)
@@ -100,8 +105,7 @@ class AudioPipeline:
         text = cfg.get("text", "").strip()
         if not text:
             text = (
-                f"How toxic is {title} from {year}? "
-                "Let's check the Daily Slur Meter!"
+                f"How toxic is {title} from {year}? Let's check the Daily Slur Meter!"
             )
 
         intro_start = self.timing.get("intro_hold", {}).get("start_time", 0.0)
@@ -233,9 +237,12 @@ class AudioPipeline:
     #  Generate audio files via providers
     # ─────────────────────────────────────────────
 
-    def generate_all(self) -> None:
+    def generate_all(
+        self, progress_cb: Callable[[int, int], None] | None = None
+    ) -> None:
         """Run each layer's provider to produce its audio file."""
-        for layer in self.timeline.layers:
+        total = len(self.timeline.layers)
+        for index, layer in enumerate(self.timeline.layers, 1):
             output_file = self.audio_dir / f"{layer.name}.mp3"
             provider = get_provider(layer.provider_name, layer.provider_kwargs)
             provider.generate(
@@ -248,18 +255,39 @@ class AudioPipeline:
             # For TTS layers that duck others, set end from actual audio duration
             # so the duck window matches the real voiceover length.
             if layer.duck_others and layer.end is None and output_file.exists():
-                import json as _json
-                import subprocess as _sp
                 try:
-                    r = _sp.run(
-                        ["ffprobe", "-v", "quiet", "-print_format", "json",
-                         "-show_streams", str(output_file)],
-                        capture_output=True, text=True, check=True,
+                    result = subprocess.run(
+                        [
+                            "ffprobe",
+                            "-v",
+                            "quiet",
+                            "-print_format",
+                            "json",
+                            "-show_streams",
+                            str(output_file),
+                        ],
+                        capture_output=True,
+                        text=True,
+                        check=True,
+                        shell=False,
                     )
-                    dur = float(_json.loads(r.stdout)["streams"][0]["duration"])
+                    dur = float(json.loads(result.stdout)["streams"][0]["duration"])
                     layer.end = layer.start + dur
-                except Exception:
-                    pass
+                except (
+                    OSError,
+                    KeyError,
+                    IndexError,
+                    TypeError,
+                    ValueError,
+                    json.JSONDecodeError,
+                    subprocess.SubprocessError,
+                ) as exc:
+                    self._warn(
+                        f"Could not determine duration for audio layer {layer.name} "
+                        f"({type(exc).__name__})."
+                    )
+            if progress_cb is not None:
+                progress_cb(index, total)
 
     # ─────────────────────────────────────────────
     #  Mix down to final audio track
@@ -269,3 +297,7 @@ class AudioPipeline:
         """Combine all generated layers into one audio file."""
         mixer = AudioMixer()
         return mixer.mix(self.timeline, output_path)
+
+    def _warn(self, message: str) -> None:
+        if self.warning_callback is not None:
+            self.warning_callback(message)

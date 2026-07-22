@@ -9,7 +9,9 @@ Builds an ffmpeg filtergraph that:
 
 from __future__ import annotations
 
+import os
 import subprocess
+import uuid
 from pathlib import Path
 
 from .layers import AudioLayer, AudioTimeline
@@ -23,7 +25,9 @@ class AudioMixer:
 
     def mix(self, timeline: AudioTimeline, output_path: Path) -> Path:
         """Render *timeline* to a single audio file at *output_path*."""
-        layers = [layer for layer in timeline.layers if layer.file and layer.file.exists()]
+        layers = [
+            layer for layer in timeline.layers if layer.file and layer.file.exists()
+        ]
         if not layers:
             # No audio layers — produce silence for the video duration
             return self._make_silence(timeline.total_duration, output_path)
@@ -43,16 +47,23 @@ class AudioMixer:
         cmd += ["-i", str(layer.file)]
 
         filters = self._layer_filters(layer, idx=0, total_dur=total_dur)
-        pad = f"[0:a]{';'.join(filters)}apad,atrim=0:{total_dur}" if filters else \
-              f"[0:a]apad,atrim=0:{total_dur}"
+        pad = (
+            f"[0:a]{';'.join(filters)}apad,atrim=0:{total_dur}"
+            if filters
+            else f"[0:a]apad,atrim=0:{total_dur}"
+        )
 
         cmd += ["-af", pad]
         cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", str(self.sample_rate)]
-        cmd += [str(output_path)]
+        partial = self._partial(output_path)
+        cmd += [str(partial)]
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(cmd, check=True, capture_output=True)
-        return output_path
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, shell=False)
+            return self._promote(partial, output_path)
+        finally:
+            partial.unlink(missing_ok=True)
 
     # ── Multi-layer complex mix ─────────────────
 
@@ -94,17 +105,19 @@ class AudioMixer:
         cmd += ["-filter_complex", filtergraph]
         cmd += ["-map", "[out]"]
         cmd += ["-c:a", "aac", "-b:a", "128k"]
-        cmd += [str(output_path)]
+        partial = self._partial(output_path)
+        cmd += [str(partial)]
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(cmd, check=True, capture_output=True)
-        return output_path
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, shell=False)
+            return self._promote(partial, output_path)
+        finally:
+            partial.unlink(missing_ok=True)
 
     # ── Per-layer filter chain builder ──────────
 
-    def _build_layer_chain(
-        self, layer: AudioLayer, idx: int, total_dur: float
-    ) -> str:
+    def _build_layer_chain(self, layer: AudioLayer, idx: int, total_dur: float) -> str:
         """Return a filtergraph chain string for one layer (without output label)."""
         parts: list[str] = []
 
@@ -197,7 +210,9 @@ class AudioMixer:
             current_label = f"[a{layer_idx}]"
             for win_idx, (d_start, d_end, duck_vol) in enumerate(windows):
                 is_last = win_idx == len(windows) - 1
-                next_label = f"[a{layer_idx}d]" if is_last else f"[a{layer_idx}d{win_idx}]"
+                next_label = (
+                    f"[a{layer_idx}d]" if is_last else f"[a{layer_idx}d{win_idx}]"
+                )
                 new_parts.append(
                     f"{current_label}"
                     f"volume=volume={duck_vol:.2f}"
@@ -218,15 +233,41 @@ class AudioMixer:
 
     def _make_silence(self, duration: float, output_path: Path) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [
-                "ffmpeg", "-y",
-                "-f", "lavfi", "-i", f"anullsrc=r={self.sample_rate}:cl=stereo",
-                "-t", str(duration),
-                "-c:a", "aac", "-b:a", "128k",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
+        partial = self._partial(output_path)
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    f"anullsrc=r={self.sample_rate}:cl=stereo",
+                    "-t",
+                    str(duration),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    str(partial),
+                ],
+                check=True,
+                capture_output=True,
+                shell=False,
+            )
+            return self._promote(partial, output_path)
+        finally:
+            partial.unlink(missing_ok=True)
+
+    @staticmethod
+    def _partial(output_path: Path) -> Path:
+        return output_path.with_name(
+            f".{output_path.stem}.{uuid.uuid4().hex}.partial{output_path.suffix}"
         )
+
+    @staticmethod
+    def _promote(partial: Path, output_path: Path) -> Path:
+        if not partial.is_file() or partial.stat().st_size <= 0:
+            raise RuntimeError("ffmpeg produced empty audio output")
+        os.replace(partial, output_path)
         return output_path

@@ -8,6 +8,10 @@ only the progress indicator moves.
 Portrait format: 540×640 px per frame (scaled to 1080×1280 by the compositor).
 """
 
+import io
+import os
+import shutil
+import uuid
 from pathlib import Path
 
 import matplotlib
@@ -32,12 +36,12 @@ class RagePlotter:
     def __init__(self, config: dict):
         c = config.get("video", {}).get("colors", {})
         self.colors = {
-            "hard":    c.get("hard_slur",  "#ff1744"),
-            "soft":    c.get("soft_slur",  "#ffea00"),
-            "f_bombs": c.get("f_bomb",     "#d500f9"),
-            "bg":      c.get("background", "#0d0d0d"),
-            "text":    c.get("text",       "#ffffff"),
-            "accent":  c.get("accent",     "#76ff03"),
+            "hard": c.get("hard_slur", "#ff1744"),
+            "soft": c.get("soft_slur", "#ffea00"),
+            "f_bombs": c.get("f_bomb", "#d500f9"),
+            "bg": c.get("background", "#0d0d0d"),
+            "text": c.get("text", "#ffffff"),
+            "accent": c.get("accent", "#76ff03"),
         }
 
     # ─────────────────────────────────────────────────────
@@ -57,20 +61,21 @@ class RagePlotter:
 
         base, max_x = self._render_base(binned, output_dir, runtime_min=runtime_min)
         if base is None:
-            return self._blank_frames(output_dir, n_frames)
+            return self._blank_frames(output_dir, n_frames, progress_cb=progress_cb)
 
         display_max = runtime_min or max_x
         frames = []
         for i in range(n_frames):
             progress = i / max(n_frames - 1, 1)
-            path = self._stamp_progress(base, max_x, display_max, progress,
-                                        output_dir / f"frame_{i:05d}.png")
+            path = self._stamp_progress(
+                base, max_x, display_max, progress, output_dir / f"frame_{i:05d}.png"
+            )
             frames.append(path)
             if i % 15 == 0:
-                import shutil
-                shutil.copy(path, output_dir.parent / "preview.png")
-                if progress_cb: progress_cb("Generating...", i, n_frames)
-        if progress_cb: progress_cb("Generating...", n_frames, n_frames)
+                self._atomic_preview(path, output_dir.parent / "preview.png")
+            if progress_cb:
+                progress_cb("Generating...", i + 1, n_frames)
+        base.close()
         return frames
 
     def generate_specific_frames(
@@ -91,11 +96,19 @@ class RagePlotter:
 
         display_max = runtime_min or max_x
         paths = []
-        for i in frame_indices:
-            progress = i / max(total_frames - 1, 1)
-            path = self._stamp_progress(base, max_x, display_max, progress,
-                                        output_dir / f"frame_{i:05d}.png")
-            paths.append(path)
+        try:
+            for i in frame_indices:
+                progress = i / max(total_frames - 1, 1)
+                path = self._stamp_progress(
+                    base,
+                    max_x,
+                    display_max,
+                    progress,
+                    output_dir / f"frame_{i:05d}.png",
+                )
+                paths.append(path)
+        finally:
+            base.close()
         return paths
 
     # ─────────────────────────────────────────────────────
@@ -103,7 +116,9 @@ class RagePlotter:
     # ─────────────────────────────────────────────────────
 
     def _render_base(
-        self, binned: list[dict], output_dir: Path,
+        self,
+        binned: list[dict],
+        output_dir: Path,
         runtime_min: "float | None" = None,
     ) -> "tuple[Image.Image | None, float]":
         """Render the complete graph (all data, no progress line) → PIL Image."""
@@ -114,14 +129,14 @@ class RagePlotter:
         if "minute" not in df.columns or df.empty:
             return None, 0.0
 
-        x      = df["minute"].values.astype(float)
-        y_hard = df.get("hard",    pd.Series(0, index=df.index)).astype(float).values
-        y_soft = df.get("soft",    pd.Series(0, index=df.index)).astype(float).values
-        y_f    = df.get("f_bombs", pd.Series(0, index=df.index)).astype(float).values
+        x = df["minute"].values.astype(float)
+        y_hard = df.get("hard", pd.Series(0, index=df.index)).astype(float).values
+        y_soft = df.get("soft", pd.Series(0, index=df.index)).astype(float).values
+        y_f = df.get("f_bombs", pd.Series(0, index=df.index)).astype(float).values
 
         cum_hard = np.cumsum(y_hard)
         cum_soft = np.cumsum(y_soft)
-        cum_f    = np.cumsum(y_f)
+        cum_f = np.cumsum(y_f)
 
         max_x = float(x.max()) if len(x) > 0 else 60.0
         axis_max = max(runtime_min or 0.0, max_x)
@@ -136,7 +151,7 @@ class RagePlotter:
             _, idx = np.unique(xp, return_index=True)
             xp, yp = xp[idx], yp[idx]
             if len(xp) < 4:
-                return xp, yp   # too sparse for cubic — just use raw
+                return xp, yp  # too sparse for cubic — just use raw
             k = min(3, len(xp) - 1)
             spl = make_interp_spline(xp, yp, k=k)
             ys = spl(x_dense)
@@ -155,16 +170,16 @@ class RagePlotter:
             (22, 0.02),
             (16, 0.04),
             (11, 0.07),
-            (7,  0.12),
-            (4,  0.22),
+            (7, 0.12),
+            (4, 0.22),
             (2.5, 0.50),
             (1.4, 0.95),
         ]
 
         for color, data, label in [
-            (self.colors["hard"],    cum_hard, "Hard Slurs"),
-            (self.colors["soft"],    cum_soft, "Soft Slurs"),
-            (self.colors["f_bombs"], cum_f,    "F-Bombs"),
+            (self.colors["hard"], cum_hard, "Hard Slurs"),
+            (self.colors["soft"], cum_soft, "Soft Slurs"),
+            (self.colors["f_bombs"], cum_f, "F-Bombs"),
         ]:
             xs, ys = _smooth(x, data)
             for lw, alpha in glow_layers[:-1]:
@@ -178,11 +193,14 @@ class RagePlotter:
 
         fig.subplots_adjust(left=0.02, right=0.98, top=0.82, bottom=0.14)
 
-        base_path = output_dir / "_base.png"
-        fig.savefig(base_path, dpi=100, transparent=True)
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=100, transparent=True)
         plt.close(fig)
+        buffer.seek(0)
+        base = Image.open(buffer).convert("RGBA")
+        buffer.close()
 
-        return Image.open(base_path).convert("RGBA"), max_x
+        return base, max_x
 
     def _stamp_progress(
         self,
@@ -196,7 +214,7 @@ class RagePlotter:
         img = base.copy()
 
         # Map data x → pixel x
-        left_frac  = 0.02
+        left_frac = 0.02
         right_frac = 0.98
         plot_x0 = int(self.W * left_frac)
         plot_x1 = int(self.W * right_frac)
@@ -211,21 +229,22 @@ class RagePlotter:
         S = 8  # noqa: N806  # supersampling factor for anti-aliasing
         ow, oh = self.W * S, self.H * S
         overlay = Image.new("RGBA", (ow, oh), (0, 0, 0, 0))
-        odraw   = ImageDraw.Draw(overlay)
+        odraw = ImageDraw.Draw(overlay)
 
         accent = self._hex(self.colors["accent"])
-        apx    = px * S
+        apx = px * S
 
         # Dashed vertical progress line
-        top_frac    = 0.80
+        top_frac = 0.80
         bottom_frac = 0.16
-        y_top    = int(oh * (1 - top_frac))
+        y_top = int(oh * (1 - top_frac))
         y_bottom = int(oh * (1 - bottom_frac))
         dash, gap_d = 12, 8
         y = y_top
         while y < y_bottom:
-            odraw.line([(apx, y), (apx, min(y + dash, y_bottom))],
-                       fill=accent + (90,), width=4)
+            odraw.line(
+                [(apx, y), (apx, min(y + dash, y_bottom))], fill=accent + (90,), width=4
+            )
             y += dash + gap_d
 
         # Load fonts at 2× size
@@ -234,6 +253,7 @@ class RagePlotter:
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         ]
+
         def _font2x(size):
             for p in font_paths:
                 try:
@@ -244,10 +264,10 @@ class RagePlotter:
 
         # White pill timer — bottom center
         cutoff_min = progress * display_max
-        label  = f"{cutoff_min:.0f} / {display_max:.0f} min"
-        pfont  = _font2x(18)
-        tw     = int(odraw.textlength(label, font=pfont))
-        th     = 18 * S
+        label = f"{cutoff_min:.0f} / {display_max:.0f} min"
+        pfont = _font2x(18)
+        tw = int(odraw.textlength(label, font=pfont))
+        th = 18 * S
         pad_x, pad_y = 18 * S, 8 * S
         pill_w = tw + pad_x * 2
         pill_h = th + pad_y * 2
@@ -266,27 +286,34 @@ class RagePlotter:
         )
 
         # Legend — top center
-        lfont   = _font2x(14)
-        line_w  = 18 * S
+        lfont = _font2x(14)
+        line_w = 18 * S
         gap_leg = 14 * S
         legend_items = [
             ("Hard Slurs", self._hex(self.colors["hard"])),
             ("Soft Slurs", self._hex(self.colors["soft"])),
-            ("F-Bombs",    self._hex(self.colors["f_bombs"])),
+            ("F-Bombs", self._hex(self.colors["f_bombs"])),
         ]
-        spacing     = 20 * S
-        item_widths = [line_w + gap_leg + int(odraw.textlength(lbl, font=lfont))
-                       for lbl, _ in legend_items]
+        spacing = 20 * S
+        item_widths = [
+            line_w + gap_leg + int(odraw.textlength(lbl, font=lfont))
+            for lbl, _ in legend_items
+        ]
         total_w = sum(item_widths) + spacing * (len(legend_items) - 1)
         lx = (ow - total_w) // 2
         ly = 10 * S
 
         for (lbl, rgb), iw in zip(legend_items, item_widths, strict=False):
-            c    = rgb + (220,)
-            my   = ly + 7 * S
+            c = rgb + (220,)
+            my = ly + 7 * S
             odraw.line([(lx, my), (lx + line_w, my)], fill=c, width=3 * S)
-            odraw.text((lx + line_w + gap_leg, ly), lbl,
-                       fill=(200, 200, 200, 200), font=lfont, anchor="lt")
+            odraw.text(
+                (lx + line_w + gap_leg, ly),
+                lbl,
+                fill=(200, 200, 200, 200),
+                font=lfont,
+                anchor="lt",
+            )
             lx += iw + spacing
 
         # Scale overlay down → anti-aliased
@@ -296,19 +323,37 @@ class RagePlotter:
         img.save(out_path)
         return out_path
 
-    def _blank_frames(self, output_dir: Path, n: int) -> list[Path]:
+    def _blank_frames(self, output_dir: Path, n: int, progress_cb=None) -> list[Path]:
         base = Image.new("RGBA", (self.W, self.H), (0, 0, 0, 0))
         draw = ImageDraw.Draw(base)
-        draw.text((self.W // 2, self.H // 2), "No subtitle data",
-                  fill=(255, 255, 255, 180), anchor="mm")
+        draw.text(
+            (self.W // 2, self.H // 2),
+            "No subtitle data",
+            fill=(255, 255, 255, 180),
+            anchor="mm",
+        )
         frames = []
         for i in range(n):
             path = output_dir / f"frame_{i:05d}.png"
             base.save(path)
             frames.append(path)
+            if progress_cb:
+                progress_cb("Generating...", i + 1, n)
         return frames
+
+    @staticmethod
+    def _atomic_preview(source: Path, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        partial = destination.with_name(
+            f".{destination.stem}.{uuid.uuid4().hex}.partial{destination.suffix}"
+        )
+        try:
+            shutil.copy2(source, partial)
+            os.replace(partial, destination)
+        finally:
+            partial.unlink(missing_ok=True)
 
     @staticmethod
     def _hex(h: str) -> tuple:
         h = h.lstrip("#")
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))

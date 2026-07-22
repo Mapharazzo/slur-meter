@@ -9,32 +9,33 @@ Layout (1080 × 1920):
 """
 
 import math
+import operator
 import re
+from collections.abc import Iterator
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
-GRAPH_H  = 1280   # top — animated plot
-POSTER_H = 640    # bottom — movie info + thumbnail
+GRAPH_H = 1280  # top — animated plot
+POSTER_H = 640  # bottom — movie info + thumbnail
 
 
 class VideoCompositor:
-
     def __init__(self, config: dict):
         v = config.get("video", {})
-        self.width  = v.get("resolution", [1080, 1920])[0]
+        self.width = v.get("resolution", [1080, 1920])[0]
         self.height = v.get("resolution", [1080, 1920])[1]
-        self.fps    = v.get("fps", 30)
+        self.fps = v.get("fps", 30)
         c = v.get("colors", {})
         self.colors = {
-            "bg":     c.get("background", "#0d0d0d"),
-            "text":   c.get("text",       "#ffffff"),
-            "accent": c.get("accent",     "#76ff03"),
-            "hard":   c.get("hard_slur",  "#ff1744"),
-            "soft":   c.get("soft_slur",  "#ffea00"),
-            "f_bomb": c.get("f_bomb",     "#d500f9"),
-            "dim":    "#aaaaaa",
+            "bg": c.get("background", "#0d0d0d"),
+            "text": c.get("text", "#ffffff"),
+            "accent": c.get("accent", "#76ff03"),
+            "hard": c.get("hard_slur", "#ff1744"),
+            "soft": c.get("soft_slur", "#ffea00"),
+            "f_bomb": c.get("f_bomb", "#d500f9"),
+            "dim": "#aaaaaa",
         }
 
     # ─────────────────────────────────────────────
@@ -59,53 +60,61 @@ class VideoCompositor:
     ) -> Image.Image:
         """Return a 1080×640 PIL image: brand banner + movie info card."""
         img = Image.new("RGB", (self.width, POSTER_H), self._hex(self.colors["bg"]))
-            
+
         draw = ImageDraw.Draw(img)
 
-        info     = movie_info or {}
+        info = movie_info or {}
         director = (info.get("Director") or "").split(",")[0].strip()
-        actors   = (info.get("Actors") or "").strip()
-        imdb_r   = (info.get("imdbRating") or "").strip()
-        runtime  = (info.get("Runtime") or "").strip()
-        awards   = (info.get("Awards") or "").strip()
+        actors = (info.get("Actors") or "").strip()
+        imdb_r = (info.get("imdbRating") or "").strip()
+        runtime = (info.get("Runtime") or "").strip()
+        awards = (info.get("Awards") or "").strip()
 
-        cx      = self.width // 2
-        accent  = self.colors["accent"]
+        cx = self.width // 2
+        accent = self.colors["accent"]
 
         # ── Brand banner ──
-        draw.text((cx, 36), "DAILY SLUR METER",
-                  fill=accent, font=self._font(46), anchor="mt")
+        draw.text(
+            (cx, 36), "DAILY SLUR METER", fill=accent, font=self._font(46), anchor="mt"
+        )
         if day_number is not None:
-            draw.text((cx, 92), f"DAY  #{day_number}",
-                      fill=self.colors["dim"], font=self._font(28), anchor="mt")
-        draw.line([(60, 130), (self.width - 60, 130)],
-                  fill=self._hex(accent), width=1)
+            draw.text(
+                (cx, 92),
+                f"DAY  #{day_number}",
+                fill=self.colors["dim"],
+                font=self._font(28),
+                anchor="mt",
+            )
+        draw.line([(60, 130), (self.width - 60, 130)], fill=self._hex(accent), width=1)
 
         # ── Movie details — vertically centered in remaining space (y: 140 – 640) ──
         DETAIL_TOP = 140  # noqa: N806
-        detail_h   = POSTER_H - DETAIL_TOP
+        detail_h = POSTER_H - DETAIL_TOP
 
-        has_meta    = bool(year or (runtime and runtime != "N/A") or (imdb_r and imdb_r != "N/A"))
-        has_dir     = bool(director and director != "N/A")
-        has_actors  = bool(actors and actors != "N/A")
-        has_awards  = bool(awards and awards not in ("N/A", ""))
+        has_meta = bool(
+            year or (runtime and runtime != "N/A") or (imdb_r and imdb_r != "N/A")
+        )
+        has_dir = bool(director and director != "N/A")
+        has_actors = bool(actors and actors != "N/A")
+        has_awards = bool(awards and awards not in ("N/A", ""))
 
-        block_h = 74   # title
+        block_h = 74  # title
         if has_meta:
             block_h += 50
         if has_dir:
             block_h += 54
         if has_actors:
             block_h += 52
-        block_h += 28   # divider
+        block_h += 28  # divider
         if has_awards:
             block_h += 40
 
         y = DETAIL_TOP + max(10, (detail_h - block_h) // 2)
 
         # ── Title ──
-        draw.text((cx, y), title,
-                  fill=self.colors["text"], font=self._font(58), anchor="mt")
+        draw.text(
+            (cx, y), title, fill=self.colors["text"], font=self._font(58), anchor="mt"
+        )
         y += 74
 
         # ── Year · Runtime · ★ IMDb ──
@@ -117,21 +126,36 @@ class VideoCompositor:
         if imdb_r and imdb_r != "N/A":
             meta_parts.append(f"★ {imdb_r}")
         if meta_parts:
-            draw.text((cx, y), "   ·   ".join(meta_parts),
-                      fill=self.colors["dim"], font=self._font(30), anchor="mt")
+            draw.text(
+                (cx, y),
+                "   ·   ".join(meta_parts),
+                fill=self.colors["dim"],
+                font=self._font(30),
+                anchor="mt",
+            )
             y += 50
 
         # ── Director ──
         if has_dir:
-            draw.text((cx, y), f"Directed by  {director}",
-                      fill=self.colors["text"], font=self._font(34), anchor="mt")
+            draw.text(
+                (cx, y),
+                f"Directed by  {director}",
+                fill=self.colors["text"],
+                font=self._font(34),
+                anchor="mt",
+            )
             y += 54
 
         # ── Cast ──
         if has_actors:
             actor_list = [a.strip() for a in actors.split(",")][:3]
-            draw.text((cx, y), "With  " + ",   ".join(actor_list),
-                      fill=self.colors["dim"], font=self._font(28), anchor="mt")
+            draw.text(
+                (cx, y),
+                "With  " + ",   ".join(actor_list),
+                fill=self.colors["dim"],
+                font=self._font(28),
+                anchor="mt",
+            )
             y += 52
 
         # ── Accent divider ──
@@ -151,11 +175,13 @@ class VideoCompositor:
     #  Content areas (bottom 1280px)
     # ─────────────────────────────────────────────
 
-    def _make_frame(self, graph_content: Image.Image,
-                    poster_area: Image.Image) -> np.ndarray:
+    def _make_frame(
+        self, graph_content: Image.Image, poster_area: Image.Image
+    ) -> np.ndarray:
         """Combine poster info (top) and graph (bottom) into a full 1080×1920 frame."""
-        frame = Image.new("RGB", (self.width, self.height),
-                          self._hex(self.colors["bg"]))
+        frame = Image.new(
+            "RGB", (self.width, self.height), self._hex(self.colors["bg"])
+        )
         frame.paste(poster_area, (0, 0))
         frame.paste(graph_content, (0, POSTER_H))
         # Thick accent separator bar at the boundary
@@ -176,13 +202,15 @@ class VideoCompositor:
         raw_poster = self._load_poster(poster_path)
         if raw_poster:
             ratio = min(self.width / raw_poster.width, GRAPH_H / raw_poster.height)
-            fit_w = int(raw_poster.width  * ratio)
+            fit_w = int(raw_poster.width * ratio)
             fit_h = int(raw_poster.height * ratio)
             scaled = raw_poster.resize((fit_w, fit_h), Image.LANCZOS)
             bg = Image.new("RGB", (self.width, GRAPH_H), (0, 0, 0))
             bg.paste(scaled, ((self.width - fit_w) // 2, (GRAPH_H - fit_h) // 2))
             bg = bg.filter(ImageFilter.GaussianBlur(radius=14))
-            bg = Image.blend(bg, Image.new("RGB", (self.width, GRAPH_H), (0, 0, 0)), alpha=0.68)
+            bg = Image.blend(
+                bg, Image.new("RGB", (self.width, GRAPH_H), (0, 0, 0)), alpha=0.68
+            )
         else:
             bg = Image.new("RGB", (self.width, GRAPH_H), self._hex(self.colors["bg"]))
         return bg
@@ -194,6 +222,16 @@ class VideoCompositor:
         day_number: "int | None" = None,
         duration: float = 2.0,
     ) -> list[np.ndarray]:
+        """Return a short preview list while production rendering streams."""
+        return list(self.iter_intro_hold(title, poster_path, day_number, duration))
+
+    def iter_intro_hold(
+        self,
+        title: str,
+        poster_path: "Path | None",
+        day_number: "int | None" = None,
+        duration: float = 2.0,
+    ) -> Iterator[np.ndarray]:
         """Full-canvas poster reveal with day banner overlay. No split layout yet."""
         n = int(duration * self.fps)
 
@@ -204,31 +242,47 @@ class VideoCompositor:
         frame_img = Image.new("RGB", (canvas_w, canvas_h), self._hex(self.colors["bg"]))
 
         if raw_poster:
-            x, y, w, h = self._fit_rect(raw_poster.width, raw_poster.height, canvas_w, canvas_h)
+            x, y, w, h = self._fit_rect(
+                raw_poster.width, raw_poster.height, canvas_w, canvas_h
+            )
             fitted = raw_poster.resize((w, h), Image.LANCZOS)
             frame_img.paste(fitted, (x, y))
 
         # Gradient veil — dark at top (brand) and bottom (title)
         veil = self._gradient_veil(canvas_w, canvas_h)
-        frame_img = Image.alpha_composite(frame_img.convert("RGBA"), veil).convert("RGB")
+        frame_img = Image.alpha_composite(frame_img.convert("RGBA"), veil).convert(
+            "RGB"
+        )
 
         draw = ImageDraw.Draw(frame_img)
         cx = canvas_w // 2
         accent = self.colors["accent"]
 
         # Brand at top
-        draw.text((cx, 52), "DAILY SLUR METER",
-                  fill=accent, font=self._font(52), anchor="mt")
+        draw.text(
+            (cx, 52), "DAILY SLUR METER", fill=accent, font=self._font(52), anchor="mt"
+        )
         if day_number is not None:
-            draw.text((cx, 116), f"DAY  #{day_number}",
-                      fill=self.colors["dim"], font=self._font(30), anchor="mt")
+            draw.text(
+                (cx, 116),
+                f"DAY  #{day_number}",
+                fill=self.colors["dim"],
+                font=self._font(30),
+                anchor="mt",
+            )
 
         # Movie title near bottom
-        draw.text((cx, canvas_h - 260), title,
-                  fill=self.colors["text"], font=self._font(72), anchor="mt")
+        draw.text(
+            (cx, canvas_h - 260),
+            title,
+            fill=self.colors["text"],
+            font=self._font(72),
+            anchor="mt",
+        )
 
         frame_arr = np.array(frame_img)
-        return [frame_arr] * n
+        for _ in range(n):
+            yield frame_arr
 
     def render_intro_transition(
         self,
@@ -237,6 +291,20 @@ class VideoCompositor:
         plotter_frames: "list[Path]",
         duration: float = 2.0,
     ) -> list[np.ndarray]:
+        """Return a short preview list while production rendering streams."""
+        return list(
+            self.iter_intro_transition(
+                poster_path, poster_area, plotter_frames, duration
+            )
+        )
+
+    def iter_intro_transition(
+        self,
+        poster_path: "Path | None",
+        poster_area: Image.Image,
+        plotter_frames: "list[Path]",
+        duration: float = 2.0,
+    ) -> Iterator[np.ndarray]:
         """Animate poster from full-canvas into the top 640px banner position.
 
         Simultaneously: poster blurs + darkens, brand banner fades in,
@@ -268,12 +336,13 @@ class VideoCompositor:
         else:
             dx, dy, dw, dh = 0, 0, self.width, POSTER_H
 
-        frames = []
         for i in range(n):
             t = i / max(n - 1, 1)
-            te = t * t * (3 - 2 * t)   # smoothstep
+            te = t * t * (3 - 2 * t)  # smoothstep
 
-            canvas = Image.new("RGB", (self.width, self.height), self._hex(self.colors["bg"]))
+            canvas = Image.new(
+                "RGB", (self.width, self.height), self._hex(self.colors["bg"])
+            )
 
             # ── Animated poster ──
             if raw_poster:
@@ -315,14 +384,15 @@ class VideoCompositor:
 
             # ── Accent separator bar fades in ──
             if banner_alpha > 0:
-                bar = Image.new("RGBA", (self.width, 8),
-                                self._hex(self.colors["accent"]) + (banner_alpha,))
+                bar = Image.new(
+                    "RGBA",
+                    (self.width, 8),
+                    self._hex(self.colors["accent"]) + (banner_alpha,),
+                )
                 bar_y = POSTER_H - 4
                 canvas.paste(bar, (0, bar_y), mask=bar.split()[3])
 
-            frames.append(np.array(canvas))
-
-        return frames
+            yield np.array(canvas)
 
     def render_graph_segment(
         self,
@@ -331,21 +401,34 @@ class VideoCompositor:
         poster_path: "Path | None" = None,
         duration: float = 47.0,
     ) -> list[np.ndarray]:
-        n  = int(duration * self.fps)
+        """Return a short preview list while production rendering streams."""
+        return list(
+            self.iter_graph_segment(plotter_frames, poster_area, poster_path, duration)
+        )
+
+    def iter_graph_segment(
+        self,
+        plotter_frames: list[Path],
+        poster_area: Image.Image,
+        poster_path: "Path | None" = None,
+        duration: float = 47.0,
+    ) -> Iterator[np.ndarray]:
+        n = int(duration * self.fps)
         bg = self._make_graph_bg(poster_path)
 
         if not plotter_frames:
-            return [self._make_frame(bg, poster_area)] * n
+            frame = self._make_frame(bg, poster_area)
+            for _ in range(n):
+                yield frame
+            return
 
-        frames = []
         last = len(plotter_frames) - 1
         for i in range(n):
             content = bg.copy()
             graph_png = Image.open(str(plotter_frames[min(i, last)])).convert("RGBA")
             graph_png = graph_png.resize((self.width, GRAPH_H), Image.LANCZOS)
             content.paste(graph_png, (0, 0), mask=graph_png.split()[3])
-            frames.append(self._make_frame(content, poster_area))
-        return frames
+            yield self._make_frame(content, poster_area)
 
     def render_verdict(
         self,
@@ -354,13 +437,23 @@ class VideoCompositor:
         poster_area: Image.Image,
         duration: float = 9.0,
     ) -> list[np.ndarray]:
-        n  = int(duration * self.fps)
-        s  = summary or {}
+        """Return a short preview list while production rendering streams."""
+        return list(self.iter_verdict(title, summary, poster_area, duration))
+
+    def iter_verdict(
+        self,
+        title: str,
+        summary: dict,
+        poster_area: Image.Image,
+        duration: float = 9.0,
+    ) -> Iterator[np.ndarray]:
+        n = int(duration * self.fps)
+        s = summary or {}
         rating = s.get("rating", "RATED")
-        hard   = s.get("total_hard", 0)
-        soft   = s.get("total_soft", 0)
-        f      = s.get("total_f_bombs", 0)
-        peak   = s.get("peak_minute", 0)
+        hard = s.get("total_hard", 0)
+        soft = s.get("total_soft", 0)
+        f = s.get("total_f_bombs", 0)
+        peak = s.get("peak_minute", 0)
         peak_s = s.get("peak_score", 0)
 
         cx = self.width // 2
@@ -369,11 +462,11 @@ class VideoCompositor:
         # Header is drawn separately (always present); stats slam in one by one.
         HEADER_Y = GRAPH_H // 2 - 330  # noqa: N806
         stats = [
-            (f"Hard Slurs:  {hard}",              self.colors["hard"],   34),
-            (f"Soft Slurs:  {soft}",              self.colors["soft"],   34),
-            (f"F-Bombs:     {f}",                 self.colors["f_bomb"], 34),
+            (f"Hard Slurs:  {hard}", self.colors["hard"], 34),
+            (f"Soft Slurs:  {soft}", self.colors["soft"], 34),
+            (f"F-Bombs:     {f}", self.colors["f_bomb"], 34),
             (f"Peak:        Min {peak}  (score {peak_s})", self.colors["dim"], 30),
-            (rating,                               self.colors["accent"], 52),
+            (rating, self.colors["accent"], 52),
         ]
 
         # Compute final y positions
@@ -381,11 +474,11 @@ class VideoCompositor:
         final_ys = []
         for _, _, fsize in stats:
             final_ys.append(y)
-            gap = 50 if fsize > 40 else 0   # extra gap before rating
+            gap = 50 if fsize > 40 else 0  # extra gap before rating
             y += fsize + 22 + gap
 
         # Animation timing: each item starts slamming SLAM_EVERY frames apart
-        SLAM_DUR = 18    # noqa: N806  # frames for one item's slam animation
+        SLAM_DUR = 18  # noqa: N806  # frames for one item's slam animation
         SLAM_EVERY = 22  # noqa: N806  # frames between each item's start
         RATING_DELAY = 15  # noqa: N806  # extra pause before the rating slams in
 
@@ -401,37 +494,41 @@ class VideoCompositor:
         def slam_y(frame_idx, item_start, y_final):
             elapsed = frame_idx - item_start
             if elapsed < 0:
-                return None          # not yet visible
+                return None  # not yet visible
             p = min(elapsed / SLAM_DUR, 1.0)
-            if p < 0.65:            # accelerating drop (gravity feel)
+            if p < 0.65:  # accelerating drop (gravity feel)
                 t2 = p / 0.65
                 offset = DROP * (1 - t2 * t2)
-            else:                   # overshoot + settle
+            else:  # overshoot + settle
                 t2 = (p - 0.65) / 0.35
                 offset = -12 * math.sin(t2 * math.pi) * (1 - t2)
             return int(y_final - offset)
 
-        frames = []
         for frame_idx in range(n):
-            content = Image.new("RGB", (self.width, GRAPH_H),
-                                self._hex(self.colors["bg"]))
+            content = Image.new(
+                "RGB", (self.width, GRAPH_H), self._hex(self.colors["bg"])
+            )
             draw = ImageDraw.Draw(content)
 
             # Header — always visible
-            draw.text((cx, HEADER_Y), "THE VERDICT",
-                      fill=self.colors["accent"], font=self._font(56), anchor="mt")
+            draw.text(
+                (cx, HEADER_Y),
+                "THE VERDICT",
+                fill=self.colors["accent"],
+                font=self._font(56),
+                anchor="mt",
+            )
 
             # Stats — slam in one by one
             for i, (text, color, fsize) in enumerate(stats):
                 y_pos = slam_y(frame_idx, start_frames[i], final_ys[i])
                 if y_pos is None:
                     continue
-                self._draw_with_emoji(draw, (cx, y_pos), text,
-                                      fill=color, size=fsize, anchor="mt")
+                self._draw_with_emoji(
+                    draw, (cx, y_pos), text, fill=color, size=fsize, anchor="mt"
+                )
 
-            frames.append(self._make_frame(content, poster_area))
-
-        return frames
+            yield self._make_frame(content, poster_area)
 
     # ─────────────────────────────────────────────
     #  Verdict timing (for SFX sync)
@@ -448,8 +545,8 @@ class VideoCompositor:
         *verdict_start_offset* is the time (seconds) when the verdict segment
         begins within the full video — used to get absolute timestamps.
         """
-        SLAM_DUR = 18      # noqa: N806
-        SLAM_EVERY = 22    # noqa: N806
+        SLAM_DUR = 18  # noqa: N806
+        SLAM_EVERY = 22  # noqa: N806
         RATING_DELAY = 15  # noqa: N806
 
         labels = ["hard_slurs", "soft_slurs", "f_bombs", "peak", "rating"]
@@ -466,12 +563,14 @@ class VideoCompositor:
             # Impact = end of the gravity-drop phase (p=0.65)
             impact_frame = start_frames[i] + int(SLAM_DUR * 0.65)
             impact_time = verdict_start_offset + impact_frame / fps
-            impacts.append({
-                "index": i,
-                "label": label,
-                "impact_frame": impact_frame,
-                "impact_time": impact_time,
-            })
+            impacts.append(
+                {
+                    "index": i,
+                    "label": label,
+                    "impact_frame": impact_frame,
+                    "impact_time": impact_time,
+                }
+            )
         return impacts
 
     # ─────────────────────────────────────────────
@@ -491,54 +590,67 @@ class VideoCompositor:
         progress_cb=None,
     ) -> dict:
         output_dir = Path(output_dir)
+        if output_dir.exists() and any(output_dir.iterdir()):
+            raise ValueError(
+                "render_all requires a fresh caller-provided staging directory"
+            )
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        poster_area = self.render_poster_area(title, year, poster_path, movie_info, day_number)
-
-        if progress_cb: progress_cb("intro_hold", 0, 1)
-        intro_hold       = self.render_intro_hold(title, poster_path, day_number)
-        
-        if progress_cb: progress_cb("intro_transition", 0, 1)
-        intro_transition = self.render_intro_transition(
-            poster_path, poster_area, plotter_frames or []
+        poster_area = self.render_poster_area(
+            title, year, poster_path, movie_info, day_number
         )
-        
-        if progress_cb: progress_cb("graph", 0, 1)
-        graph_duration = (len(plotter_frames) / self.fps + 1.0) if plotter_frames else 47.0
-        graph   = self.render_graph_segment(plotter_frames or [], poster_area, poster_path, duration=graph_duration)
-        
-        if progress_cb: progress_cb("verdict", 0, 1)
-        verdict = self.render_verdict(title, summary or {}, poster_area)
-
-        segments = {
-            "intro_hold":       intro_hold,
-            "intro_transition": intro_transition,
-            "graph":            graph,
-            "verdict":          verdict,
+        graph_duration = (
+            (len(plotter_frames) / self.fps + 1.0) if plotter_frames else 47.0
+        )
+        planned = {
+            "intro_hold": int(2.0 * self.fps),
+            "intro_transition": int(2.0 * self.fps),
+            "graph": int(graph_duration * self.fps),
+            "verdict": int(9.0 * self.fps),
+        }
+        iterators = {
+            "intro_hold": self.iter_intro_hold(title, poster_path, day_number),
+            "intro_transition": self.iter_intro_transition(
+                poster_path, poster_area, plotter_frames or []
+            ),
+            "graph": self.iter_graph_segment(
+                plotter_frames or [],
+                poster_area,
+                poster_path,
+                duration=graph_duration,
+            ),
+            "verdict": self.iter_verdict(title, summary or {}, poster_area),
         }
 
         all_dir = output_dir / "concat"
         all_dir.mkdir(parents=True, exist_ok=True)
         global_idx = 0
         segment_timing: dict[str, dict] = {}
+        segment_outputs: dict[str, dict] = {}
         for seg_name in ["intro_hold", "intro_transition", "graph", "verdict"]:
             seg_dir = output_dir / seg_name
             seg_dir.mkdir(parents=True, exist_ok=True)
             start_frame = global_idx
-            
-            total_seg = len(segments[seg_name])
-            for idx, frame in enumerate(segments[seg_name]):
+            iterator = iterators[seg_name]
+            total_seg = operator.length_hint(iterator) or planned[seg_name]
+            if progress_cb:
+                progress_cb(seg_name, 0, total_seg)
+            written = 0
+            for idx, frame in enumerate(iterator):
                 img = Image.fromarray(frame)
                 img.save(seg_dir / f"{idx:05d}.png")
                 img.save(all_dir / f"{global_idx:05d}.png")
-                if global_idx % 15 == 0:
-                    img.save(output_dir.parent / "preview.png")
-                    if progress_cb: progress_cb(seg_name, idx, total_seg)
                 global_idx += 1
-                
-            if progress_cb and total_seg > 0:
-                progress_cb(seg_name, total_seg, total_seg)
-                
+                written += 1
+                if progress_cb:
+                    progress_cb(seg_name, written, total_seg)
+                del img, frame
+
+            if written != total_seg:
+                raise ValueError(
+                    f"Segment {seg_name} produced {written} frames; expected {total_seg}"
+                )
+
             segment_timing[seg_name] = {
                 "start_frame": start_frame,
                 "end_frame": global_idx - 1,
@@ -546,9 +658,13 @@ class VideoCompositor:
                 "end_time": global_idx / self.fps,
                 "num_frames": global_idx - start_frame,
             }
+            segment_outputs[seg_name] = {
+                "directory": str(seg_dir),
+                "num_frames": written,
+            }
 
         return {
-            "segments": segments,
+            "segments": segment_outputs,
             "timing": segment_timing,
             "total_frames": global_idx,
             "total_duration": global_idx / self.fps,
@@ -560,12 +676,16 @@ class VideoCompositor:
 
     # Regex that matches a single leading emoji (including ZWJ sequences / variation selectors)
     _EMOJI_RE = re.compile(
-        r'^([\U00010000-\U0010ffff][\ufe0f\u20d0-\u20ff]?(?:\u200d[\U00010000-\U0010ffff][\ufe0f\u20d0-\u20ff]?)*'
-        r'|[\u2600-\u27bf][\ufe0f]?)'
+        r"^([\U00010000-\U0010ffff][\ufe0f\u20d0-\u20ff]?(?:\u200d[\U00010000-\U0010ffff][\ufe0f\u20d0-\u20ff]?)*"
+        r"|[\u2600-\u27bf][\ufe0f]?)"
     )
-    _EMOJI_NATIVE_SIZE = 109   # NotoColorEmoji is a bitmap font — only loads at this size
-    _EMOJI_FONT_PATH   = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
-    _emoji_font_cache: "ImageFont.FreeTypeFont | None | bool" = False  # False = unchecked
+    _EMOJI_NATIVE_SIZE = (
+        109  # NotoColorEmoji is a bitmap font — only loads at this size
+    )
+    _EMOJI_FONT_PATH = "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf"
+    _emoji_font_cache: "ImageFont.FreeTypeFont | None | bool" = (
+        False  # False = unchecked
+    )
 
     def _get_emoji_font(self) -> "ImageFont.FreeTypeFont | None":
         if self._emoji_font_cache is False:
@@ -591,8 +711,8 @@ class VideoCompositor:
             return None
         scratch = scratch.crop(bbox)
         # Scale so height matches target_size
-        scale  = target_size / scratch.height
-        new_w  = max(1, int(scratch.width * scale))
+        scale = target_size / scratch.height
+        new_w = max(1, int(scratch.width * scale))
         return scratch.resize((new_w, target_size), Image.LANCZOS)
 
     def _draw_with_emoji(
@@ -615,10 +735,10 @@ class VideoCompositor:
             draw.text(xy, text, fill=fill, font=self._font(size), anchor=anchor)
             return
 
-        emoji_str  = m.group(0)
-        rest       = text[m.end():].lstrip()
-        emoji_img  = self._render_emoji(emoji_str, size)
-        tfont      = self._font(size)
+        emoji_str = m.group(0)
+        rest = text[m.end() :].lstrip()
+        emoji_img = self._render_emoji(emoji_str, size)
+        tfont = self._font(size)
 
         if emoji_img is None:
             # Emoji font unavailable — draw text only
@@ -657,8 +777,8 @@ class VideoCompositor:
         veil = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         pixels = veil.load()
 
-        top_band = 200      # px — covers brand text area
-        bottom_band = 400   # px — covers movie title area
+        top_band = 200  # px — covers brand text area
+        bottom_band = 400  # px — covers movie title area
 
         for y in range(height):
             if y < top_band:
@@ -688,4 +808,4 @@ class VideoCompositor:
     @staticmethod
     def _hex(h: str) -> tuple:
         h = h.lstrip("#")
-        return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+        return tuple(int(h[i : i + 2], 16) for i in (0, 2, 4))
