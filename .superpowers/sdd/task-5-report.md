@@ -383,3 +383,105 @@ Modified `api/database.py`, `api/main.py`, `api/pipeline.py`, `api/subtitles.py`
 `src/video/encoder.py`, `src/video/plotter.py`, and their focused unit/integration tests.
 Added the implementation plan at
 `docs/superpowers/plans/2026-07-22-task-5-final-review-fixes.md`.
+
+---
+
+## Subtitle artifact and first-heartbeat fencing follow-up (2026-07-22)
+
+This section closes the final Important subtitle-filesystem finding and the intermittent
+blocking-stage heartbeat failure. The patch remains schema-neutral and uses injected local
+subtitle clients only. The protected local change in `scripts/get_youtube_token.py` remains
+untouched and outside the patch.
+
+### Causal evidence and RED/GREEN results
+
+- **A delayed first heartbeat could be overtaken by recovery.** In the retained failed
+  database, the worker claimed the job at `20:31:27.784090`, queued metadata at `.853385`,
+  moved it to running at `.882921`, and started its attempt at `.905797`. Recovery then
+  recorded `restart_recovery` at `.952694`, requeued the run/stage, interrupted the attempt,
+  and cleared both lease fields. The dispatcher heartbeat slept for `lease_seconds / 3`
+  before its first renewal, but its task could start late after the runner's synchronous
+  setup; the sleep was therefore measured from task scheduling rather than a fresh renewal.
+  The deterministic RED observed zero renewals when the runner reached its claimed boundary.
+  GREEN renews immediately, returns `False` through the existing lease-loss path, and sleeps
+  only between successful renewals. The strengthened integration requires a running run and
+  metadata stage, two non-null expiries, and an advancing expiry while the provider blocks.
+- **Subtitle bytes were outside the durable lease fence.** The store rejected stale candidate
+  mutations, but provider download and normalization still wrote the canonical candidate
+  path directly, and cache replacement used one shared partial without a lease check. Four
+  deterministic RED races reclaimed the lease during download, normalization, candidate
+  promotion, and IMDb-cache promotion. The dedicated candidate-promotion injection reclaims
+  after normalization and lets the replacement owner publish before the stale worker enters
+  the promotion helper. In each case the replacement bytes remain distinct and stable after
+  stale resumption. A fifth RED showed cache publication had no guard API. GREEN performs
+  download/copy,
+  inspection, and normalization only in a UUID-named per-execution directory. Candidate and
+  cache publication use target-specific advisory locks, fsynced staging, a live execution
+  revalidation immediately before `os.replace`, directory fsync, and normal-exit cleanup.
+
+### Publication and heartbeat invariants
+
+- A provider filename is never a path. Provider, upload, resumed, and cached candidate bytes
+  are copied into an opaque per-execution directory on the destination filesystem.
+- Normalization can mutate only private staging bytes. A reclaimed worker cannot touch the
+  stable candidate while finishing a delayed download or normalization call.
+- Candidate and IMDb-cache writers serialize across processes on a per-target lock. After
+  acquiring that lock, the writer revalidates the exact lease/cancellation capability at the
+  last boundary before atomic replacement. Lease loss raises cancellation and preserves the
+  replacement owner's bytes.
+- Staging names are unique, are removed on every normal Python exit including cancellation,
+  and can never be selected as an artifact path. A process crash can leave an unreferenced
+  partial, but cannot corrupt or partially expose the stable file.
+- Every heartbeat execution attempts renewal before its first sleep. Failed renewal returns
+  `False` immediately so `_execute` cancels and observes the nested runner.
+
+### Verification
+
+The five subtitle publication regressions first failed for the intended overwrite/missing
+guard reasons, then passed together. Existing subtitle service/cache coverage also passed:
+
+```text
+43 passed, 1 known pysrt deprecation warning
+```
+
+The deterministic heartbeat regression failed with `0 == 1`, then passed with the existing
+periodic/error paths. The blocking integration passed 50 consecutive isolated runs, and the
+entire generation scenario module passed six consecutive module-order runs.
+
+Fresh affected and consolidated Task 3-5 suites:
+
+```text
+75 passed, 2 known warnings
+175 passed, 6 known warnings
+```
+
+Fresh full repository suite:
+
+```text
+242 passed, 1 failed, 26 warnings
+```
+
+The sole failure remains the unchanged disclosed baseline
+`tests/integration/test_pipeline.py::TestAnalysisEngineIntegration::test_django_srt_pipeline`:
+the engine reports 200 f-bombs while that test expects 100. Changed-file Ruff reported
+`All checks passed!`, and `git diff --check` exited 0.
+
+### Independent re-review
+
+The first independent re-review found no production-mechanism or heartbeat defect, but marked
+the patch **Needs fixes** because the normalization race cancelled at the next context check
+and therefore did not exercise the in-lock candidate-promotion guard. A dedicated promotion
+race was then added. With that guard temporarily disabled, the regression deterministically
+failed because stale `Hello` bytes replaced the replacement owner's `Replacement` bytes;
+restoring the guard made all five filesystem regressions pass together. Final re-review is
+**Ready**, with no Critical, Important, or Minor findings. It confirmed that the new race
+enters the stale promotion helper after replacement publication, the live guard rejects the
+stale writer inside the lock immediately before replacement, heartbeat lease-loss handling
+remains correct, the report and verification counts are accurate, and the patch has no
+schema, external-call, Task 6, or protected-helper expansion.
+
+### Follow-up files
+
+Modified `api/dispatcher.py`, `api/subtitles.py`, `src/data/opensubtitles.py`, and their
+focused unit/integration tests. Added the implementation plan at
+`docs/superpowers/plans/2026-07-22-subtitle-artifact-heartbeat-fixes.md`.

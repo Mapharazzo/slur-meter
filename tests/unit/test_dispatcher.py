@@ -175,6 +175,33 @@ async def test_long_runner_gets_periodic_lease_heartbeat_without_progress():
 
 
 @pytest.mark.anyio
+async def test_heartbeat_renews_immediately_at_claimed_runner_boundary():
+    store = LeaseRecordingStore()
+    started = asyncio.Event()
+    gate = asyncio.Event()
+
+    class ClaimedRunner:
+        async def run(self, job_id, lease_owner):
+            started.set()
+            await gate.wait()
+
+    dispatcher = JobDispatcher(
+        store,
+        ClaimedRunner,
+        poll_interval=0.01,
+        lease_seconds=0.06,
+    )
+
+    await dispatcher.start()
+    await started.wait()
+    renewals_at_boundary = store.renewals
+    gate.set()
+    await dispatcher.stop()
+
+    assert renewals_at_boundary == 1
+
+
+@pytest.mark.anyio
 async def test_bounded_stop_cancels_runner_and_requeues_owned_work(store):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     store.ensure_stage(job["id"], "analysis", state="queued")

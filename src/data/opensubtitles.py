@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import io
 import os
 import re
+import uuid
 import zipfile
+from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -196,13 +201,80 @@ class SubtitleCache:
         path = self._dir / f"{self.key(imdb_id)}.srt"
         return path if path.exists() else None
 
-    def store(self, imdb_id: str, srt_path: Path, *, replace: bool = False) -> Path:
+    def store(
+        self,
+        imdb_id: str,
+        srt_path: Path,
+        *,
+        replace: bool = False,
+        publish_allowed: Callable[[], bool] | None = None,
+    ) -> Path:
         dest = self._dir / f"{self.key(imdb_id)}.srt"
-        if replace or not dest.exists():
-            partial = dest.with_suffix(".partial")
-            partial.write_bytes(srt_path.read_bytes())
-            partial.replace(dest)
-        return dest.resolve()
+        partial = self._dir / f".{dest.stem}.{uuid.uuid4().hex}.partial.srt"
+        try:
+            _copy_fsynced(Path(srt_path), partial)
+            with _publication_lock(dest):
+                if replace or not dest.exists():
+                    _require_publication(publish_allowed)
+                    os.replace(partial, dest)
+                    _fsync_directory(dest.parent)
+            return dest.resolve()
+        finally:
+            partial.unlink(missing_ok=True)
+
+
+def promote_subtitle_file(
+    staged_path: Path,
+    destination: Path,
+    *,
+    publish_allowed: Callable[[], bool] | None = None,
+) -> Path:
+    """Atomically select one staged subtitle after serialized live-lease validation."""
+    staged = Path(staged_path)
+    destination = Path(destination)
+    if not staged.is_file():
+        raise FileNotFoundError("Staged subtitle is unavailable")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with staged.open("rb") as stream:
+        os.fsync(stream.fileno())
+    with _publication_lock(destination):
+        _require_publication(publish_allowed)
+        os.replace(staged, destination)
+        _fsync_directory(destination.parent)
+    return destination.resolve()
+
+
+def _require_publication(callback: Callable[[], bool] | None) -> None:
+    if callback is not None and not callback():
+        raise asyncio.CancelledError("Subtitle publication lost its execution lease")
+
+
+@contextmanager
+def _publication_lock(destination: Path):
+    lock_path = destination.with_name(f".{destination.name}.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
+def _copy_fsynced(source: Path, destination: Path) -> None:
+    with source.open("rb") as input_stream, destination.open("xb") as output_stream:
+        while chunk := input_stream.read(1024 * 1024):
+            output_stream.write(chunk)
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _archive_subtitle(content: bytes, max_bytes: int) -> bytes:

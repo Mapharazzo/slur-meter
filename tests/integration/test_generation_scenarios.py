@@ -178,10 +178,18 @@ def _selected_subtitle(store, job_id, path):
 
 
 class FakeSubtitleClient:
-    def __init__(self, results, payloads, *, before_download=None):
+    def __init__(
+        self,
+        results,
+        payloads,
+        *,
+        before_download=None,
+        callback_before_write=False,
+    ):
         self.results = results
         self.payloads = payloads
         self.before_download = before_download
+        self.callback_before_write = callback_before_write
 
     def search(self, **_kwargs):
         return self.results
@@ -189,8 +197,10 @@ class FakeSubtitleClient:
     def download(self, file_id, destination):
         path = Path(destination)
         path.parent.mkdir(parents=True, exist_ok=True)
+        if self.before_download is not None and self.callback_before_write:
+            self.before_download()
         path.write_bytes(self.payloads[file_id])
-        if self.before_download is not None:
+        if self.before_download is not None and not self.callback_before_write:
             self.before_download()
         return path
 
@@ -200,6 +210,26 @@ VALID_PROVIDER_SRT = (
     b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
     b"2\n01:20:00,000 --> 01:25:00,000\nBye\n"
 )
+REPLACEMENT_PROVIDER_SRT = VALID_PROVIDER_SRT.replace(b"Hello", b"Replacement")
+CP1252_PROVIDER_SRT = (
+    "1\n00:00:01,000 --> 00:00:02,000\ncaf\N{LATIN SMALL LETTER E WITH ACUTE}\n\n"
+    "2\n01:20:00,000 --> 01:25:00,000\nBye\n"
+).encode("cp1252")
+
+
+def _expire_and_reclaim(store, job_id, replacement_owner):
+    with store._mutation() as connection:
+        connection.execute(
+            "UPDATE job_runs SET lease_expires_at = "
+            "'2000-01-01T00:00:00+00:00' WHERE id = ?",
+            (job_id,),
+        )
+    store.recover_expired_leases()
+    assert store.claim_next_job(replacement_owner, lease_seconds=30) is not None
+
+
+def _lease_cancelled(store, job_id, owner):
+    return not store.renew_lease(job_id, owner, lease_seconds=30)
 
 
 @pytest.mark.anyio
@@ -670,13 +700,21 @@ async def test_blocking_generation_stage_keeps_event_loop_and_lease_heartbeat_al
                 break
             await asyncio.sleep(0.01)
         assert started.is_set()
-        first_expiry = store.get_job(job["id"])["lease_expires_at"]
+        boundary = store.get_job_detail(job["id"])
+        metadata_stage = next(
+            stage for stage in boundary["stages"] if stage["name"] == "metadata"
+        )
+        assert boundary["run"]["state"] == "running"
+        assert metadata_stage["state"] == "running"
+        first_expiry = boundary["run"]["lease_expires_at"]
+        assert first_expiry is not None
         ticks = 0
         for _ in range(12):
             await asyncio.sleep(0.01)
             ticks += 1
         second_expiry = store.get_job(job["id"])["lease_expires_at"]
         assert ticks == 12
+        assert second_expiry is not None
         assert second_expiry > first_expiry
         release.set()
         for _ in range(100):
@@ -939,6 +977,326 @@ async def test_real_subtitle_service_stops_mutating_after_lease_reclamation(tmp_
     assert after["run"] == snapshot["run"]
     for key in ("stages", "attempts", "candidates", "events", "decisions"):
         assert after[key] == snapshot[key]
+
+
+def test_reclaimed_subtitle_download_cannot_overwrite_replacement_candidate_bytes(
+    tmp_path,
+):
+    store = OperationStore(tmp_path / "download-race.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job(
+        "tt0110912", "pulp fiction", "Pulp Fiction"
+    )
+    stale_owner = "stale-download-worker"
+    replacement_owner = "replacement-download-worker"
+    store.claim_next_job(stale_owner, lease_seconds=30)
+    settings = Settings(base_dir=tmp_path, results_dir=tmp_path / "results")
+    cache = SubtitleCache(settings.results_dir)
+    result = SubtitleResult(
+        "1",
+        "one.srt",
+        "Pulp Fiction",
+        "1994",
+        "en",
+        None,
+        "tt0110912",
+        runtime_seconds=100 * 60,
+    )
+    replacement_service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": REPLACEMENT_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+
+    def replace_after_reclaim():
+        _expire_and_reclaim(store, job["id"], replacement_owner)
+        replacement_service.select(
+            job["id"],
+            lease_owner=replacement_owner,
+            cancel_requested=lambda: _lease_cancelled(
+                store, job["id"], replacement_owner
+            ),
+        )
+
+    stale_service = SubtitleService(
+        store,
+        FakeSubtitleClient(
+            [result],
+            {"1": VALID_PROVIDER_SRT},
+            before_download=replace_after_reclaim,
+            callback_before_write=True,
+        ),
+        cache,
+        settings,
+    )
+    candidate = stale_service.discover(
+        job["id"],
+        lease_owner=stale_owner,
+        cancel_requested=lambda: _lease_cancelled(store, job["id"], stale_owner),
+    )[0]
+
+    with pytest.raises(asyncio.CancelledError):
+        stale_service.select(
+            job["id"],
+            lease_owner=stale_owner,
+            cancel_requested=lambda: _lease_cancelled(
+                store, job["id"], stale_owner
+            ),
+        )
+
+    artifact = Path(
+        store.get_candidate(candidate["id"], include_internal=True)["artifact_path"]
+    )
+    assert artifact.read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert cache.has("tt0110912").read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert not list(settings.results_dir.rglob("*.partial*"))
+
+
+def test_reclaimed_normalization_cannot_overwrite_replacement_candidate_bytes(
+    tmp_path, monkeypatch
+):
+    from api import subtitles as subtitles_module
+
+    store = OperationStore(tmp_path / "normalization-race.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job(
+        "tt0110912", "pulp fiction", "Pulp Fiction"
+    )
+    stale_owner = "stale-normalization-worker"
+    replacement_owner = "replacement-normalization-worker"
+    store.claim_next_job(stale_owner, lease_seconds=30)
+    settings = Settings(base_dir=tmp_path, results_dir=tmp_path / "results")
+    cache = SubtitleCache(settings.results_dir)
+    result = SubtitleResult(
+        "1",
+        "one.srt",
+        "Pulp Fiction",
+        "1994",
+        "en",
+        None,
+        "tt0110912",
+        runtime_seconds=100 * 60,
+    )
+    replacement_service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": REPLACEMENT_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+    original_write_normalized = subtitles_module._write_normalized
+    reclaimed = False
+
+    def reclaim_before_stale_normalization(path, content):
+        nonlocal reclaimed
+        if not reclaimed:
+            reclaimed = True
+            _expire_and_reclaim(store, job["id"], replacement_owner)
+            replacement_service.select(
+                job["id"],
+                lease_owner=replacement_owner,
+                cancel_requested=lambda: _lease_cancelled(
+                    store, job["id"], replacement_owner
+                ),
+            )
+        original_write_normalized(path, content)
+
+    stale_service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": CP1252_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+    candidate = stale_service.discover(
+        job["id"],
+        lease_owner=stale_owner,
+        cancel_requested=lambda: _lease_cancelled(store, job["id"], stale_owner),
+    )[0]
+    monkeypatch.setattr(
+        subtitles_module, "_write_normalized", reclaim_before_stale_normalization
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        stale_service.select(
+            job["id"],
+            lease_owner=stale_owner,
+            cancel_requested=lambda: _lease_cancelled(
+                store, job["id"], stale_owner
+            ),
+        )
+
+    artifact = Path(
+        store.get_candidate(candidate["id"], include_internal=True)["artifact_path"]
+    )
+    assert artifact.read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert cache.has("tt0110912").read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert not list(settings.results_dir.rglob("*.partial*"))
+
+
+def test_reclaimed_candidate_promotion_cannot_overwrite_replacement_bytes(
+    tmp_path, monkeypatch
+):
+    from api import subtitles as subtitles_module
+
+    store = OperationStore(tmp_path / "candidate-promotion-race.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job(
+        "tt0110912", "pulp fiction", "Pulp Fiction"
+    )
+    stale_owner = "stale-candidate-worker"
+    replacement_owner = "replacement-candidate-worker"
+    store.claim_next_job(stale_owner, lease_seconds=30)
+    settings = Settings(base_dir=tmp_path, results_dir=tmp_path / "results")
+    cache = SubtitleCache(settings.results_dir)
+    result = SubtitleResult(
+        "1",
+        "one.srt",
+        "Pulp Fiction",
+        "1994",
+        "en",
+        None,
+        "tt0110912",
+        runtime_seconds=100 * 60,
+    )
+    replacement_service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": REPLACEMENT_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+    stale_service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": VALID_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+    candidate = stale_service.discover(
+        job["id"],
+        lease_owner=stale_owner,
+        cancel_requested=lambda: _lease_cancelled(store, job["id"], stale_owner),
+    )[0]
+    original_promote = subtitles_module.promote_subtitle_file
+    reclaimed = False
+
+    def reclaim_at_candidate_promotion(
+        staged_path, destination, *, publish_allowed=None
+    ):
+        nonlocal reclaimed
+        if not reclaimed:
+            reclaimed = True
+            _expire_and_reclaim(store, job["id"], replacement_owner)
+            replacement_service.select(
+                job["id"],
+                lease_owner=replacement_owner,
+                cancel_requested=lambda: _lease_cancelled(
+                    store, job["id"], replacement_owner
+                ),
+            )
+        return original_promote(
+            staged_path,
+            destination,
+            publish_allowed=publish_allowed,
+        )
+
+    monkeypatch.setattr(
+        subtitles_module,
+        "promote_subtitle_file",
+        reclaim_at_candidate_promotion,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        stale_service.select(
+            job["id"],
+            lease_owner=stale_owner,
+            cancel_requested=lambda: _lease_cancelled(
+                store, job["id"], stale_owner
+            ),
+        )
+
+    artifact = Path(
+        store.get_candidate(candidate["id"], include_internal=True)["artifact_path"]
+    )
+    assert artifact.read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert cache.has("tt0110912").read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert not list(settings.results_dir.rglob("*.partial*"))
+
+
+def test_reclaimed_cache_promotion_cannot_overwrite_replacement_owner_bytes(tmp_path):
+    store = OperationStore(tmp_path / "cache-race.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job(
+        "tt0110912", "pulp fiction", "Pulp Fiction"
+    )
+    stale_owner = "stale-cache-worker"
+    replacement_owner = "replacement-cache-worker"
+    store.claim_next_job(stale_owner, lease_seconds=30)
+    settings = Settings(base_dir=tmp_path, results_dir=tmp_path / "results")
+    replacement_source = tmp_path / "replacement-cache.srt"
+    replacement_source.write_bytes(REPLACEMENT_PROVIDER_SRT)
+    reclaimed = False
+
+    class ReclaimingCache(SubtitleCache):
+        def store(
+            self,
+            imdb_id,
+            srt_path,
+            *,
+            replace=False,
+            publish_allowed=None,
+        ):
+            nonlocal reclaimed
+            if not reclaimed:
+                reclaimed = True
+                _expire_and_reclaim(store, job["id"], replacement_owner)
+                super().store(
+                    imdb_id,
+                    replacement_source,
+                    replace=True,
+                    publish_allowed=lambda: not _lease_cancelled(
+                        store, job["id"], replacement_owner
+                    ),
+                )
+            return super().store(
+                imdb_id,
+                srt_path,
+                replace=replace,
+                publish_allowed=publish_allowed,
+            )
+
+    cache = ReclaimingCache(settings.results_dir)
+    result = SubtitleResult(
+        "1",
+        "one.srt",
+        "Pulp Fiction",
+        "1994",
+        "en",
+        None,
+        "tt0110912",
+        runtime_seconds=100 * 60,
+    )
+    service = SubtitleService(
+        store,
+        FakeSubtitleClient([result], {"1": VALID_PROVIDER_SRT}),
+        cache,
+        settings,
+    )
+    service.discover(
+        job["id"],
+        lease_owner=stale_owner,
+        cancel_requested=lambda: _lease_cancelled(store, job["id"], stale_owner),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        service.select(
+            job["id"],
+            lease_owner=stale_owner,
+            cancel_requested=lambda: _lease_cancelled(
+                store, job["id"], stale_owner
+            ),
+        )
+
+    assert cache.has("tt0110912").read_bytes() == REPLACEMENT_PROVIDER_SRT
+    assert not list(settings.results_dir.rglob("*.partial*"))
 
 
 @pytest.mark.anyio

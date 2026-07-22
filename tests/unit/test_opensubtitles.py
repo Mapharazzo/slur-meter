@@ -1,5 +1,6 @@
 """Unit tests — data fetching module."""
 
+import asyncio
 import io
 import zipfile
 from contextlib import contextmanager
@@ -240,3 +241,24 @@ class TestSubtitleCache:
     def test_key_sanitization(self, tmp_path):
         cache = SubtitleCache(tmp_path)
         assert cache.key("tt-0110_912") == "tt_0110_912"
+
+    def test_rejected_publication_preserves_previous_bytes_and_cleans_staging(
+        self, tmp_path
+    ):
+        cache = SubtitleCache(tmp_path)
+        previous = tmp_path / "previous.srt"
+        previous.write_bytes(b"previous")
+        cache.store("tt0110912", previous)
+        replacement = tmp_path / "replacement.srt"
+        replacement.write_bytes(b"replacement")
+
+        with pytest.raises(asyncio.CancelledError):
+            cache.store(
+                "tt0110912",
+                replacement,
+                replace=True,
+                publish_allowed=lambda: False,
+            )
+
+        assert cache.has("tt0110912").read_bytes() == b"previous"
+        assert not list((tmp_path / "subtitles").glob("*.partial*"))

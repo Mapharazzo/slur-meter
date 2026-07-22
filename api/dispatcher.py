@@ -175,12 +175,11 @@ class JobDispatcher:
 
     async def _heartbeat(self, job_id: str, owner: str) -> bool:
         interval = self.lease_seconds / 3
-        while True:
+        while self.store.renew_lease(
+            job_id, owner, lease_seconds=self.lease_seconds
+        ):
             await asyncio.sleep(interval)
-            if not self.store.renew_lease(
-                job_id, owner, lease_seconds=self.lease_seconds
-            ):
-                return False
+        return False
 
     def _runner_done(self, task: asyncio.Task[None]) -> None:
         self._active.discard(task)

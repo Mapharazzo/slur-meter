@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -18,6 +20,7 @@ from src.data.opensubtitles import (
     OpenSubtitlesClient,
     SubtitleCache,
     UnsafeArchiveError,
+    promote_subtitle_file,
 )
 from src.data.subtitle_quality import (
     SubtitleParseError,
@@ -45,6 +48,11 @@ class _ExecutionContext:
     def check(self) -> None:
         if self.cancel_requested is not None and self.cancel_requested():
             raise asyncio.CancelledError("Subtitle work no longer owns the job lease")
+
+    def publication_allowed(self) -> bool:
+        """Revalidate ownership at the filesystem publication boundary."""
+        self.check()
+        return True
 
     @staticmethod
     def require(value: Any) -> Any:
@@ -253,13 +261,22 @@ class SubtitleService:
                 content_hash=digest,
             )
         )
-        destination = confined_path(self._root, job_id, row["id"], "subtitle.srt")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        context.check()
-        destination.write_bytes(content)
-        context.check()
+        destination, staging_directory, staged_path = self._candidate_workspace(
+            job_id, row["id"]
+        )
         try:
-            inspection = inspect_subtitle(destination)
+            context.check()
+            staged_path.write_bytes(content)
+            context.check()
+            inspection = inspect_subtitle(staged_path)
+            context.check()
+            _write_normalized(staged_path, inspection.normalized_utf8)
+            context.check()
+            path = promote_subtitle_file(
+                staged_path,
+                destination,
+                publish_allowed=context.publication_allowed,
+            )
         except SubtitleParseError:
             return context.require(
                 self.store.update_candidate(
@@ -270,8 +287,8 @@ class SubtitleService:
                     rejection_reasons=["invalid_srt"],
                 )
             )
-        context.check()
-        _write_normalized(destination, inspection.normalized_utf8)
+        finally:
+            shutil.rmtree(staging_directory, ignore_errors=True)
         context.check()
         return context.require(
             self.store.update_candidate(
@@ -282,8 +299,8 @@ class SubtitleService:
                 first_cue_seconds=inspection.first_cue_seconds,
                 final_cue_seconds=inspection.final_cue_seconds,
                 parsed_duration_seconds=inspection.parsed_duration_seconds,
-                content_hash=_hash(destination),
-                artifact_path=str(destination),
+                content_hash=_hash(path),
+                artifact_path=str(path),
             )
         )
 
@@ -305,8 +322,13 @@ class SubtitleService:
                 lease_owner=context.lease_owner,
             )
         )
+        destination, staging_directory, _ = self._candidate_workspace(
+            job_id, candidate["id"]
+        )
         try:
-            path = self._candidate_path(job_id, candidate, context)
+            path = self._candidate_path(
+                candidate, staging_directory, context
+            )
             context.check()
             inspection = inspect_subtitle(path)
             context.check()
@@ -322,6 +344,11 @@ class SubtitleService:
             if manual and not accepted:
                 accepted = True
                 reasons.append("manual_threshold_override")
+            path = promote_subtitle_file(
+                path,
+                destination,
+                publish_allowed=context.publication_allowed,
+            )
             candidate_fields = {
                 "detected_encoding": inspection.detected_encoding,
                 "cue_count": inspection.cue_count,
@@ -409,27 +436,29 @@ class SubtitleService:
                 )
             )
             return updated
+        finally:
+            shutil.rmtree(staging_directory, ignore_errors=True)
 
     def _candidate_path(
         self,
-        job_id: str,
         candidate: dict[str, Any],
+        staging_directory: Path,
         context: _ExecutionContext,
     ) -> Path:
         context.check()
+        destination = staging_directory / "subtitle.srt"
         if candidate["source_type"] in {"upload", "cache"}:
             stored = self.store.get_candidate(candidate["id"], include_internal=True)
             if stored and stored.get("artifact_path"):
-                return Path(stored["artifact_path"])
+                shutil.copy2(Path(stored["artifact_path"]), destination)
+                return destination
             raise SubtitleParseError("Candidate file is unavailable")
-        destination = confined_path(self._root, job_id, candidate["id"], "subtitle.srt")
-        destination.parent.mkdir(parents=True, exist_ok=True)
         downloaded = self.client.download(
             candidate["provider_id"], destination
         ).resolve()
         context.check()
         try:
-            downloaded.relative_to(destination.parent.resolve())
+            downloaded.relative_to(staging_directory.resolve())
         except ValueError as exc:
             raise UnsafeArchiveError(
                 "Provider download escaped its generated destination"
@@ -446,15 +475,25 @@ class SubtitleService:
         stored = self.store.get_candidate(candidate["id"], include_internal=True)
         if stored is None or not stored.get("artifact_path"):
             return self._reject_resumed_artifact(job_id, candidate, context)
-        path = Path(stored["artifact_path"])
+        destination, staging_directory, staged_path = self._candidate_workspace(
+            job_id, candidate["id"]
+        )
         try:
             context.check()
-            inspection = inspect_subtitle(path)
+            shutil.copy2(Path(stored["artifact_path"]), staged_path)
+            inspection = inspect_subtitle(staged_path)
             context.check()
-            _write_normalized(path, inspection.normalized_utf8)
+            _write_normalized(staged_path, inspection.normalized_utf8)
             context.check()
+            path = promote_subtitle_file(
+                staged_path,
+                destination,
+                publish_allowed=context.publication_allowed,
+            )
         except (OSError, ValueError, SubtitleParseError):
             return self._reject_resumed_artifact(job_id, candidate, context)
+        finally:
+            shutil.rmtree(staging_directory, ignore_errors=True)
         attempt = self._active_candidate_attempt(job_id, candidate["id"])
         if _hash(path) == candidate["content_hash"]:
             return self._complete_validated(job_id, candidate, path, attempt, context)
@@ -638,7 +677,12 @@ class SubtitleService:
         attempt = attempt or self._active_candidate_attempt(job_id, candidate["id"])
         job = self._job(job_id)
         if job["source_imdb_id"]:
-            self.cache.store(job["source_imdb_id"], path, replace=True)
+            self.cache.store(
+                job["source_imdb_id"],
+                path,
+                replace=True,
+                publish_allowed=context.publication_allowed,
+            )
             context.check()
         if not any(
             event["type"] == "subtitle_selected"
@@ -743,6 +787,19 @@ class SubtitleService:
             ),
             None,
         )
+
+    def _candidate_workspace(
+        self, job_id: str, candidate_id: str
+    ) -> tuple[Path, Path, Path]:
+        destination = confined_path(
+            self._root, job_id, candidate_id, "subtitle.srt"
+        )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staging_directory = destination.parent / (
+            f".execution.{uuid.uuid4().hex}.partial"
+        )
+        staging_directory.mkdir()
+        return destination, staging_directory, staging_directory / "subtitle.srt"
 
     def _selection_stage(self, job_id: str) -> dict[str, Any]:
         return next(
