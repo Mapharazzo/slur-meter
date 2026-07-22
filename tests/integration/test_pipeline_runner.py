@@ -257,3 +257,67 @@ async def test_runner_terminal_failure_rolls_back_stage_and_job_together(store, 
     detail = store.get_job_detail(job["id"])
     assert detail["run"]["state"] == "running"
     assert detail["stages"][0]["state"] == "running"
+
+
+@pytest.mark.anyio
+async def test_successful_stage_recursively_sanitizes_manifest_keys_values_and_warnings(
+    store, tmp_path
+):
+    job = await claimed_job(store, ("analysis",))
+    services = FakeServices()
+    secret = "settings-only-stage-secret"
+    settings = Settings(base_dir=tmp_path, admin_api_token=secret)
+
+    async def output(progress):
+        return StageResult(
+            output_manifest={
+                "stage": "analysis",
+                f"key-{secret}": {"nested": f"value-{secret}"},
+            },
+            warnings=(f"warning-{secret}",),
+        )
+
+    services.handlers["analysis"] = output
+    await PipelineRunner(store, services, stages=("analysis",), settings=settings).run(
+        job["id"], "test-owner"
+    )
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["run"]["state"] == "completed"
+    assert secret not in repr(detail["stages"])
+    assert secret not in repr(detail["attempts"])
+    assert "[REDACTED]" in repr(detail["stages"])
+
+
+@pytest.mark.anyio
+async def test_completed_validation_event_and_attention_roll_back_together(store, monkeypatch):
+    job = await claimed_job(store, ("analysis",))
+    services = FakeServices()
+    store.transition_stage(job["id"], "analysis", "queued", lease_owner="test-owner")
+    store.transition_stage(job["id"], "analysis", "running", lease_owner="test-owner")
+    attempt = store.start_attempt(job["id"], "analysis", lease_owner="test-owner")
+    store.finish_attempt(attempt["id"], "completed", lease_owner="test-owner")
+    store.transition_stage(
+        job["id"],
+        "analysis",
+        "completed",
+        output_manifest={"stage": "analysis"},
+        lease_owner="test-owner",
+    )
+    services.valid["analysis"] = False
+    original_insert_event = store._insert_event
+
+    def fail_on_job_event(connection, job_id, **fields):
+        if fields.get("event_type") == "job_state_changed":
+            raise RuntimeError("injected event failure")
+        return original_insert_event(connection, job_id, **fields)
+
+    monkeypatch.setattr(store, "_insert_event", fail_on_job_event)
+    with pytest.raises(RuntimeError, match="injected event failure"):
+        await PipelineRunner(store, services, stages=("analysis",)).run(
+            job["id"], "test-owner"
+        )
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["run"]["state"] == "running"
+    assert not any(event["type"] == "artifact_validation_failed" for event in detail["events"])

@@ -309,6 +309,29 @@ def test_events_are_monotonic_and_sanitized(store):
     assert "/mnt/runtime" not in repr(broader)
 
 
+def test_running_job_events_are_fenced_by_lease_owner(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.ensure_stage(job["id"], "analysis", state=StageState.QUEUED)
+    store.claim_next_job("worker-a", lease_seconds=30)
+
+    stale = store.record_event(
+        job["id"],
+        event_type="stale_diagnostic",
+        stage_name="analysis",
+        lease_owner="worker-b",
+    )
+    owned = store.record_event(
+        job["id"],
+        event_type="owned_diagnostic",
+        stage_name="analysis",
+        lease_owner="worker-a",
+    )
+
+    assert stale is None
+    assert owned["type"] == "owned_diagnostic"
+    assert not any(event["type"] == "stale_diagnostic" for event in store.list_events(job["id"]))
+
+
 def test_queue_summary_omits_internal_and_large_detail_fields(store):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     store.record_event(

@@ -219,6 +219,10 @@ class OperationStore:
         safe_error_message: object | None = None,
         retryable: bool = False,
         lease_owner: str | None = None,
+        additional_event_type: str | None = None,
+        additional_event_message: object = "",
+        additional_event_data: Mapping[str, Any] | None = None,
+        additional_event_stage_name: str | None = None,
     ) -> dict[str, Any] | None:
         target = JobState(_enum_value(JobState, new_state))
         transition_trigger = _optional_trigger(trigger)
@@ -288,6 +292,21 @@ class OperationStore:
                 },
                 created_at=now,
             )
+            if additional_event_type is not None:
+                additional_stage_id = (
+                    self._stage_id(connection, resolved, additional_event_stage_name)
+                    if additional_event_stage_name
+                    else None
+                )
+                self._insert_event(
+                    connection,
+                    resolved,
+                    stage_id=additional_stage_id,
+                    event_type=additional_event_type,
+                    message=additional_event_message,
+                    data=additional_event_data,
+                    created_at=now,
+                )
             updated = connection.execute(
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
             ).fetchone()
@@ -1048,10 +1067,16 @@ class OperationStore:
         stage_name: str | None = None,
         attempt_id: int | None = None,
         data: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        lease_owner: str | None = None,
+    ) -> dict[str, Any] | None:
         now = self._now_text()
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, now):
+                return None
             stage_id = (
                 self._stage_id(connection, resolved, stage_name) if stage_name else None
             )

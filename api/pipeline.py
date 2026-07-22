@@ -13,11 +13,12 @@ from typing import Any, Protocol
 from api.domain import AttemptTrigger, JobState, StageState
 from api.errors import (
     AttentionRequired,
+    ConfigurationRequired,
     OperationalError,
     classify_exception,
     sanitize_text,
 )
-from api.retry import RetryContext, RetryPolicy, run_with_attempts
+from api.retry import RetryContext, RetryPolicy, run_with_attempts, sanitize_value
 from api.settings import DEFAULT_RETRY_DELAYS, Settings
 
 GENERATION_STAGES = (
@@ -38,7 +39,7 @@ class StageResult:
     """A validated stage's durable, operator-safe result."""
 
     output_manifest: Mapping[str, Any] = field(default_factory=dict)
-    warnings: tuple[str, ...] = ()
+    warnings: tuple[Any, ...] = ()
 
 
 class ProgressReporter(Protocol):
@@ -64,6 +65,30 @@ class PipelineServices(Protocol):
     def retry_policy(self, stage_name: str) -> RetryPolicy: ...
 
 
+class UnavailablePipelineServices:
+    """Safe lifecycle default until Task 5 injects real stage services."""
+
+    async def run_stage(
+        self,
+        stage_name: str,
+        job_id: str,
+        progress: ProgressReporter,
+    ) -> StageResult:
+        raise ConfigurationRequired(
+            "Pipeline stage services are not configured on this worker.",
+            code="pipeline_services_unavailable",
+            actions=("configure_pipeline_services",),
+        )
+
+    async def validate_stage(
+        self, stage_name: str, output_manifest: Mapping[str, Any]
+    ) -> bool:
+        return False
+
+    def retry_policy(self, stage_name: str) -> RetryPolicy:
+        return RetryPolicy(max_attempts=1)
+
+
 class PipelineStore(Protocol):
     def get_job(self, job_id: str) -> dict[str, Any] | None: ...
 
@@ -86,7 +111,7 @@ class PipelineStore(Protocol):
 
     def renew_lease(self, job_id: str, owner: str, *, lease_seconds: float) -> bool: ...
 
-    def record_event(self, job_id: str, **fields: Any) -> object: ...
+    def record_event(self, job_id: str, **fields: Any) -> object | None: ...
 
 
 class PipelineRunner:
@@ -140,12 +165,17 @@ class PipelineRunner:
                     )
                     return
                 if reusable:
-                    self.store.record_event(
+                    reused_event = self.store.record_event(
                         job_id,
                         event_type="artifact_reused",
                         message=f"Validated output for stage {stage_name} was reused.",
                         stage_name=stage_name,
+                        lease_owner=lease_owner,
                     )
+                    if reused_event is None:
+                        raise asyncio.CancelledError(
+                            "The worker no longer owns the job lease"
+                        )
                     continue
                 self._invalid_completed_stage(job_id, stage_name, lease_owner)
                 return
@@ -236,12 +266,16 @@ class PipelineRunner:
             self._apply_cancellation(job_id, lease_owner)
             return
         if self._renew(job_id, lease_owner):
-            self.store.transition_job(
+            completed_job = self.store.transition_job(
                 job_id,
                 JobState.COMPLETED,
                 expected_state=JobState.RUNNING,
                 lease_owner=lease_owner,
             )
+            if completed_job is None:
+                raise asyncio.CancelledError(
+                    "The worker no longer owns the job lease"
+                )
 
     def _ensure_stages(self, job_id: str) -> None:
         for ordinal, stage_name in enumerate(self.stages, 1):
@@ -287,7 +321,10 @@ class PipelineRunner:
             )
         if not self._renew(job_id, lease_owner):
             raise asyncio.CancelledError("The worker no longer owns the job lease")
-        return result
+        return StageResult(
+            output_manifest=sanitize_value(result.output_manifest, self.settings),
+            warnings=tuple(sanitize_value(result.warnings, self.settings)),
+        )
 
     async def _validate(self, stage_name: str, manifest: Mapping[str, Any]) -> bool:
         value = self.services.validate_stage(stage_name, manifest)
@@ -312,7 +349,7 @@ class PipelineRunner:
         next_action = error.actions[0] if error.actions else ("retry" if error.retryable else None)
         safe_code = sanitize_text(error.code, self.settings)
         safe_message = sanitize_text(error.message, self.settings)
-        self.store.transition_stage_and_job(
+        outcome = self.store.transition_stage_and_job(
             job_id,
             stage_name,
             state,
@@ -323,6 +360,8 @@ class PipelineRunner:
             next_action=next_action,
             lease_owner=lease_owner,
         )
+        if outcome is None:
+            raise asyncio.CancelledError("The worker no longer owns the job lease")
 
     def _invalid_completed_stage(
         self,
@@ -338,14 +377,7 @@ class PipelineRunner:
             self.settings,
         )
         safe_code = sanitize_text(code, self.settings)
-        self.store.record_event(
-            job_id,
-            event_type="artifact_validation_failed",
-            severity="warning",
-            message=safe_message,
-            stage_name=stage_name,
-        )
-        self.store.transition_job(
+        outcome = self.store.transition_job(
             job_id,
             JobState.NEEDS_ATTENTION,
             expected_state=JobState.RUNNING,
@@ -354,19 +386,26 @@ class PipelineRunner:
             retryable=False,
             next_action="retry",
             lease_owner=lease_owner,
+            additional_event_type="artifact_validation_failed",
+            additional_event_message=safe_message,
+            additional_event_stage_name=stage_name,
         )
+        if outcome is None:
+            raise asyncio.CancelledError("The worker no longer owns the job lease")
 
     def _cancel_requested(self, job_id: str) -> bool:
         job = self.store.get_job(job_id)
         return job is None or bool(job["cancel_requested"])
 
     def _apply_cancellation(self, job_id: str, lease_owner: str) -> None:
-        self.store.transition_job(
+        cancelled = self.store.transition_job(
             job_id,
             JobState.CANCELLED,
             expected_state=JobState.RUNNING,
             lease_owner=lease_owner,
         )
+        if cancelled is None:
+            raise asyncio.CancelledError("The worker no longer owns the job lease")
 
     def _renew(self, job_id: str, lease_owner: str) -> bool:
         return self.store.renew_lease(

@@ -29,9 +29,11 @@ class RecordingStore:
 
     def finish_attempt(self, attempt_id, outcome, **fields):
         self.finished.append((attempt_id, outcome, fields))
+        return {"id": attempt_id, "outcome": outcome}
 
     def record_event(self, job_id, **fields):
         self.events.append(fields)
+        return fields
 
 
 @pytest.mark.anyio
@@ -83,6 +85,50 @@ async def test_transient_exhaustion_raises_the_sanitized_operational_error():
     assert all(row[1] == "failed" for row in store.finished)
     assert "secret-token" not in repr(store.finished)
     assert "/home/operator" not in repr(store.finished)
+
+
+@pytest.mark.anyio
+async def test_attempt_diagnostics_allowlist_excludes_exception_and_upstream_text():
+    store = RecordingStore()
+
+    async def operation():
+        raise RuntimeError("private upstream response body")
+
+    with pytest.raises(AttentionRequired):
+        await run_with_attempts(
+            operation,
+            RetryContext("job_1", "analysis"),
+            RetryPolicy(max_attempts=1),
+            store,
+            asyncio.sleep,
+        )
+
+    assert store.finished[0][2]["diagnostics"] == {
+        "code": "unexpected_operation_error",
+        "category": "unexpected",
+        "exception_type": "RuntimeError",
+    }
+    assert "private upstream response body" not in repr(store.finished)
+
+
+@pytest.mark.anyio
+async def test_retry_stops_when_fenced_event_write_loses_ownership():
+    store = RecordingStore()
+    store.record_event = lambda *args, **kwargs: None
+
+    async def operation():
+        raise TimeoutError("temporary")
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_with_attempts(
+            operation,
+            RetryContext("job_1", "metadata", lease_owner="stale-owner"),
+            RetryPolicy(max_attempts=2, delays=(0,)),
+            store,
+            asyncio.sleep,
+        )
+
+    assert len(store.attempts) == 1
 
 
 @pytest.mark.anyio

@@ -235,3 +235,88 @@ async def test_heartbeat_error_cancels_nested_runner_without_orphaning_it():
     await dispatcher.stop()
 
     assert dispatcher.active_count == 0
+
+
+@pytest.mark.anyio
+async def test_stop_returns_at_deadline_without_releasing_cancellation_resistant_work():
+    store = LeaseRecordingStore()
+    started = asyncio.Event()
+    suppressed = asyncio.Event()
+    finish = asyncio.Event()
+
+    class ResistantRunner:
+        async def run(self, job_id, lease_owner):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                suppressed.set()
+                await finish.wait()
+
+    dispatcher = JobDispatcher(
+        store,
+        ResistantRunner,
+        poll_interval=0.01,
+        lease_seconds=0.06,
+        shutdown_timeout=0.04,
+    )
+    await dispatcher.start()
+    await started.wait()
+    stopping = asyncio.create_task(dispatcher.stop())
+    try:
+        await asyncio.sleep(0.12)
+        assert stopping.done()
+        assert suppressed.is_set()
+        assert dispatcher.active_count == 1
+        assert store.released == []
+        with pytest.raises(RuntimeError, match="stopping"):
+            await dispatcher.start()
+        stopping_again = asyncio.create_task(dispatcher.stop())
+        await asyncio.sleep(0.12)
+        assert stopping_again.done()
+        assert dispatcher.active_count == 1
+        assert store.released == []
+        await stopping_again
+    finally:
+        finish.set()
+        await stopping
+    await eventually(lambda: dispatcher.active_count == 0)
+    assert len(store.released) == 1
+    await dispatcher.stop()
+
+
+@pytest.mark.anyio
+async def test_supervisor_error_cancels_and_observes_active_runner():
+    store = LeaseRecordingStore()
+    cleaned_up = asyncio.Event()
+    recoveries = 0
+
+    def recover_then_fail():
+        nonlocal recoveries
+        recoveries += 1
+        if recoveries >= 3:
+            raise RuntimeError("recovery failed")
+        return []
+
+    store.recover_expired_leases = recover_then_fail
+
+    class CleanupRunner:
+        async def run(self, job_id, lease_owner):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned_up.set()
+
+    dispatcher = JobDispatcher(
+        store,
+        CleanupRunner,
+        concurrency=2,
+        poll_interval=0.01,
+        lease_seconds=1,
+    )
+    await dispatcher.start()
+    await eventually(cleaned_up.is_set)
+
+    assert dispatcher.active_count == 0
+    assert len(store.released) == 1
+    await dispatcher.stop()

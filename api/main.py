@@ -3,6 +3,7 @@
 import asyncio
 import json
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import uvicorn
@@ -20,6 +21,8 @@ sys.path.insert(0, str(BASE_DIR))
 load_dotenv(BASE_DIR / ".env", override=True)
 
 from api.database import (  # noqa: E402
+    DB_PATH,
+    OperationStore,
     get_aggregate_costs,
     get_alerts,
     get_costs,
@@ -28,13 +31,17 @@ from api.database import (  # noqa: E402
     get_releases,
     get_revenue,
     get_steps,
-    init_db,
     list_jobs,
-    upsert_job,
     upsert_release,
     upsert_revenue,
 )
-from api.pipeline import get_client, run_pipeline  # noqa: E402
+from api.dispatcher import JobDispatcher  # noqa: E402
+from api.pipeline import (  # noqa: E402
+    PipelineRunner,
+    PipelineServices,
+    UnavailablePipelineServices,
+)
+from api.settings import Settings  # noqa: E402
 from src.data.opensubtitles import safe_imdb_id  # noqa: E402
 
 # ─── App ───────────────────────────────────────────────
@@ -53,10 +60,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+runtime_settings = Settings.from_env(BASE_DIR)
+operation_store = OperationStore(DB_PATH)
+pipeline_services_factory: Callable[[], PipelineServices] = UnavailablePipelineServices
+
+
+def _runner_factory() -> PipelineRunner:
+    return PipelineRunner(
+        operation_store,
+        pipeline_services_factory(),
+        settings=runtime_settings,
+    )
+
+
+job_dispatcher = JobDispatcher(operation_store, _runner_factory)
+
 
 @app.on_event("startup")
-def startup():
-    init_db()
+async def startup():
+    operation_store.initialize()
+    await job_dispatcher.start()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await job_dispatcher.stop()
 
 
 # ─── Models ────────────────────────────────────────────
@@ -70,45 +98,19 @@ class SubmitRequest(BaseModel):
 
 @app.post("/api/jobs")
 async def submit_job(req: SubmitRequest):
-    """Submit a movie for full pipeline processing.
-
-    If imdb_id is provided, the job is keyed on it.
-    If only query is given, a subtitle search is done first to resolve the IMDB ID.
-    """
+    """Durably enqueue generation work and wake the retained dispatcher."""
     if not req.imdb_id and not req.query:
         raise HTTPException(status_code=400, detail="Provide either imdb_id or query")
 
     imdb_id = safe_imdb_id(req.imdb_id) if req.imdb_id else ""
-    resolved_imdb_id: str | None = req.imdb_id or None  # passed to pipeline as imdb_id_input
-    label = req.query or imdb_id
-
-    if not imdb_id and req.query:
-        # Resolve query → real IMDB ID via subtitle search
-        try:
-            client = get_client()
-            results = await asyncio.to_thread(client.search, query=req.query, language="en", limit=1)
-            if results and results[0].imdb_id:
-                best = results[0]
-                imdb_id = safe_imdb_id(best.imdb_id)
-                resolved_imdb_id = best.imdb_id
-                label = f"{best.movie_title} ({best.movie_year})"
-        except Exception:
-            pass
-
-        if not imdb_id:
-            # Fallback if search failed
-            import hashlib
-            imdb_id = "q_" + hashlib.md5(req.query.encode()).hexdigest()[:10]
-
-    existing = get_job(imdb_id)
-    if existing and existing.get("status") in ["queued", "fetching", "analysing", "rendering", "encoding"]:
-        return existing
-
-    job = upsert_job(imdb_id=imdb_id, label=label, query=req.query or "")
-
-    asyncio.create_task(
-        run_pipeline(imdb_id, query=req.query, imdb_id_input=resolved_imdb_id)
+    query = (req.query or "").strip()
+    label = query or imdb_id
+    job, _created = operation_store.create_or_get_active_job(
+        imdb_id or "",
+        query,
+        label,
     )
+    job_dispatcher.wake()
     return job
 
 

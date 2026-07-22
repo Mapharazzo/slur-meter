@@ -62,8 +62,13 @@ class JobDispatcher:
 
     async def start(self) -> None:
         """Recover stale ownership and start one retained supervisor task."""
-        if self._supervisor is not None and not self._supervisor.done():
-            return
+        if self._supervisor is not None:
+            if not self._supervisor.done():
+                if self._stopping:
+                    raise RuntimeError("Dispatcher is still stopping retained work")
+                return
+            await asyncio.gather(self._supervisor, return_exceptions=True)
+            self._supervisor = None
         self._stopping = False
         self.store.recover_expired_leases()
         self._wake_event.set()
@@ -78,20 +83,25 @@ class JobDispatcher:
             self._wake_event.set()
 
     async def stop(self) -> None:
-        """Stop claiming new jobs and allow every owned runner to finish."""
+        """Stop claiming and bound graceful plus forced shutdown by one deadline."""
         self._stopping = True
         self._wake_event.set()
         supervisor = self._supervisor
-        if supervisor is not None:
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(supervisor), timeout=self.shutdown_timeout
-                )
-            except TimeoutError:
+        if supervisor is None:
+            return
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.shutdown_timeout
+        grace = self.shutdown_timeout / 2
+        done, _ = await asyncio.wait({supervisor}, timeout=grace)
+        if not done:
+            if supervisor.cancelling() == 0:
                 supervisor.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await supervisor
-        self._supervisor = None
+            remaining = max(0.0, deadline - loop.time())
+            if remaining:
+                done, _ = await asyncio.wait({supervisor}, timeout=remaining)
+        if done or supervisor.done():
+            await asyncio.gather(supervisor, return_exceptions=True)
+            self._supervisor = None
 
     async def _run(self) -> None:
         try:
@@ -110,7 +120,7 @@ class JobDispatcher:
                         )
             if self._active:
                 await asyncio.gather(*tuple(self._active), return_exceptions=True)
-        except asyncio.CancelledError:
+        except BaseException:
             for task in tuple(self._active):
                 task.cancel()
             if self._active:
@@ -147,8 +157,11 @@ class JobDispatcher:
                     await runner
         except asyncio.CancelledError:
             runner.cancel()
+            # Keep the heartbeat alive while a cancellation-resistant runner can
+            # still perform external work. Release only after it has stopped.
+            await asyncio.gather(runner, return_exceptions=True)
             heartbeat.cancel()
-            await asyncio.gather(runner, heartbeat, return_exceptions=True)
+            await asyncio.gather(heartbeat, return_exceptions=True)
             self.store.release_job_lease(job_id, owner)
             raise
         finally:

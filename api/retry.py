@@ -48,9 +48,11 @@ class RetryContext:
 class RetryStore(Protocol):
     def start_attempt(self, job_id: str, stage_name: str, **fields: Any) -> dict[str, Any] | None: ...
 
-    def finish_attempt(self, attempt_id: int, outcome: str, **fields: Any) -> object: ...
+    def finish_attempt(
+        self, attempt_id: int, outcome: str, **fields: Any
+    ) -> object | None: ...
 
-    def record_event(self, job_id: str, **fields: Any) -> object: ...
+    def record_event(self, job_id: str, **fields: Any) -> object | None: ...
 
 
 T = TypeVar("T")
@@ -81,27 +83,35 @@ async def run_with_attempts(
             value = operation()
             result = await value if inspect.isawaitable(value) else value
         except asyncio.CancelledError:
-            store.finish_attempt(
+            finished = store.finish_attempt(
                 attempt["id"],
                 "cancelled",
-                diagnostics={"reason": "Execution was interrupted."},
+                diagnostics={"code": "execution_interrupted"},
                 lease_owner=resolved.lease_owner,
             )
+            if finished is None:
+                raise asyncio.CancelledError(
+                    "The worker no longer owns the job lease"
+                ) from None
             raise
         except Exception as exc:
             error = classify_exception(exc, resolved.stage_name, resolved.settings)
-            diagnostics = _error_diagnostics(error, resolved.settings)
-            store.finish_attempt(
+            diagnostics = _error_diagnostics(error, exc, resolved.settings)
+            finished = store.finish_attempt(
                 attempt["id"],
                 "failed",
                 retryable=error.retryable,
                 diagnostics=diagnostics,
                 lease_owner=resolved.lease_owner,
             )
+            if finished is None:
+                raise asyncio.CancelledError(
+                    "The worker no longer owns the job lease"
+                ) from None
             if not error.retryable or sequence >= policy.max_attempts:
                 raise error from None
             delay = policy.delay_after(sequence)
-            store.record_event(
+            event = store.record_event(
                 resolved.job_id,
                 event_type="retry_scheduled",
                 severity="warning",
@@ -113,16 +123,23 @@ async def run_with_attempts(
                     "next_attempt": sequence + 1,
                     "delay_seconds": delay,
                 },
+                lease_owner=resolved.lease_owner,
             )
+            if event is None:
+                raise asyncio.CancelledError(
+                    "The worker no longer owns the job lease"
+                ) from None
             await sleep(delay)
             continue
 
-        store.finish_attempt(
+        finished = store.finish_attempt(
             attempt["id"],
             "completed",
-            output=_safe_value(result, resolved.settings),
+            output=sanitize_value(result, resolved.settings),
             lease_owner=resolved.lease_owner,
         )
+        if finished is None:
+            raise asyncio.CancelledError("The worker no longer owns the job lease")
         return result
     raise RuntimeError("Retry policy exhausted without an outcome")  # pragma: no cover
 
@@ -140,27 +157,32 @@ def _context(value: RetryContext | Mapping[str, Any]) -> RetryContext:
     )
 
 
-def _error_diagnostics(error: OperationalError, settings: Settings | None) -> dict[str, Any]:
+def _error_diagnostics(
+    error: OperationalError,
+    source: Exception,
+    settings: Settings | None,
+) -> dict[str, Any]:
     return {
         "code": sanitize_text(error.code, settings),
-        "message": sanitize_text(error.message, settings),
         "category": error.category.value,
-        "technical_detail": sanitize_text(error.technical_detail, settings),
-        "actions": [sanitize_text(action, settings) for action in error.actions],
+        "exception_type": type(source).__name__,
     }
 
 
-def _safe_value(value: Any, settings: Settings | None) -> Any:
+def sanitize_value(value: Any, settings: Settings | None = None) -> Any:
     if value is None:
         return {}
     if isinstance(value, Mapping):
-        return {sanitize_text(key, settings): _safe_value(item, settings) for key, item in value.items()}
+        return {
+            sanitize_text(key, settings): sanitize_value(item, settings)
+            for key, item in value.items()
+        }
     if isinstance(value, (list, tuple)):
-        return [_safe_value(item, settings) for item in value]
+        return [sanitize_value(item, settings) for item in value]
     if isinstance(value, str):
         return sanitize_text(value, settings)
     if isinstance(value, (bool, int, float)):
         return value
     if is_dataclass(value) and not isinstance(value, type):
-        return _safe_value(asdict(value), settings)
+        return sanitize_value(asdict(value), settings)
     return sanitize_text(value, settings)
