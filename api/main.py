@@ -1,65 +1,863 @@
-"""FastAPI backend for Daily Slur Meter — Admin Dashboard."""
+"""Authenticated operational API; construction is explicit and startup is lifespan-only."""
+# ruff: noqa: B008, E701, SIM102
 
-import asyncio
-import json
-import sys
+from __future__ import annotations
+
+import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import uvicorn
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.routing import Match
 
-# ─── Path setup ───────────────────────────────────────
+from api.auth import authorized
+from api.database import DB_PATH, OperationStore
+from api.dispatcher import JobDispatcher
+from api.errors import OperationalError, error_payload, sanitize_text
+from api.pipeline import GenerationPipelineServices, PipelineRunner, PipelineServices
+from api.schemas import (
+    ActionRequest,
+    ActionResponse,
+    DetailResponse,
+    EventPageResponse,
+    HealthResponse,
+    JobPageResponse,
+    JobResponse,
+    SubmitRequest,
+    SummaryResponse,
+    UploadResponse,
+)
+from api.settings import (
+    Settings,
+    canonical_imdb_id,
+    validate_candidate_id,
+    validate_job_id,
+)
+from api.subtitles import generated_upload_path, recover_interrupted_uploads
+from src.data.opensubtitles import OpenSubtitlesClient
+from src.publishing.metadata import generate_metadata
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE_DIR))
-load_dotenv(BASE_DIR / ".env", override=True)
+_PLATFORMS = frozenset({"youtube", "tiktok", "instagram"})
 
-from api.database import (  # noqa: E402
-    DB_PATH,
-    OperationStore,
-    get_aggregate_costs,
-    get_alerts,
-    get_costs,
-    get_job,
-    get_platform_stats,
-    get_releases,
-    get_revenue,
-    get_steps,
-    list_jobs,
-    upsert_revenue,
-)
-from api.dispatcher import JobDispatcher  # noqa: E402
-from api.pipeline import (  # noqa: E402
-    GenerationPipelineServices,
-    PipelineRunner,
-    PipelineServices,
-)
-from api.settings import Settings  # noqa: E402
-from src.data.opensubtitles import safe_imdb_id  # noqa: E402
 
-# ─── App ───────────────────────────────────────────────
+async def _file_chunks(path: Path, chunk_size: int = 1024 * 1024):
+    with path.open("rb") as handle:
+        while chunk := handle.read(chunk_size):
+            yield chunk
 
-app = FastAPI(
-    title="Daily Slur Meter — Admin API",
-    description="Backend for the Slur Meter admin dashboard",
-    version="2.0.0",
-)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _request_id(request: Request) -> str:
+    return getattr(request.state, "request_id", f"req_{uuid.uuid4().hex}")
+
+
+def _error(
+    request: Request,
+    status: int,
+    code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "code": code,
+                "message": message,
+                "retryable": False,
+                "details": details or {},
+                "request_id": _request_id(request),
+            }
+        },
+    )
+
+
+def _public_job(
+    value: dict[str, Any], settings: Settings | None = None
+) -> dict[str, Any]:
+    """Defence-in-depth: database DTOs are reduced to safe JSON only."""
+    hidden = {
+        "artifact_path",
+        "lease_owner",
+        "lease_expires_at",
+        "technical_detail",
+        "diagnostics",
+        "idempotency_key",
+        "content_hash",
+    }
+    return {
+        key: _public_value(item, settings)
+        for key, item in value.items()
+        if key not in hidden
+    }
+
+
+def _public_value(value: Any, settings: Settings | None = None) -> Any:
+    if isinstance(value, dict):
+        return _public_job(value, settings)
+    if isinstance(value, list):
+        return [_public_value(item, settings) for item in value]
+    if isinstance(value, str):
+        return sanitize_text(value, settings)
+    return value
+
+
+def _strict_job(
+    store: OperationStore, value: str, *, aliases: bool = False
+) -> dict[str, Any] | None:
+    try:
+        identifier = validate_job_id(value)
+    except ValueError:
+        if not aliases:
+            raise ValueError("Invalid job ID") from None
+        try:
+            identifier = canonical_imdb_id(value)
+        except ValueError:
+            raise ValueError("Invalid job ID") from None
+    return store.get_job(identifier)
+
+
+def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> FastAPI:
+    """Create a fully injected app; no database or worker work happens on import."""
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        store.initialize()
+        # Construct all runtime dependencies before allowing the dispatcher to claim work.
+        if isinstance(dispatcher, JobDispatcher):
+            services: PipelineServices = GenerationPipelineServices(store, settings)
+            dispatcher.runner_factory = lambda: PipelineRunner(
+                store, services, settings=settings
+            )
+            app.state.pipeline_services = services
+        recover_interrupted_uploads(store, settings.results_dir / "subtitle-candidates")
+        await dispatcher.start()
+        try:
+            yield
+        finally:
+            await dispatcher.stop()
+
+    app = FastAPI(
+        title="Daily Slur Meter — Admin API", version="2.0.0", lifespan=lifespan
+    )
+    app.state.settings, app.state.store, app.state.dispatcher = (
+        settings,
+        store,
+        dispatcher,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.allowed_origins),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Idempotency-Key",
+            "X-Request-ID",
+        ],
+        expose_headers=["X-Request-ID"],
+    )
+
+    @app.middleware("http")
+    async def correlation_and_auth(request: Request, call_next):
+        request.state.request_id = f"req_{uuid.uuid4().hex}"
+        public_health = (
+            request.method == "GET" and request.url.path == "/api/health"
+        )
+        origin = request.headers.get("origin", "").strip()
+        cors_preflight = (
+            request.method == "OPTIONS"
+            and bool(origin)
+            and bool(
+                request.headers.get("access-control-request-method", "").strip()
+            )
+        )
+        if cors_preflight and origin not in settings.allowed_origins:
+            response = _error(
+                request,
+                400,
+                "bad_request",
+                "CORS preflight request is not allowed.",
+            )
+            response.headers["X-Request-ID"] = request.state.request_id
+            return response
+        if (
+            request.url.path.startswith("/api/")
+            and not public_health
+            and not cors_preflight
+        ):
+            if not authorized(
+                request, settings.admin_api_token, settings.allow_local_development_auth
+            ):
+                response = _error(
+                    request,
+                    401,
+                    "unauthorized",
+                    "Valid operator authentication is required.",
+                )
+                response.headers["X-Request-ID"] = request.state.request_id
+                return response
+        try:
+            response = await call_next(request)
+        except Exception:
+            response = _error(
+                request, 500, "internal_error", "The operation could not be completed."
+            )
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error(request: Request, _exc: RequestValidationError):
+        return _error(request, 422, "validation_error", "Request validation failed.")
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error(request: Request, exc: StarletteHTTPException):
+        code = {
+            400: "bad_request",
+            401: "unauthorized",
+            404: "not_found",
+            409: "conflict",
+            413: "payload_too_large",
+            405: "method_not_allowed",
+            422: "validation_error",
+        }.get(exc.status_code, "request_error")
+        return _error(
+            request, exc.status_code, code, sanitize_text(exc.detail, settings)
+        )
+
+    @app.exception_handler(OperationalError)
+    async def operational_error(request: Request, exc: OperationalError):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=error_payload(exc, _request_id(request)),
+        )
+
+    @app.get("/api/health", response_model=HealthResponse)
+    async def health() -> dict[str, Any]:
+        return {"status": "ok", "dispatcher_ready": True}
+
+    @app.get("/api/operations/summary", response_model=SummaryResponse)
+    async def summary() -> dict[str, Any]:
+        jobs = store.list_jobs(limit=500)
+        items = jobs["items"]
+        return {
+            "total": jobs["total"],
+            "states": {
+                state: sum(item["state"] == state for item in items)
+                for state in {item["state"] for item in items}
+            },
+        }
+
+    @app.post("/api/jobs", status_code=201, response_model=JobResponse)
+    async def submit(req: SubmitRequest, request: Request) -> dict[str, Any]:
+        imdb = canonical_imdb_id(req.imdb_id) if req.imdb_id else ""
+        query = (req.query or "").strip()
+        job, created = store.create_or_get_active_job(imdb, query, query or imdb)
+        if created:
+            dispatcher.wake()
+        return _public_job(job, settings)
+
+    @app.get("/api/jobs", response_model=JobPageResponse)
+    async def jobs(
+        state: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        query: str | None = None,
+    ) -> dict[str, Any]:
+        if not 1 <= limit <= 500 or offset < 0:
+            raise HTTPException(422, "Pagination bounds are invalid")
+        result = store.list_jobs(state=state, limit=limit, offset=offset, query=query)
+        result["items"] = [_public_job(item, settings) for item in result["items"]]
+        return result
+
+    @app.get("/api/jobs/{job_id}", response_model=DetailResponse)
+    async def detail(job_id: str) -> dict[str, Any]:
+        try:
+            job = _strict_job(store, job_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from None
+        if job is None:
+            raise HTTPException(404, "Run was not found")
+        result = store.get_job_detail(job["id"])
+        assert result is not None
+        result["last_event_id"] = max(
+            (item["id"] for item in result["events"]), default=0
+        )
+        result["available_actions"] = _available_actions(result)
+        return _public_value(result, settings)
+
+    @app.get("/api/jobs/{job_id}/events", response_model=EventPageResponse)
+    async def events(job_id: str, after: int = 0) -> dict[str, Any]:
+        if after < 0:
+            raise HTTPException(422, "after must be non-negative")
+        try:
+            job = _strict_job(store, job_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from None
+        if job is None:
+            raise HTTPException(404, "Run was not found")
+        snapshot = store.list_events(job["id"], after=after)
+        return {
+            "items": _public_value(snapshot, settings),
+            "last_event_id": max(
+                (item["id"] for item in snapshot),
+                default=after,
+            ),
+        }
+
+    @app.post("/api/jobs/{job_id}/actions/cancel", response_model=ActionResponse)
+    async def cancel(job_id: str, request: Request) -> dict[str, Any]:
+        return _cancel(
+            store, dispatcher, settings, job_id, request.headers.get("Idempotency-Key")
+        )
+
+    @app.post("/api/jobs/{job_id}/actions/resume", response_model=ActionResponse)
+    async def resume(job_id: str, request: Request) -> dict[str, Any]:
+        return _transition_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            "resume",
+            "queued",
+            request.headers.get("Idempotency-Key"),
+        )
+
+    @app.post("/api/jobs/{job_id}/stages/{stage}/retry", response_model=ActionResponse)
+    async def retry_stage(job_id: str, stage: str, request: Request) -> dict[str, Any]:
+        return _stage_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            stage,
+            "retry_stage",
+            request.headers.get("Idempotency-Key"),
+        )
+
+    @app.post("/api/jobs/{job_id}/subtitles/rediscover", response_model=ActionResponse)
+    async def rediscover(job_id: str, request: Request) -> dict[str, Any]:
+        return _stage_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            "subtitles",
+            "rediscover_subtitles",
+            request.headers.get("Idempotency-Key"),
+        )
+
+    @app.post(
+        "/api/jobs/{job_id}/subtitle-candidates/{candidate_id}/select",
+        response_model=ActionResponse,
+    )
+    async def select_candidate(
+        job_id: str, candidate_id: str, request: Request
+    ) -> dict[str, Any]:
+        job = _require_opaque(store, job_id)
+        try:
+            candidate_id = validate_candidate_id(candidate_id)
+        except ValueError as exc:
+            raise HTTPException(404, str(exc)) from None
+        candidate = store.get_candidate(candidate_id)
+        if candidate is None or candidate["job_id"] != job["id"]:
+            raise HTTPException(404, "Subtitle candidate was not found")
+        return _decision_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            "select_subtitle",
+            request.headers.get("Idempotency-Key"),
+            candidate_id=candidate_id,
+        )
+
+    @app.post("/api/jobs/{job_id}/subtitles/upload", response_model=UploadResponse)
+    async def upload_subtitle(
+        job_id: str, request: Request, file: UploadFile = File(...)
+    ) -> dict[str, Any]:
+        job = _require_opaque(store, job_id)
+        key = request.headers.get("Idempotency-Key")
+        if key:
+            replay = next(
+                (
+                    row
+                    for row in store.list_decisions(job["id"])
+                    if row.get("idempotency_key") == key
+                    and row.get("action") == "upload_subtitle"
+                ),
+                None,
+            )
+            if replay is not None:
+                candidate = store.get_candidate(replay["candidate_id"])
+                return {
+                    "candidate": _public_job(candidate or {}, settings),
+                    "decision": _public_job(replay, settings),
+                }
+        limit = OpenSubtitlesClient.MAX_DOWNLOAD_BYTES
+        parts: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await file.read(min(1024 * 1024, limit + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise HTTPException(413, "Uploaded subtitle exceeds the size limit")
+            parts.append(chunk)
+        if not (file.filename or "").lower().endswith(".srt"):
+            raise HTTPException(422, "Uploaded subtitle must be an SRT file")
+        service = getattr(
+            getattr(app.state, "pipeline_services", None), "subtitle_service", None
+        )
+        if service is None:
+            raise HTTPException(409, "Subtitle upload service is unavailable")
+        candidate: dict[str, Any] | None = None
+        try:
+            candidate = service.upload(
+                job["id"], Path(file.filename or "subtitle.srt").name, b"".join(parts)
+            )
+            if candidate.get("status") == "rejected":
+                _discard_upload(store, settings, candidate)
+                raise HTTPException(422, "Uploaded subtitle could not be parsed")
+            decision = store.finalize_uploaded_candidate(
+                job["id"],
+                candidate["id"],
+                idempotency_key=key,
+            )
+        except HTTPException:
+            raise
+        except ValueError as exc:
+            if candidate is not None:
+                _discard_upload(store, settings, candidate)
+            raise HTTPException(422, "Uploaded subtitle could not be parsed") from exc
+        except Exception:
+            if candidate is not None:
+                _discard_upload(store, settings, candidate)
+            raise
+        if decision[2]:
+            dispatcher.wake()
+        return {
+            "candidate": _public_job(candidate, settings),
+            "decision": _public_job(decision[0], settings),
+        }
+
+    @app.post("/api/jobs/{job_id}/publish/{platform}")
+    @app.post("/api/jobs/{job_id}/publish/{platform}/retry")
+    async def publish(
+        job_id: str, platform: str, request: Request, _body: ActionRequest | None = None
+    ) -> dict[str, Any]:
+        if platform not in _PLATFORMS:
+            raise HTTPException(422, "Unknown platform")
+        if _body and _body.reconciliation:
+            job = _require_opaque(store, job_id)
+            try:
+                release, decision, changed = store.reconcile_publication_request(
+                    job["id"],
+                    platform,
+                    outcome=_body.reconciliation,
+                    remote_id=_body.remote_id,
+                    idempotency_key=request.headers.get("Idempotency-Key"),
+                )
+            except (KeyError, ValueError) as exc:
+                raise HTTPException(
+                    409, "Publishing reconciliation conflicts with durable state"
+                ) from exc
+            if changed:
+                dispatcher.wake()
+            return {
+                "run": _public_job(store.get_job(job["id"]) or job, settings),
+                "release": _public_job(release, settings),
+                "decision": _public_job(decision, settings),
+                "changed": changed,
+            }
+        job = _require_opaque(store, job_id)
+        analysis = store.compatibility_analysis(job["id"]) or {}
+        summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
+        metadata = dict(generate_metadata(job["label"], summary))
+        if platform == "youtube":
+            metadata["privacy_status"] = "private"
+        return _decision_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            "publish",
+            request.headers.get("Idempotency-Key"),
+            platform=platform,
+            metadata=metadata,
+        )
+
+    @app.post("/api/jobs/{job_id}/stats/refresh", response_model=ActionResponse)
+    async def refresh(job_id: str, request: Request) -> dict[str, Any]:
+        return _decision_action(
+            store,
+            dispatcher,
+            settings,
+            job_id,
+            "refresh_stats",
+            request.headers.get("Idempotency-Key"),
+        )
+
+    @app.get("/api/jobs/{job_id}/costs")
+    async def job_costs(job_id: str) -> dict[str, Any]:
+        job = _require_opaque(store, job_id)
+        items = _public_value(store.list_costs(job["id"]), settings)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/costs")
+    async def costs(
+        start: str | None = None,
+        end: str | None = None,
+        group_by: str = "category",
+    ) -> list[dict[str, Any]]:
+        if group_by not in {"category", "day", "week", "month"}:
+            raise HTTPException(422, "Invalid cost grouping")
+        return _public_value(
+            store.aggregate_costs(start=start, end=end, group_by=group_by), settings
+        )
+
+    @app.get("/api/releases")
+    async def releases() -> dict[str, Any]:
+        items = _public_value(store.list_releases(), settings)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/releases/{identifier}")
+    async def job_releases(identifier: str) -> dict[str, Any]:
+        job = _require_alias(store, identifier)
+        items = _public_value(store.list_releases(job["id"]), settings)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/jobs/{identifier}/platform-stats")
+    async def platform_stats(identifier: str) -> dict[str, Any]:
+        job = _require_alias(store, identifier)
+        items = _public_value(store.platform_stats(job["id"]), settings)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/revenue")
+    async def revenue(identifier: str | None = None) -> dict[str, Any]:
+        job = _require_alias(store, identifier) if identifier else None
+        items = _public_value(store.list_revenue(job["id"] if job else None), settings)
+        return {"items": items, "total": len(items)}
+
+    @app.get("/api/alerts")
+    async def alerts(limit: int = 50) -> dict[str, Any]:
+        if not 1 <= limit <= 200:
+            raise HTTPException(422, "Invalid alert limit")
+        page = store.list_jobs(limit=500)
+        items = [
+            {
+                "job_id": row["id"],
+                "state": row["state"],
+                "message": (row.get("safe_error") or {}).get("message")
+                or "Run needs operator attention.",
+                "created_at": row["updated_at"],
+            }
+            for row in page["items"]
+            if row["state"] in {"failed", "needs_attention"}
+        ][:limit]
+        return {"items": _public_value(items, settings), "total": len(items)}
+
+    @app.get("/api/leaderboard")
+    async def leaderboard() -> dict[str, Any]:
+        ranked = []
+        for row in store.list_jobs(state="completed", limit=500)["items"]:
+            summary = (
+                row.get("artifact_summary", {}).get("analysis", {}).get("summary", {})
+            )
+            if not summary:
+                continue
+            stats = store.platform_stats(row["id"])
+            ranked.append(
+                {
+                    "job_id": row["id"],
+                    "source_imdb_id": row["source_imdb_id"],
+                    "label": row["label"],
+                    "hard": int(summary.get("total_hard", 0)),
+                    "soft": int(summary.get("total_soft", 0)),
+                    "f_bombs": int(summary.get("total_f_bombs", 0)),
+                    "total_views": sum(int(item.get("views", 0)) for item in stats),
+                }
+            )
+        ranked.sort(key=lambda row: (row["hard"], row["f_bombs"]), reverse=True)
+        return {"items": _public_value(ranked, settings), "total": len(ranked)}
+
+    @app.get("/api/analysis/{identifier}")
+    async def analysis(identifier: str) -> dict[str, Any]:
+        job = _require_alias(store, identifier)
+        payload = store.compatibility_analysis(job["id"])
+        if payload is None:
+            raise HTTPException(404, "Analysis was not found")
+        return _public_value(payload, settings)
+
+    def current_artifact(identifier: str, stage_name: str):
+        job = _require_alias(store, identifier)
+        detail = store.get_job_detail(job["id"])
+        services = getattr(app.state, "pipeline_services", None)
+        artifacts = getattr(services, "artifacts", None)
+        if detail is None or artifacts is None:
+            raise HTTPException(404, "Artifact was not found")
+        stage = next(
+            (row for row in detail["stages"] if row["name"] == stage_name), None
+        )
+        if stage is None or not stage.get("output_manifest"):
+            raise HTTPException(404, "Artifact was not found")
+        try:
+            path = artifacts.artifact_path(stage["output_manifest"])
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise HTTPException(404, "Artifact was not found") from exc
+        return job, stage["output_manifest"], path
+
+    @app.get("/api/videos/{identifier}")
+    async def video(identifier: str):
+        job, _manifest, path = current_artifact(identifier, "encode")
+        if not path.is_file():
+            raise HTTPException(404, "Video was not found")
+        return StreamingResponse(
+            _file_chunks(path),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="slur-meter-{job["id"]}.mp4"'
+            },
+        )
+
+    @app.get("/api/jobs/{identifier}/preview")
+    async def preview(identifier: str):
+        _job, manifest, directory = current_artifact(identifier, "graph")
+        if manifest.get("details", {}).get("preview_file") != "preview.png":
+            raise HTTPException(404, "Preview was not found")
+        path = directory / "preview.png"
+        if not path.is_file():
+            raise HTTPException(404, "Preview was not found")
+        return Response(
+            path.read_bytes(),
+            media_type="image/png",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/videos/{identifier}/segments/{segment}")
+    async def segment(identifier: str, segment: str) -> dict[str, Any]:
+        if segment not in {"intro_hold", "intro_transition", "graph", "verdict"}:
+            raise HTTPException(400, "Invalid segment")
+        _job, manifest, directory = current_artifact(identifier, "composite")
+        path = directory / segment
+        if not path.is_dir():
+            raise HTTPException(404, "Segment was not found")
+        return {
+            "segment": segment,
+            "frame_count": len(list(path.glob("*.png"))),
+            "timing": manifest.get("details", {}).get("timing", {}).get(segment, {}),
+        }
+
+    @app.get("/api/videos/{identifier}/frames/{segment}/{frame_num}")
+    async def frame(identifier: str, segment: str, frame_num: int):
+        if (
+            segment not in {"intro_hold", "intro_transition", "graph", "verdict"}
+            or frame_num < 0
+        ):
+            raise HTTPException(400, "Invalid frame")
+        _job, _manifest, directory = current_artifact(identifier, "composite")
+        path = directory / segment / f"{frame_num:05d}.png"
+        if not path.is_file():
+            raise HTTPException(404, "Frame was not found")
+        return StreamingResponse(_file_chunks(path), media_type="image/png")
+
+    @app.api_route(
+        "/api/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"]
+    )
+    async def unknown_api(request: Request, path: str):
+        if any(
+            getattr(route, "path", "").startswith("/api/")
+            and getattr(route, "path", "") != "/api/{path:path}"
+            and route.matches(request.scope)[0] is Match.PARTIAL
+            for route in app.router.routes
+        ):
+            return _error(
+                request, 405, "method_not_allowed", "Method is not allowed"
+            )
+        return _error(request, 404, "not_found", "API route was not found")
+
+    dist = BASE_DIR / "webui" / "dist"
+    assets = dist / "assets"
+    if assets.exists():
+        app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
+
+    @app.get("/{path:path}")
+    async def spa(path: str):
+        index = dist / "index.html"
+        return HTMLResponse(
+            index.read_text() if index.exists() else "<h1>Daily Slur Meter</h1>"
+        )
+
+    return app
+
+
+def _available_actions(detail: dict[str, Any]) -> list[str]:
+    run = detail["run"]
+    state = run.get("state")
+    actions: list[str] = []
+    if state in {"queued", "running", "needs_attention", "failed"}:
+        actions.append("cancel")
+    if state in {"cancelled", "failed", "needs_attention"}:
+        actions.append("resume")
+    for stage in detail.get("stages", []):
+        if stage.get("state") in {"failed", "needs_attention", "cancelled"}:
+            actions.append(f"retry_stage:{stage['name']}")
+    if state in {"queued", "cancelled", "failed", "needs_attention"}:
+        actions.append("rediscover_subtitles")
+    actions.extend(
+        f"select_subtitle:{candidate['id']}"
+        for candidate in detail.get("candidates", [])
+        if candidate.get("status") in {"discovered", "uploaded", "validated"}
+    )
+    releases = {row["platform"]: row for row in detail.get("releases", [])}
+    if state == "completed":
+        for platform in sorted(_PLATFORMS):
+            release = releases.get(platform)
+            if release is None:
+                actions.append(f"publish:{platform}")
+            elif release.get("status") == "failed":
+                actions.append(f"retry_publish:{platform}")
+            elif release.get("status") == "needs_attention":
+                actions.append(f"reconcile_publish:{platform}")
+            elif release.get("status") == "uploaded" and release.get("remote_id"):
+                actions.append("refresh_stats")
+    return list(dict.fromkeys(actions))
+
+
+def _require_opaque(store: OperationStore, job_id: str) -> dict[str, Any]:
+    try:
+        job = _strict_job(store, job_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from None
+    if job is None:
+        raise HTTPException(404, "Run was not found")
+    return job
+
+
+def _require_alias(store: OperationStore, identifier: str) -> dict[str, Any]:
+    try:
+        job = _strict_job(store, identifier, aliases=True)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from None
+    if job is None:
+        raise HTTPException(404, "Run was not found")
+    return job
+
+
+def _discard_upload(
+    store: OperationStore, settings: Settings, candidate: dict[str, Any]
+) -> None:
+    try:
+        path = generated_upload_path(
+            settings.results_dir / "subtitle-candidates",
+            candidate["job_id"],
+            candidate["id"],
+        )
+        path.unlink(missing_ok=True)
+        path.parent.rmdir()
+    except (KeyError, OSError, ValueError):
+        pass
+    store.discard_candidate(candidate["id"])
+
+
+def _decision_action(
+    store: OperationStore,
+    dispatcher: Any,
+    settings: Settings,
+    job_id: str,
+    action: str,
+    key: str | None,
+    **fields: Any,
+) -> dict[str, Any]:
+    job = _require_opaque(store, job_id)
+    decision, run, changed, accepted = store.apply_admin_action(
+        job["id"], action, idempotency_key=key, **fields
+    )
+    if not accepted:
+        raise HTTPException(409, "Action conflicts with current run state")
+    if changed:
+        dispatcher.wake()
+    return {
+        "run": _public_job(run, settings),
+        "decision": _public_job(decision, settings),
+        "changed": changed,
+    }
+
+
+def _cancel(
+    store: OperationStore,
+    dispatcher: Any,
+    settings: Settings,
+    job_id: str,
+    key: str | None,
+) -> dict[str, Any]:
+    job = _require_opaque(store, job_id)
+    decision, updated, changed, accepted = store.apply_admin_action(
+        job["id"], "cancel", idempotency_key=key
+    )
+    if not accepted:
+        raise HTTPException(409, "Action conflicts with current run state")
+    if changed:
+        dispatcher.wake()
+    return {
+        "run": _public_job(updated, settings),
+        "decision": _public_job(decision, settings),
+        "changed": changed,
+    }
+
+
+def _transition_action(
+    store: OperationStore,
+    dispatcher: Any,
+    settings: Settings,
+    job_id: str,
+    action: str,
+    state: str,
+    key: str | None,
+) -> dict[str, Any]:
+    result = _decision_action(store, dispatcher, settings, job_id, action, key)
+    return result
+
+
+def _stage_action(
+    store: OperationStore,
+    dispatcher: Any,
+    settings: Settings,
+    job_id: str,
+    stage: str,
+    action: str,
+    key: str | None,
+) -> dict[str, Any]:
+    return _decision_action(
+        store, dispatcher, settings, job_id, action, key, target_stage=stage
+    )
+
+
+def _default_dispatcher(settings: Settings, store: OperationStore) -> JobDispatcher:
+    def unavailable() -> PipelineRunner:
+        raise RuntimeError(
+            "Runtime services are initialized in the application lifespan"
+        )
+
+    return JobDispatcher(store, unavailable)
+
 
 runtime_settings = Settings.from_env(BASE_DIR)
 operation_store = OperationStore(DB_PATH)
+job_dispatcher = _default_dispatcher(runtime_settings, operation_store)
+app = create_app(runtime_settings, operation_store, job_dispatcher)
+
+# Kept as thin, non-route compatibility helpers for pre-control-panel callers.
 _pipeline_services: PipelineServices | None = None
 
 
@@ -67,453 +865,138 @@ def pipeline_services_factory() -> PipelineServices:
     return GenerationPipelineServices(operation_store, runtime_settings)
 
 
-def _runner_factory() -> PipelineRunner:
-    if _pipeline_services is None:
-        raise RuntimeError("Pipeline services were not initialized at startup")
-    return PipelineRunner(
-        operation_store,
-        _pipeline_services,
-        settings=runtime_settings,
-    )
-
-
-job_dispatcher = JobDispatcher(operation_store, _runner_factory)
-
-
-@app.on_event("startup")
-async def startup():
+async def startup() -> None:
     global _pipeline_services
     operation_store.initialize()
     _pipeline_services = pipeline_services_factory()
     await job_dispatcher.start()
 
 
-@app.on_event("shutdown")
-async def shutdown():
+async def shutdown() -> None:
     global _pipeline_services
     await job_dispatcher.stop()
     _pipeline_services = None
 
 
-# ─── Models ────────────────────────────────────────────
-
-class SubmitRequest(BaseModel):
-    imdb_id: str | None = None
-    query: str | None = None
-
-
-# ─── Jobs ──────────────────────────────────────────────
-
-@app.post("/api/jobs")
-async def submit_job(req: SubmitRequest):
-    """Durably enqueue generation work and wake the retained dispatcher."""
-    if not req.imdb_id and not req.query:
-        raise HTTPException(status_code=400, detail="Provide either imdb_id or query")
-
-    imdb_id = safe_imdb_id(req.imdb_id) if req.imdb_id else ""
+async def submit_job(req: SubmitRequest) -> dict[str, Any]:
+    imdb = canonical_imdb_id(req.imdb_id) if req.imdb_id else ""
     query = (req.query or "").strip()
-    label = query or imdb_id
-    job, _created = operation_store.create_or_get_active_job(
-        imdb_id or "",
-        query,
-        label,
-    )
-    job_dispatcher.wake()
+    job, created = operation_store.create_or_get_active_job(imdb, query, query or imdb)
+    if created:
+        job_dispatcher.wake()
     return job
 
-
-@app.get("/api/jobs")
-async def list_all_jobs(
-    status: str | None = Query(None),
-    limit: int = Query(100, ge=1, le=500),
-    offset: int = Query(0, ge=0),
-):
-    return list_jobs(limit=limit, offset=offset, status=status)
-
-
-@app.get("/api/jobs/{imdb_id}")
-async def get_single_job(imdb_id: str):
-    job = get_job(imdb_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    job["steps"] = get_steps(imdb_id)
-    return job
-
-
-@app.get("/api/jobs/{imdb_id}/steps")
-async def get_job_steps(imdb_id: str):
-    job = get_job(imdb_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return get_steps(imdb_id)
-
-
-@app.get("/api/jobs/{imdb_id}/costs")
-async def get_job_costs(imdb_id: str):
-    job = get_job(imdb_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return get_costs(imdb_id)
-
-
-# ─── Videos & Frames ──────────────────────────────────
 
 def _current_artifact(identifier: str, stage_name: str):
     job = operation_store.get_job(identifier)
     if job is None:
         return None
     detail = operation_store.get_job_detail(job["id"])
-    if detail is None:
+    artifacts = getattr(_pipeline_services, "artifacts", None)
+    if detail is None or artifacts is None:
         return None
     stage = next(
-        (item for item in detail["stages"] if item["name"] == stage_name),
-        None,
+        (item for item in detail["stages"] if item["name"] == stage_name), None
     )
-    artifacts = getattr(_pipeline_services, "artifacts", None)
-    if stage is None or not stage["output_manifest"] or artifacts is None:
+    if stage is None or not stage.get("output_manifest"):
         return None
     try:
-        path = artifacts.artifact_path(stage["output_manifest"])
+        return (
+            job,
+            stage["output_manifest"],
+            artifacts.artifact_path(stage["output_manifest"]),
+        )
     except (KeyError, OSError, TypeError, ValueError):
         return None
-    return job, stage["output_manifest"], path
 
 
-@app.get("/api/videos/{imdb_id}")
-async def serve_video(imdb_id: str):
-    current = _current_artifact(imdb_id, "encode")
-    if current is not None:
-        _job, _manifest, video_path = current
-        return FileResponse(
-            str(video_path),
-            media_type="video/mp4",
-            filename=f"slur-meter-{imdb_id}.mp4",
-        )
-    raise HTTPException(status_code=404, detail="Video not found")
+async def serve_video(identifier: str):
+    from fastapi.responses import FileResponse
 
-
-VALID_SEGMENTS = {"intro_hold", "intro_transition", "graph", "verdict"}
-
-
-@app.get("/api/videos/{imdb_id}/segments/{segment}")
-async def serve_segment_info(imdb_id: str, segment: str):
-    """Return segment metadata and frame count."""
-    if segment not in VALID_SEGMENTS:
-        raise HTTPException(status_code=400, detail=f"Invalid segment: {segment}")
-    current = _current_artifact(imdb_id, "composite")
+    current = _current_artifact(identifier, "encode")
     if current is None:
-        raise HTTPException(status_code=404, detail="Segment not found")
+        raise HTTPException(404, "Video not found")
+    job, _manifest, path = current
+    return FileResponse(
+        str(path), media_type="video/mp4", filename=f"slur-meter-{job['id']}.mp4"
+    )
+
+
+async def serve_segment_info(identifier: str, segment: str) -> dict[str, Any]:
+    if segment not in {"intro_hold", "intro_transition", "graph", "verdict"}:
+        raise HTTPException(400, "Invalid segment")
+    current = _current_artifact(identifier, "composite")
+    if current is None:
+        raise HTTPException(404, "Segment not found")
     _job, manifest, render = current
-    seg_dir = render / segment
-    if not seg_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Segment not found")
-    frame_count = len(list(seg_dir.glob("*.png")))
-    timing = (manifest.get("details", {}).get("timing", {})).get(segment, {})
-    return {"segment": segment, "frame_count": frame_count, "timing": timing}
+    directory = render / segment
+    if not directory.is_dir():
+        raise HTTPException(404, "Segment not found")
+    return {
+        "segment": segment,
+        "frame_count": len(list(directory.glob("*.png"))),
+        "timing": manifest.get("details", {}).get("timing", {}).get(segment, {}),
+    }
 
 
-@app.get("/api/videos/{imdb_id}/frames/{segment}/{frame_num}")
-async def serve_frame(imdb_id: str, segment: str, frame_num: int):
-    """Serve an individual PNG frame from a segment."""
-    if segment not in VALID_SEGMENTS:
-        raise HTTPException(status_code=400, detail=f"Invalid segment: {segment}")
-    current = _current_artifact(imdb_id, "composite")
+async def serve_frame(identifier: str, segment: str, frame_num: int):
+    from fastapi.responses import FileResponse
+
+    if segment not in {"intro_hold", "intro_transition", "graph", "verdict"}:
+        raise HTTPException(400, "Invalid segment")
+    current = _current_artifact(identifier, "composite")
     if current is None:
-        raise HTTPException(status_code=404, detail=f"Frame {frame_num} not found")
-    _job, _manifest, render = current
-    frame_path = render / segment / f"{frame_num:05d}.png"
-    if not frame_path.exists():
-        raise HTTPException(status_code=404, detail=f"Frame {frame_num} not found")
-    return FileResponse(str(frame_path), media_type="image/png")
+        raise HTTPException(404, "Frame not found")
+    path = current[2] / segment / f"{frame_num:05d}.png"
+    if not path.is_file():
+        raise HTTPException(404, "Frame not found")
+    return FileResponse(str(path), media_type="image/png")
 
 
-# ─── Costs ─────────────────────────────────────────────
-
-@app.get("/api/jobs/{imdb_id}/preview")
-async def serve_preview_frame(imdb_id: str):
-    from fastapi.responses import Response
-
-    current = _current_artifact(imdb_id, "graph")
-    if current is not None:
-        _job, manifest, graph = current
-        preview_file = manifest.get("details", {}).get("preview_file")
-        if preview_file == "preview.png":
-            preview_path = graph / preview_file
-            if preview_path.is_file():
-                data = preview_path.read_bytes()
-                return Response(
-                    content=data,
-                    media_type="image/png",
-                    headers={"Cache-Control": "no-store"},
-                )
-    raise HTTPException(status_code=404, detail="Preview not ready")
-
-@app.get("/api/costs")
-async def aggregate_costs(
-    start: str | None = Query(None),
-    end: str | None = Query(None),
-    group_by: str = Query("category"),
-):
-    return get_aggregate_costs(start=start, end=end, group_by=group_by)
-
-
-# ─── Releases ─────────────────────────────────────────
-
-@app.get("/api/releases")
-async def list_releases(imdb_id: str | None = Query(None)):
-    return get_releases(imdb_id=imdb_id)
-
-
-@app.get("/api/releases/{imdb_id}")
-async def get_job_releases(imdb_id: str):
-    return get_releases(imdb_id=imdb_id)
-
-
-# ─── Leaderboard ──────────────────────────────────────
-
-@app.get("/api/leaderboard")
-async def leaderboard():
-    jobs = list_jobs(limit=500, status="done")
-
-    # Batch-fetch all releases so we don't hit the DB per-job
-    all_releases = get_releases()
-    releases_by_imdb: dict[str, list] = {}
-    for r in all_releases:
-        releases_by_imdb.setdefault(r["imdb_id"], []).append(r)
-
-    ranked = []
-    for j in jobs:
-        analysis = j.get("analysis_json")
-        if not analysis:
-            continue
-        summary = analysis.get("summary") if isinstance(analysis, dict) else {}
-        if not summary:
-            continue
-
-        imdb_id = j["imdb_id"]
-
-        # Build per-platform release info
-        platforms: dict[str, dict] = {}
-        for rel in releases_by_imdb.get(imdb_id, []):
-            platforms[rel["platform"]] = {
-                "status": rel["status"],
-                "platform_id": rel.get("platform_id"),
-                "uploaded_at": rel.get("uploaded_at"),
-                "views": 0,
-                "likes": 0,
-                "comments": 0,
-                "shares": 0,
-                "revenue_usd": 0.0,
-            }
-
-        # Overlay latest revenue stats
-        for stat in get_platform_stats(imdb_id):
-            p = stat["platform"]
-            if p in platforms:
-                platforms[p].update({
-                    "views": stat.get("views", 0),
-                    "likes": stat.get("likes", 0),
-                    "comments": stat.get("comments", 0),
-                    "shares": stat.get("shares", 0),
-                    "revenue_usd": stat.get("revenue_usd", 0.0),
-                })
-
-        total_views = sum(p.get("views", 0) for p in platforms.values())
-
-        ranked.append({
-            "imdb_id": imdb_id,
-            "label": j["label"],
-            "rating": summary.get("rating", "N/A"),
-            "hard": summary.get("total_hard", 0),
-            "soft": summary.get("total_soft", 0),
-            "f_bombs": summary.get("total_f_bombs", 0),
-            "peak_score": summary.get("peak_score", 0),
-            "peak_minute": summary.get("peak_minute", 0),
-            "platforms": platforms,
-            "total_views": total_views,
-        })
-
-    ranked.sort(
-        key=lambda j: (j.get("hard", 0), j.get("f_bombs", 0)),
-        reverse=True,
-    )
-    return ranked
-
-
-# ─── Publishing ───────────────────────────────────────
-
-SUPPORTED_PLATFORMS = {"youtube", "tiktok", "instagram"}
-
-
-@app.post("/api/jobs/{imdb_id}/publish/{platform}")
-async def publish_video(imdb_id: str, platform: str):
-    """Trigger upload of a completed job's video to a platform."""
-    if platform not in SUPPORTED_PLATFORMS:
-        raise HTTPException(400, f"platform must be one of: {', '.join(sorted(SUPPORTED_PLATFORMS))}")
-
-    current = _current_artifact(imdb_id, "encode")
+async def serve_preview_frame(identifier: str):
+    current = _current_artifact(identifier, "graph")
     if current is None:
-        job = operation_store.get_job(imdb_id)
-        if job is None:
-            raise HTTPException(404, "Job not found")
-        raise HTTPException(404, "Video file not found")
-    job, _manifest, video_path = current
-    if not job:
-        raise HTTPException(404, "Job not found")
-    if job.get("state") != "completed":
-        raise HTTPException(400, "Job must be completed (status=done) before publishing")
-
-    analysis = job.get("analysis_json") or {}
-    summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
-    from src.publishing.metadata import generate_metadata
-    meta = generate_metadata(job["label"], summary)
-
-    operation_store.upsert_release(
-        job["id"], platform, status="pending", metadata=meta
-    )
-    asyncio.create_task(_do_publish(job["id"], platform, video_path, meta))
-    return {"status": "publishing", "platform": platform, "imdb_id": imdb_id}
-
-
-async def _do_publish(job_id: str, platform: str, video_path: Path, meta: dict):
-    try:
-        if platform == "youtube":
-            from src.publishing.youtube import YouTubeClient
-            client = YouTubeClient()
-            vid_id = await asyncio.to_thread(
-                client.upload, video_path,
-                meta["video_title"], meta["description"], meta["tags"],
-            )
-        elif platform == "tiktok":
-            from src.publishing.tiktok import TikTokClient
-            client = TikTokClient()
-            vid_id = await asyncio.to_thread(
-                client.upload, video_path,
-                meta["video_title"], " ".join(meta["hashtags"]),
-            )
-        else:  # instagram
-            from src.publishing.instagram import InstagramClient
-            client = InstagramClient()
-            vid_id = await asyncio.to_thread(
-                client.upload, video_path,
-                meta["video_title"], " ".join(meta["hashtags"]),
-            )
-        operation_store.upsert_release(
-            job_id,
-            platform,
-            status="uploaded",
-            remote_id=vid_id,
-            metadata=meta,
-        )
-    except Exception as exc:
-        operation_store.upsert_release(
-            job_id,
-            platform,
-            status="failed",
-            safe_error_message=exc,
-        )
-
-
-# ─── Stats Refresh ────────────────────────────────────
-
-@app.post("/api/jobs/{imdb_id}/stats/refresh")
-async def refresh_stats(imdb_id: str):
-    """Pull latest stats from every platform this video has been published on."""
-    job = get_job(imdb_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-
-    releases = get_releases(imdb_id=imdb_id)
-    published = [r for r in releases if r.get("status") == "uploaded" and r.get("platform_id")]
-    if not published:
-        raise HTTPException(400, "No uploaded releases found for this job")
-
-    asyncio.create_task(_do_refresh_stats(imdb_id, published))
-    return {"status": "refreshing", "platforms": [r["platform"] for r in published]}
-
-
-async def _do_refresh_stats(imdb_id: str, releases: list[dict]):
-    from datetime import date as _date
-    today = _date.today().isoformat()
-
-    for release in releases:
-        platform = release["platform"]
-        platform_id = release["platform_id"]
-        try:
-            if platform == "youtube":
-                from src.publishing.youtube import YouTubeClient
-                stats = await asyncio.to_thread(YouTubeClient().get_video_stats, platform_id)
-            elif platform == "tiktok":
-                from src.publishing.tiktok import TikTokClient
-                stats = await asyncio.to_thread(TikTokClient().get_video_stats, platform_id)
-            elif platform == "instagram":
-                from src.publishing.instagram import InstagramClient
-                stats = await asyncio.to_thread(InstagramClient().get_video_stats, platform_id)
-            else:
-                continue
-            upsert_revenue(imdb_id, platform, today, **stats)
-        except Exception:
-            pass
-
-
-# ─── Per-job Platform Stats ───────────────────────────
-
-@app.get("/api/jobs/{imdb_id}/platform-stats")
-async def job_platform_stats(imdb_id: str):
-    """Return latest stats snapshot per platform for a job."""
-    job = get_job(imdb_id)
-    if not job:
-        raise HTTPException(404, "Job not found")
-    return get_platform_stats(imdb_id)
-
-
-# ─── Alerts ────────────────────────────────────────────
-
-@app.get("/api/alerts")
-async def alerts(limit: int = Query(50, ge=1, le=200)):
-    return get_alerts(limit=limit)
-
-
-# ─── Revenue (stubbed) ────────────────────────────────
-
-@app.get("/api/revenue")
-async def revenue(imdb_id: str | None = Query(None)):
-    return get_revenue(imdb_id=imdb_id)
-
-
-# ─── Analysis JSON ────────────────────────────────────
-
-@app.get("/api/analysis/{imdb_id}")
-async def serve_analysis(imdb_id: str):
-    json_path = BASE_DIR / "results" / f"{imdb_id}.json"
-    if json_path.exists():
-        with open(json_path) as f:
-            return JSONResponse(json.load(f))
-    raise HTTPException(status_code=404, detail="Analysis not found")
-
-
-# ─── Frontend SPA ─────────────────────────────────────
-
-# Serve React static assets (must be after API routes)
-dist_dir = BASE_DIR / "webui" / "dist"
-assets_dir = dist_dir / "assets"
-if assets_dir.exists():
-    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
-
-
-@app.get("/{full_path:path}")
-async def serve_frontend(full_path: str):
-    """Serve the React SPA for all non-API routes (client-side routing)."""
-    index = dist_dir / "index.html"
-    if index.exists():
-        return HTMLResponse(index.read_text())
-    return HTMLResponse(
-        "<h1>Daily Slur Meter</h1>"
-        "<p>Run <code>cd webui && npm install && npm run build</code> first.</p>"
+        raise HTTPException(404, "Preview not ready")
+    _job, manifest, graph = current
+    if manifest.get("details", {}).get("preview_file") != "preview.png":
+        raise HTTPException(404, "Preview not ready")
+    path = graph / "preview.png"
+    if not path.is_file():
+        raise HTTPException(404, "Preview not ready")
+    return Response(
+        content=path.read_bytes(),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
     )
 
 
-# ─── Run ──────────────────────────────────────────────
+async def _do_publish(
+    job_id: str, platform: str, video_path: Path, metadata: dict[str, Any]
+) -> None:
+    """Removed legacy worker hook; operational routes only record durable work."""
+    return None
+
+
+async def publish_video(identifier: str, platform: str) -> dict[str, Any]:
+    if platform not in _PLATFORMS:
+        raise HTTPException(400, "Unknown platform")
+    job = operation_store.get_job(identifier)
+    if job is None:
+        raise HTTPException(404, "Job not found")
+    current = _current_artifact(identifier, "encode")
+    if current is None:
+        raise HTTPException(404, "Video not found")
+    # This non-route legacy helper is retained for in-process callers only; API routes
+    # record durable work and never invoke it.
+    operation_store.upsert_release(job["id"], platform, status="pending", metadata={})
+    await _do_publish(job["id"], platform, current[2], {})
+    decision = operation_store.record_decision(
+        job["id"], "publish", platform=platform, accepted=True
+    )
+    if decision is not None and decision[1]:
+        job_dispatcher.wake()
+    return {"status": "publishing", "platform": platform, "imdb_id": identifier}
+
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

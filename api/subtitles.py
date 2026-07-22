@@ -40,6 +40,33 @@ _SAFE_PARSE_ERROR = "Subtitle candidate could not be parsed."
 _SAFE_ARCHIVE_ERROR = "Subtitle archive could not be safely read."
 
 
+def generated_upload_path(
+    candidate_root: str | Path, job_id: str, candidate_id: str
+) -> Path:
+    """Resolve the sole generated artifact location for an upload candidate."""
+    return confined_path(candidate_root, job_id, candidate_id, "subtitle.srt")
+
+
+def recover_interrupted_uploads(
+    store: OperationStore, candidate_root: str | Path
+) -> list[str]:
+    """Reconcile pending upload artifacts without requiring provider credentials."""
+    recovered: list[str] = []
+    for candidate in store.list_pending_uploads():
+        try:
+            expected = generated_upload_path(
+                candidate_root, candidate["job_id"], candidate["id"]
+            )
+        except ValueError:
+            expected = None
+        if expected is not None:
+            expected.unlink(missing_ok=True)
+            shutil.rmtree(expected.parent, ignore_errors=True)
+        if store.reject_pending_upload(candidate["id"]):
+            recovered.append(candidate["id"])
+    return recovered
+
+
 @dataclass(frozen=True)
 class _ExecutionContext:
     lease_owner: str | None
@@ -239,7 +266,7 @@ class SubtitleService:
         ):
             raise ValueError("Uploaded subtitle exceeds the size limit")
         digest = sha256(content).hexdigest()
-        row, _ = context.require(
+        row, created = context.require(
             self.store.record_candidate(
                 job_id,
                 "upload",
@@ -247,20 +274,30 @@ class SubtitleService:
                 lease_owner=context.lease_owner,
                 provider_filename=Path(filename).name,
                 source_type="upload",
-                discovery_cycle=max(
-                    (
-                        item["discovery_cycle"]
-                        for item in self.store.list_candidates(job_id)
-                    ),
-                    default=0,
-                )
-                + 1,
+                discovery_cycle=0,
                 rank=0,
                 rank_reasons=["operator_upload"],
-                status="uploaded",
+                status="upload_pending",
                 content_hash=digest,
             )
         )
+        if not created and row["status"] in {"uploaded", "selected"}:
+            return row
+        if not created:
+            generated_upload_path(self._root, job_id, row["id"]).unlink(
+                missing_ok=True
+            )
+            row = context.require(
+                self.store.update_candidate(
+                    row["id"],
+                    lease_owner=context.lease_owner,
+                    status="upload_pending",
+                    parse_error=None,
+                    rejection_reasons=[],
+                    artifact_path=None,
+                    content_hash=digest,
+                )
+            )
         destination, staging_directory, staged_path = self._candidate_workspace(
             job_id, row["id"]
         )
@@ -304,6 +341,10 @@ class SubtitleService:
             )
         )
 
+    def recover_pending_uploads(self) -> list[str]:
+        """Reject and clean interrupted uploads before workers can claim runs."""
+        return recover_interrupted_uploads(self.store, self._root)
+
     def _evaluate(
         self,
         job_id: str,
@@ -326,9 +367,7 @@ class SubtitleService:
             job_id, candidate["id"]
         )
         try:
-            path = self._candidate_path(
-                candidate, staging_directory, context
-            )
+            path = self._candidate_path(candidate, staging_directory, context)
             context.check()
             inspection = inspect_subtitle(path)
             context.check()
@@ -791,9 +830,7 @@ class SubtitleService:
     def _candidate_workspace(
         self, job_id: str, candidate_id: str
     ) -> tuple[Path, Path, Path]:
-        destination = confined_path(
-            self._root, job_id, candidate_id, "subtitle.srt"
-        )
+        destination = confined_path(self._root, job_id, candidate_id, "subtitle.srt")
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging_directory = destination.parent / (
             f".execution.{uuid.uuid4().hex}.partial"

@@ -1487,6 +1487,53 @@ class OperationStore:
             ).fetchall()
             return [self._candidate_dto(row) for row in rows]
 
+    def list_pending_uploads(self) -> list[dict[str, Any]]:
+        """Return internal paths only for startup reconciliation of pending uploads."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM subtitle_candidates
+                   WHERE source_type = 'upload' AND status = 'upload_pending'
+                   ORDER BY id"""
+            ).fetchall()
+            return [
+                {**self._candidate_dto(row), "artifact_path": row["artifact_path"]}
+                for row in rows
+            ]
+
+    def reject_pending_upload(self, candidate_id: str) -> bool:
+        """Atomically reconcile one interrupted upload and its safe event."""
+        now = self._now_text()
+        with self._mutation() as connection:
+            row = connection.execute(
+                """SELECT * FROM subtitle_candidates
+                   WHERE id = ? AND source_type = 'upload'
+                     AND status = 'upload_pending'""",
+                (candidate_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """UPDATE subtitle_candidates SET status = 'rejected', artifact_path = NULL,
+                       parse_error = ?, rejection_reasons_json = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    "Interrupted subtitle upload was safely discarded.",
+                    _safe_json_dump(["interrupted_upload"]),
+                    now,
+                    candidate_id,
+                ),
+            )
+            self._insert_event(
+                connection,
+                row["job_id"],
+                event_type="subtitle_upload_recovered",
+                severity="warning",
+                message="An interrupted subtitle upload was safely discarded.",
+                data={"candidate_id": candidate_id},
+                created_at=now,
+            )
+            return True
+
     def get_candidate(
         self,
         candidate_id: str,
@@ -1562,10 +1609,390 @@ class OperationStore:
             ).fetchone()
             return self._decision_dto(row), True
 
+    def apply_admin_action(
+        self,
+        job_id: str,
+        action: str,
+        *,
+        idempotency_key: str | None = None,
+        target_stage: str | None = None,
+        candidate_id: str | None = None,
+        platform: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
+        """Validate, decide, and apply one operator action in one transaction.
+
+        Returns ``(decision, run, changed, accepted)``. An idempotency replay is
+        stable and never reapplies work.
+        """
+        now = self._now_text()
+        key = str(idempotency_key).strip() if idempotency_key else None
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if key:
+                existing = connection.execute(
+                    "SELECT * FROM admin_decisions WHERE job_id = ? AND idempotency_key = ?",
+                    (resolved, key),
+                ).fetchone()
+                if existing is not None:
+                    return (
+                        self._decision_dto(existing),
+                        self._job_dto(job),
+                        False,
+                        bool(existing["accepted"]),
+                    )
+
+            if not key and self._admin_action_equivalent(
+                connection,
+                job,
+                action,
+                target_stage=target_stage,
+                candidate_id=candidate_id,
+                platform=platform,
+            ):
+                existing = connection.execute(
+                    """SELECT * FROM admin_decisions
+                       WHERE job_id = ? AND action = ? AND target_stage IS ?
+                         AND candidate_id IS ? AND platform IS ? AND accepted = 1
+                       ORDER BY id DESC LIMIT 1""",
+                    (resolved, action, target_stage, candidate_id, platform),
+                ).fetchone()
+                if existing is not None:
+                    return (
+                        self._decision_dto(existing),
+                        self._job_dto(job),
+                        False,
+                        True,
+                    )
+
+            accepted, reason = self._admin_action_allowed(
+                connection,
+                job,
+                action,
+                target_stage=target_stage,
+                candidate_id=candidate_id,
+                platform=platform,
+            )
+            cursor = connection.execute(
+                """INSERT INTO admin_decisions
+                   (job_id, action, target_stage, candidate_id, platform,
+                    idempotency_key, accepted, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resolved,
+                    action,
+                    target_stage,
+                    candidate_id,
+                    platform,
+                    key,
+                    int(accepted),
+                    reason,
+                    now,
+                ),
+            )
+            decision = connection.execute(
+                "SELECT * FROM admin_decisions WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            if not accepted:
+                return self._decision_dto(decision), self._job_dto(job), False, False
+
+            if action == "cancel":
+                state = JobState(job["state"])
+                if state is JobState.RUNNING:
+                    connection.execute(
+                        """UPDATE job_runs SET cancel_requested_at = ?, updated_at = ?,
+                           next_action = 'cancel_pending' WHERE id = ?""",
+                        (now, now, resolved),
+                    )
+                else:
+                    connection.execute(
+                        """UPDATE job_runs SET state = 'cancelled', cancel_requested_at = ?,
+                           updated_at = ?, finished_at = ?, next_action = NULL,
+                           lease_owner = NULL, lease_expires_at = NULL WHERE id = ?""",
+                        (now, now, now, resolved),
+                    )
+                    self._cancel_job_work(connection, resolved, now)
+            elif action == "resume":
+                connection.execute(
+                    """UPDATE job_runs SET state = 'queued', updated_at = ?, finished_at = NULL,
+                       cancel_requested_at = NULL, next_action = 'resume',
+                       safe_error_code = NULL, safe_error_message = NULL,
+                       error_retryable = 0, lease_owner = NULL, lease_expires_at = NULL
+                       WHERE id = ?""",
+                    (now, resolved),
+                )
+            elif action in {"retry_stage", "rediscover_subtitles"}:
+                stage_name = target_stage or "subtitles"
+                stage = connection.execute(
+                    "SELECT * FROM pipeline_stages WHERE job_id = ? AND name = ?",
+                    (resolved, stage_name),
+                ).fetchone()
+                if stage is not None:
+                    connection.execute(
+                        """UPDATE pipeline_stages SET state = 'queued', retry_cycle = retry_cycle + 1,
+                           updated_at = ?, started_at = NULL, finished_at = NULL,
+                           progress_numerator = 0, progress_denominator = 1,
+                           warnings_json = '[]', output_manifest_json = '{}',
+                           safe_error_code = NULL, safe_error_message = NULL,
+                           retryable = 0, next_action = NULL WHERE id = ?""",
+                        (now, stage["id"]),
+                    )
+                connection.execute(
+                    """UPDATE job_runs SET state = 'queued', current_stage = ?, updated_at = ?,
+                       finished_at = NULL, next_action = ?, safe_error_code = NULL,
+                       safe_error_message = NULL, error_retryable = 0,
+                       lease_owner = NULL, lease_expires_at = NULL WHERE id = ?""",
+                    (stage_name, now, action, resolved),
+                )
+            elif action == "select_subtitle":
+                connection.execute(
+                    """UPDATE job_runs SET state = CASE WHEN state IN ('failed', 'needs_attention', 'cancelled')
+                           THEN 'queued' ELSE state END, updated_at = ?, finished_at = NULL,
+                       next_action = 'select_subtitle', safe_error_code = NULL,
+                       safe_error_message = NULL, error_retryable = 0 WHERE id = ?""",
+                    (now, resolved),
+                )
+            elif action == "publish":
+                connection.execute(
+                    """INSERT INTO releases (job_id, platform, status, metadata_json, updated_at)
+                       VALUES (?, ?, 'pending', ?, ?)
+                       ON CONFLICT(job_id, platform) DO UPDATE SET status = 'pending',
+                         safe_error_code = NULL, safe_error_message = NULL,
+                         updated_at = excluded.updated_at
+                       WHERE releases.status NOT IN ('uploaded', 'uploading')""",
+                    (resolved, platform, _safe_json_dump(metadata or {}), now),
+                )
+            elif action == "refresh_stats":
+                connection.execute(
+                    "UPDATE job_runs SET updated_at = ? WHERE id = ?", (now, resolved)
+                )
+
+            self._insert_event(
+                connection,
+                resolved,
+                event_type=f"admin_{action}_accepted",
+                message=f"Operator action {action} was accepted.",
+                data={
+                    "action": action,
+                    "target_stage": target_stage,
+                    "candidate_id": candidate_id,
+                    "platform": platform,
+                },
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            return self._decision_dto(decision), self._job_dto(updated), True, True
+
+    @staticmethod
+    def _admin_action_allowed(
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        action: str,
+        *,
+        target_stage: str | None,
+        candidate_id: str | None,
+        platform: str | None,
+    ) -> tuple[bool, str]:
+        state = str(job["state"])
+        if action == "cancel":
+            allowed = state in {"queued", "running", "needs_attention", "failed"}
+        elif action == "resume":
+            allowed = state in {"cancelled", "failed", "needs_attention"}
+        elif action == "retry_stage":
+            stage = connection.execute(
+                "SELECT state FROM pipeline_stages WHERE job_id = ? AND name = ?",
+                (job["id"], target_stage),
+            ).fetchone()
+            allowed = stage is not None and stage["state"] in {
+                "failed",
+                "needs_attention",
+                "cancelled",
+            }
+        elif action == "rediscover_subtitles":
+            allowed = state not in {"running", "completed"}
+        elif action == "select_subtitle":
+            candidate = connection.execute(
+                "SELECT job_id FROM subtitle_candidates WHERE id = ?",
+                (candidate_id,),
+            ).fetchone()
+            allowed = candidate is not None and candidate["job_id"] == job["id"]
+        elif action == "publish":
+            release = connection.execute(
+                "SELECT status FROM releases WHERE job_id = ? AND platform = ?",
+                (job["id"], platform),
+            ).fetchone()
+            allowed = state == "completed" and (
+                release is None or release["status"] not in {"uploaded", "uploading"}
+            )
+        elif action == "refresh_stats":
+            allowed = (
+                connection.execute(
+                    """SELECT 1 FROM releases WHERE job_id = ? AND status = 'uploaded'
+                       AND remote_id IS NOT NULL LIMIT 1""",
+                    (job["id"],),
+                ).fetchone()
+                is not None
+            )
+        else:
+            allowed = False
+        return allowed, "" if allowed else "Action conflicts with current run state."
+
+    @staticmethod
+    def _admin_action_equivalent(
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        action: str,
+        *,
+        target_stage: str | None,
+        candidate_id: str | None,
+        platform: str | None,
+    ) -> bool:
+        state = str(job["state"])
+        if action == "cancel":
+            return state == "cancelled" or job["cancel_requested_at"] is not None
+        if action == "resume":
+            return state == "queued" and job["next_action"] == "resume"
+        if action in {"retry_stage", "rediscover_subtitles"}:
+            stage_name = target_stage or "subtitles"
+            stage = connection.execute(
+                "SELECT state FROM pipeline_stages WHERE job_id = ? AND name = ?",
+                (job["id"], stage_name),
+            ).fetchone()
+            return (
+                state == "queued"
+                and job["next_action"] == action
+                and (stage is None or stage["state"] == "queued")
+            )
+        if action == "select_subtitle":
+            return job["next_action"] == "select_subtitle" and candidate_id is not None
+        if action == "publish":
+            release = connection.execute(
+                "SELECT status FROM releases WHERE job_id = ? AND platform = ?",
+                (job["id"], platform),
+            ).fetchone()
+            return release is not None and release["status"] in {
+                "pending",
+                "uploading",
+                "uploaded",
+            }
+        return action == "refresh_stats"
+
+    def discard_candidate(self, candidate_id: str) -> None:
+        """Compensate an uncommitted upload finalization without exposing its path."""
+        with self._mutation() as connection:
+            connection.execute(
+                "DELETE FROM subtitle_candidates WHERE id = ?", (candidate_id,)
+            )
+
     def list_decisions(self, job_id: str) -> list[dict[str, Any]]:
         with self._connection() as connection:
             resolved = self._resolve_job_id(connection, job_id)
             return [] if resolved is None else self._decision_rows(connection, resolved)
+
+    def finalize_uploaded_candidate(
+        self,
+        job_id: str,
+        candidate_id: str,
+        *,
+        idempotency_key: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Atomically record an accepted upload, resumable state, and event."""
+        now = self._now_text()
+        key = str(idempotency_key).strip() if idempotency_key else None
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            candidate = connection.execute(
+                "SELECT * FROM subtitle_candidates WHERE id = ? AND job_id = ?",
+                (candidate_id, resolved),
+            ).fetchone()
+            if candidate is None:
+                raise ValueError("Subtitle candidate does not belong to this run")
+            if candidate["status"] not in {"upload_pending", "uploaded"}:
+                raise ValueError(
+                    "Subtitle candidate is not ready for upload finalization"
+                )
+            if not candidate["artifact_path"]:
+                raise ValueError("Subtitle candidate has no validated artifact")
+            if key:
+                existing = connection.execute(
+                    "SELECT * FROM admin_decisions WHERE job_id = ? AND idempotency_key = ?",
+                    (resolved, key),
+                ).fetchone()
+                if existing is not None:
+                    run = connection.execute(
+                        "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+                    ).fetchone()
+                    return self._decision_dto(existing), self._job_dto(run), False
+            elif candidate["status"] == "uploaded":
+                existing = connection.execute(
+                    """SELECT * FROM admin_decisions
+                       WHERE job_id = ? AND action = 'upload_subtitle'
+                         AND candidate_id = ? AND accepted = 1
+                       ORDER BY id DESC LIMIT 1""",
+                    (resolved, candidate_id),
+                ).fetchone()
+                if existing is not None:
+                    run = connection.execute(
+                        "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+                    ).fetchone()
+                    return self._decision_dto(existing), self._job_dto(run), False
+            cursor = connection.execute(
+                """INSERT INTO admin_decisions
+                   (job_id, action, candidate_id, idempotency_key, accepted, reason, created_at)
+                   VALUES (?, 'upload_subtitle', ?, ?, 1, '', ?)""",
+                (resolved, candidate_id, key, now),
+            )
+            connection.execute(
+                """UPDATE subtitle_candidates SET status = 'uploaded', updated_at = ?
+                   WHERE id = ?""",
+                (now, candidate_id),
+            )
+            connection.execute(
+                """UPDATE job_runs SET state = CASE
+                         WHEN state IN ('failed', 'needs_attention', 'cancelled') THEN 'queued'
+                         ELSE state END,
+                       updated_at = ?, finished_at = CASE
+                         WHEN state IN ('failed', 'needs_attention', 'cancelled') THEN NULL
+                         ELSE finished_at END,
+                       next_action = 'select_subtitle', safe_error_code = NULL,
+                       safe_error_message = NULL, error_retryable = 0 WHERE id = ?""",
+                (now, resolved),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="subtitle_uploaded",
+                message="An operator subtitle upload was accepted.",
+                data={"candidate_id": candidate_id},
+                created_at=now,
+            )
+            decision = connection.execute(
+                "SELECT * FROM admin_decisions WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            run = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            return self._decision_dto(decision), self._job_dto(run), True
+
+    def compatibility_analysis(self, job_id: str) -> dict[str, Any] | None:
+        """Return only the sanitized legacy analysis payload for a resolved run."""
+        with self._connection() as connection:
+            resolved = self._resolve_job_id(connection, job_id)
+            if resolved is None:
+                return None
+            row = connection.execute(
+                "SELECT legacy_payload_json FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            payload = _json_load(row["legacy_payload_json"], {})
+            analysis = _json_load(
+                payload.get("analysis_json"), payload.get("analysis_json")
+            )
+            return _safe_json_value(analysis) if isinstance(analysis, Mapping) else None
 
     def request_publication(
         self,
@@ -1915,6 +2342,116 @@ class OperationStore:
                 self._release_dto(updated_release),
             )
 
+    def reconcile_publication_request(
+        self,
+        job_id: str,
+        platform: str,
+        *,
+        outcome: str,
+        remote_id: str | None = None,
+        idempotency_key: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+        """Atomically reconcile an ambiguous release with idempotent decision replay."""
+        now = self._now_text()
+        normalized_platform = str(platform).strip().lower()
+        key = str(idempotency_key).strip() if idempotency_key else None
+        normalized_remote_id = (
+            _normalized_remote_id(remote_id) if remote_id is not None else None
+        )
+        if outcome not in {"uploaded", "not_uploaded"}:
+            raise ValueError("Unknown publishing reconciliation outcome")
+        if outcome == "uploaded" and normalized_remote_id is None:
+            raise ValueError("An uploaded reconciliation requires a remote ID")
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            release = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if release is None:
+                raise KeyError("Publishing release was not found")
+            if key:
+                existing = connection.execute(
+                    "SELECT * FROM admin_decisions WHERE job_id = ? AND idempotency_key = ?",
+                    (resolved, key),
+                ).fetchone()
+                if existing is not None:
+                    if existing["action"] != "reconcile_publishing":
+                        raise ValueError("Idempotency key belongs to another action")
+                    return (
+                        self._release_dto(release),
+                        self._decision_dto(existing),
+                        False,
+                    )
+            else:
+                existing = connection.execute(
+                    """SELECT * FROM admin_decisions
+                       WHERE job_id = ? AND action = 'reconcile_publishing'
+                         AND platform = ? AND accepted = 1 AND reason = ?
+                       ORDER BY id DESC LIMIT 1""",
+                    (resolved, normalized_platform, outcome),
+                ).fetchone()
+                expected_status = "uploaded" if outcome == "uploaded" else "failed"
+                if existing is not None and release["status"] == expected_status:
+                    return (
+                        self._release_dto(release),
+                        self._decision_dto(existing),
+                        False,
+                    )
+            if not (
+                release["status"] == "needs_attention"
+                and release["safe_error_code"]
+                in {"ambiguous_publish", "ambiguous_publish_outcome"}
+            ):
+                raise ValueError("Only an ambiguous publication can be reconciled")
+            status = "uploaded" if outcome == "uploaded" else "failed"
+            error_code = (
+                None if outcome == "uploaded" else "publishing_reconciled_absent"
+            )
+            error_message = (
+                None
+                if outcome == "uploaded"
+                else "Reconciliation confirmed that no remote publication exists."
+            )
+            connection.execute(
+                """UPDATE releases SET status = ?, remote_id = COALESCE(?, remote_id),
+                       uploaded_at = CASE WHEN ? = 'uploaded' THEN COALESCE(uploaded_at, ?)
+                                          ELSE uploaded_at END,
+                       safe_error_code = ?, safe_error_message = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    _safe_text(normalized_remote_id) if normalized_remote_id else None,
+                    status,
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    release["id"],
+                ),
+            )
+            cursor = connection.execute(
+                """INSERT INTO admin_decisions
+                   (job_id, action, platform, idempotency_key, accepted, reason, created_at)
+                   VALUES (?, 'reconcile_publishing', ?, ?, 1, ?, ?)""",
+                (resolved, normalized_platform, key, outcome, now),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_reconciled",
+                message=f"Publishing to {normalized_platform} was reconciled.",
+                data={"platform": normalized_platform, "outcome": outcome},
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM releases WHERE id = ?", (release["id"],)
+            ).fetchone()
+            decision = connection.execute(
+                "SELECT * FROM admin_decisions WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            return self._release_dto(updated), self._decision_dto(decision), True
+
     def reconcile_publication(
         self,
         job_id: str,
@@ -1948,7 +2485,9 @@ class OperationStore:
             ):
                 raise ValueError("Only an ambiguous publication can be reconciled")
             status = "uploaded" if outcome == "uploaded" else "failed"
-            error_code = None if outcome == "uploaded" else "publishing_reconciled_absent"
+            error_code = (
+                None if outcome == "uploaded" else "publishing_reconciled_absent"
+            )
             error_message = (
                 None
                 if outcome == "uploaded"
@@ -2015,7 +2554,9 @@ class OperationStore:
             or not math.isfinite(revenue)
             or revenue < 0
         ):
-            raise ValueError("Publishing revenue metrics must be finite and non-negative")
+            raise ValueError(
+                "Publishing revenue metrics must be finite and non-negative"
+            )
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
             release = connection.execute(
