@@ -31,6 +31,7 @@ class AttemptTrigger(StrEnum):
     MANUAL_RETRY = "manual_retry"
     RESUME = "resume"
     RESTART_RECOVERY = "restart_recovery"
+    ARTIFACT_INVALIDATION = "artifact_invalidation"
 
 
 class FailureCategory(StrEnum):
@@ -108,12 +109,20 @@ def assert_stage_transition(
     old: StageState,
     new: StageState,
     trigger: AttemptTrigger | None = None,
+    stage_name: str | None = None,
 ) -> None:
     """Assert that a stage state update is one of the allowed durable moves."""
     if (
         old is StageState.RUNNING
         and new is StageState.QUEUED
         and trigger is AttemptTrigger.RESTART_RECOVERY
+    ):
+        return
+    if (
+        old is StageState.COMPLETED
+        and new is StageState.QUEUED
+        and trigger is AttemptTrigger.ARTIFACT_INVALIDATION
+        and stage_name == "subtitle_selection"
     ):
         return
     _assert_transition(old, new, _STAGE_TRANSITIONS, "stage")

@@ -654,7 +654,9 @@ class OperationStore:
                     "SELECT * FROM pipeline_stages WHERE id = ?", (row["id"],)
                 ).fetchone()
                 return self._stage_dto(updated)
-            assert_stage_transition(old, target, transition_trigger)
+            assert_stage_transition(
+                old, target, transition_trigger, stage_name=stage_name
+            )
             started_at = row["started_at"] or (
                 now if target is StageState.RUNNING else None
             )
@@ -674,6 +676,7 @@ class OperationStore:
             if target is StageState.QUEUED and transition_trigger in {
                 AttemptTrigger.MANUAL_RETRY,
                 AttemptTrigger.RESTART_RECOVERY,
+                AttemptTrigger.ARTIFACT_INVALIDATION,
             }:
                 retry_cycle += 1
             connection.execute(

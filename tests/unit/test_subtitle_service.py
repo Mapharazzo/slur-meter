@@ -121,6 +121,47 @@ def test_selected_cache_replaces_stale_content_only_after_validation(store, conf
     assert selected["content_hash"]
 
 
+def test_imdb_selection_recovers_a_deleted_cache_without_duplicate_history(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+    first = service.select(job["id"])
+    artifact = Path(store.get_candidate(first["id"], include_internal=True)["artifact_path"])
+    cache_path = service.cache.has("tt0110912")
+    cache_path.unlink()
+
+    recovered = service.select(job["id"])
+    detail = store.get_job_detail(job["id"])
+    assert recovered["id"] == first["id"]
+    assert service.cache.has("tt0110912").read_bytes() == artifact.read_bytes()
+    assert len([event for event in detail["events"] if event["type"] == "subtitle_selected"]) == 1
+    assert len([attempt for attempt in detail["attempts"] if attempt["candidate_id"]]) == 1
+
+
+def test_post_success_tampering_transitions_to_attention_and_allows_manual_recovery(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+    selected = service.select(job["id"])
+    artifact = Path(store.get_candidate(selected["id"], include_internal=True)["artifact_path"])
+    artifact.write_bytes(SHORT_SRT)
+
+    with pytest.raises(AttentionRequired):
+        service.select(job["id"])
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["candidates"][0]["status"] == "rejected"
+    assert detail["stages"][0]["state"] == "needs_attention"
+    assert detail["run"]["state"] == "needs_attention"
+
+    recovered = service.select(job["id"], manual_candidate_id=selected["id"])
+    detail = store.get_job_detail(job["id"])
+    assert recovered["status"] == "selected"
+    assert detail["stages"][0]["state"] == "completed"
+
+
 def test_cp1252_candidate_promotes_normalized_utf8_for_cache_and_analysis(store, configured):
     result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
     job = make_job(store)

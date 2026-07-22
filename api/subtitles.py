@@ -344,6 +344,29 @@ class SubtitleService:
         self, job_id: str, candidate: dict[str, Any]
     ) -> dict[str, Any]:
         stage = self._selection_stage(job_id)
+        if StageState(stage["state"]) is StageState.COMPLETED:
+            job = self._job(job_id)
+            if JobState(job["state"]) is JobState.COMPLETED:
+                self.store.transition_job(
+                    job_id, JobState.QUEUED, expected_state=JobState.COMPLETED
+                )
+                self.store.transition_job(
+                    job_id, JobState.RUNNING, expected_state=JobState.QUEUED
+                )
+            self.store.transition_stage(
+                job_id,
+                "subtitle_selection",
+                StageState.QUEUED,
+                trigger=AttemptTrigger.ARTIFACT_INVALIDATION,
+                expected_state=StageState.COMPLETED,
+            )
+            self.store.transition_stage(
+                job_id,
+                "subtitle_selection",
+                StageState.RUNNING,
+                expected_state=StageState.QUEUED,
+            )
+            stage = self._selection_stage(job_id)
         if StageState(stage["state"]) is StageState.RUNNING:
             self._exhaust(
                 job_id,
@@ -421,9 +444,12 @@ class SubtitleService:
             and candidate["content_hash"] == _hash(path)
             and StageState(self._selection_stage(job_id)["state"]) is StageState.COMPLETED
         )
-        return artifact_valid and (
-            cache_path is None or cache_path.read_bytes() == path.read_bytes()
+        cache_valid = (
+            cache_path is not None and cache_path.read_bytes() == path.read_bytes()
+            if job["source_imdb_id"]
+            else True
         )
+        return artifact_valid and cache_valid
 
     def _active_candidate_attempt(
         self, job_id: str, candidate_id: str
