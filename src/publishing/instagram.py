@@ -14,6 +14,7 @@ from src.publishing.errors import (
     PlatformCredentialsError,
     PlatformStatsError,
     PlatformTransientError,
+    normalized_remote_id,
 )
 from src.publishing.tiktok import (
     _close_browser_resources,
@@ -114,8 +115,8 @@ class InstagramClient:
                     raise PlatformConfirmationError(
                         "Instagram did not expose a Share control."
                     )
-                share.click()
                 submitted = True
+                share.click()
                 page.wait_for_url("**/p/**", timeout=30_000)
                 remote_id = _remote_id(page.url, "p")
                 if remote_id is None:
@@ -142,11 +143,12 @@ class InstagramClient:
 
     def get_video_stats(self, post_id: str) -> dict[str, int | float]:
         """Return a complete verified snapshot or raise a typed failure."""
-        normalized = str(post_id or "").strip()
-        if not normalized:
+        try:
+            normalized = normalized_remote_id(post_id)
+        except ValueError:
             raise PlatformConfirmationError(
                 "Instagram statistics require a confirmed post ID."
-            )
+            ) from None
         cookie = self._cookie()
         browser = None
         context = None

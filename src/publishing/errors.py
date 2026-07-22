@@ -2,10 +2,23 @@
 
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Iterable
 
 from api.domain import FailureCategory
 from api.errors import AttentionRequired, ConfigurationRequired, TransientFailure
+
+
+def normalized_remote_id(value: object) -> str:
+    """Return a usable platform identity without coercing arbitrary objects."""
+    if not isinstance(value, str) or any(
+        unicodedata.category(character).startswith("C") for character in value
+    ):
+        raise ValueError("A non-empty control-free remote ID is required")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("A non-empty control-free remote ID is required")
+    return normalized
 
 
 class PlatformCredentialsError(ConfigurationRequired):

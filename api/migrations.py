@@ -333,24 +333,48 @@ def _add_publishing_attempt_leases(
         )
     code = "ambiguous_publish_outcome"
     message = "An unfinished pre-lease publishing attempt requires reconciliation."
+    affected_ids = [
+        int(row[0])
+        for row in connection.execute(
+            """SELECT id FROM publishing_attempts
+               WHERE finished_at IS NULL
+                 AND (lease_owner IS NULL OR lease_expires_at IS NULL)"""
+        )
+    ]
+    if not affected_ids:
+        return
+    placeholders = ", ".join("?" for _ in affected_ids)
     connection.execute(
-        """UPDATE publishing_attempts SET finished_at = ?, outcome = 'ambiguous',
+        f"""UPDATE publishing_attempts SET finished_at = ?, outcome = 'ambiguous',
                retryable = 0, safe_error_code = ?, safe_error_message = ?
-           WHERE finished_at IS NULL
-             AND (lease_owner IS NULL OR lease_expires_at IS NULL)""",
-        (_now, code, message),
+           WHERE id IN ({placeholders})""",
+        (_now, code, message, *affected_ids),
     )
     connection.execute(
-        """UPDATE releases SET status = 'needs_attention', safe_error_code = ?,
+        f"""UPDATE releases SET status = 'needs_attention', safe_error_code = ?,
                safe_error_message = ?, updated_at = ?
-           WHERE status = 'uploading' AND EXISTS (
+           WHERE EXISTS (
                SELECT 1 FROM publishing_attempts attempt
                WHERE attempt.job_id = releases.job_id
                  AND attempt.platform = releases.platform
-                 AND attempt.outcome = 'ambiguous'
-                 AND attempt.safe_error_code = ?
+                 AND attempt.id IN ({placeholders})
            )""",
-        (code, message, _now, code),
+        (code, message, _now, *affected_ids),
+    )
+    connection.execute(
+        f"""INSERT INTO releases
+               (job_id, platform, status, safe_error_code, safe_error_message,
+                metadata_json, updated_at)
+           SELECT attempt.job_id, attempt.platform, 'needs_attention', ?, ?,
+                  attempt.metadata_json, ?
+           FROM publishing_attempts attempt
+           WHERE attempt.id IN ({placeholders})
+             AND NOT EXISTS (
+                 SELECT 1 FROM releases
+                 WHERE releases.job_id = attempt.job_id
+                   AND releases.platform = attempt.platform
+             )""",
+        (code, message, _now, *affected_ids),
     )
 
 

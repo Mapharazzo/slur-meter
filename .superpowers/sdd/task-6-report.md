@@ -82,6 +82,30 @@ construction), before any network or browser launch.
 - Fifth independent confirmation reran 114 focused cases plus Ruff/diff checks and
   reported no remaining Critical or Important findings: ready.
 
+### Controller-review repair cycles
+
+- RED: 19 selected regressions reproduced post-dispatch browser exceptions being
+  retried, typed YouTube credential errors being masked, non-string/control-bearing
+  remote identities being coerced, legacy lease-less helpers remaining callable,
+  and v2 active attempts without releases being missed by migration v3. Two more
+  RED cases reproduced fractional count metrics being truncated.
+- GREEN: TikTok and Instagram mark the irreversible boundary before clicking;
+  YouTube preserves typed operational failures; remote identities must be genuine
+  non-empty control-free strings; the legacy attempt helpers are removed; and v3
+  creates or updates a `needs_attention` release for every migrated active attempt.
+- A direct injected v3 failure after `ALTER TABLE` and attempt backfill proves the
+  migration transaction restores both the original columns and original active
+  attempt. Service, clients, and persistence now reject fractional view/like/comment/
+  share counts while continuing to accept finite non-negative fractional revenue.
+- Independent follow-up review found two Important edge cases. Exact REDs proved
+  historical ambiguous attempts could downgrade a later reconciled upload and a
+  supplemental stats provider could mask typed credentials errors. GREEN snapshots
+  only the unfinished lease-less attempt IDs affected by v3 and preserves
+  supplemental `OperationalError` instances. The same reviewer then reported no
+  remaining Critical or Important findings.
+- The expanded controller-focused migration/service/store/client group reached
+  138/138 passing cases before the final repository gates.
+
 ## Contract/self-review
 
 - Publication request metadata is persisted once and reused from the release on all
@@ -92,11 +116,12 @@ construction), before any network or browser launch.
 - Active and uploaded publications coalesce/idempotently return; live publishing
   calls are lease-protected and only expired claims can enter explicit recovery.
   Completion requires the matching unexpired owner.
-- Empty IDs are ambiguity failures. Post-submit uncertainty becomes
+- Empty, non-string, and control-bearing IDs are ambiguity failures. Post-submit uncertainty becomes
   `needs_attention` and cannot upload again until explicit reconciliation.
 - Persisted errors contain only stable codes/messages; adversarial bearer, cookie,
   query-secret, upstream body, and absolute-path text is excluded.
-- Stats require a confirmed remote ID and a complete finite non-negative snapshot.
+- Stats require a confirmed remote ID and a complete finite non-negative snapshot;
+  count dimensions are integers and revenue may be a finite float.
   Fetch, parse, confirmation, and atomic-store failures preserve prior last-good
   revenue rows.
 - TikTok, Instagram, and YouTube now raise typed errors rather than returning empty
@@ -121,9 +146,9 @@ the commit gate.
 
 ## Final post-review gate
 
-- Required focused command: `107 passed in 3.03s`.
-- Required unit plus job-submission command: `284 passed, 22 warnings in 11.94s`.
-- Required repository-wide command: `317 passed, 1 failed, 26 warnings in 17.92s`.
+- Required focused command: `132 passed in 3.20s`.
+- Required unit plus job-submission command: `312 passed, 22 warnings in 11.58s`.
+- Required repository-wide command: `345 passed, 1 failed, 26 warnings in 19.05s`.
   The sole failure remained the documented Task 8 Django SRT fixture conflict
   (`total_f_bombs`, expected 100 vs actual 200); Task 6 did not modify it.
 - Independent final review: no Critical or Important findings; ready.

@@ -286,6 +286,112 @@ def test_v3_migration_marks_unfinished_lease_less_publication_ambiguous(tmp_path
     assert detail["releases"][0]["status"] == "needs_attention"
 
 
+def test_v3_migrates_helper_shaped_attempt_without_release_to_attention(tmp_path):
+    path = tmp_path / "v2-helper-attempt.db"
+    store, job_id = _prepare_v2_helper_attempt(path)
+
+    store.initialize()
+
+    detail = store.get_job_detail(job_id)
+    assert detail["publishing_attempts"][0]["outcome"] == "ambiguous"
+    assert len(detail["releases"]) == 1
+    assert detail["releases"][0]["status"] == "needs_attention"
+    assert detail["releases"][0]["remote_id"] is None
+    assert detail["releases"][0]["metadata"] == {
+        "title": "Legacy helper metadata"
+    }
+
+
+def test_v3_preserves_release_reconciled_after_historical_ambiguity(tmp_path):
+    path = tmp_path / "v2-reconciled-publication.db"
+    store = OperationStore(path)
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.upsert_release(
+        job["id"], "youtube", status="uploaded", remote_id="confirmed-remote"
+    )
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO publishing_attempts
+               (job_id, platform, retry_cycle, attempt_number, max_attempts,
+                trigger, started_at, finished_at, outcome, retryable,
+                safe_error_code, safe_error_message, metadata_json)
+               VALUES (?, 'youtube', 1, 1, 3, 'automatic', ?, ?, 'ambiguous', 0,
+                       'ambiguous_publish_outcome', 'Already reconciled', '{}')""",
+            (
+                job["id"],
+                "2026-07-21T12:00:00+00:00",
+                "2026-07-21T12:01:00+00:00",
+            ),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute(
+            "ALTER TABLE publishing_attempts DROP COLUMN lease_expires_at"
+        )
+        connection.execute("ALTER TABLE publishing_attempts DROP COLUMN lease_owner")
+
+    store.initialize()
+
+    release = store.get_job_detail(job["id"])["releases"][0]
+    assert release["status"] == "uploaded"
+    assert release["remote_id"] == "confirmed-remote"
+    assert release["safe_error"] is None
+
+
+def test_v3_failure_rolls_back_alter_and_attempt_release_backfill(tmp_path):
+    path = tmp_path / "v3-rollback.db"
+    store, _ = _prepare_v2_helper_attempt(path)
+    with store._connection() as connection:
+        connection.execute(
+            """CREATE TRIGGER reject_v3_release_recovery
+               BEFORE INSERT ON releases
+               BEGIN
+                   SELECT RAISE(ABORT, 'injected v3 backfill failure');
+               END"""
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected v3 backfill failure"):
+        store.initialize()
+
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(publishing_attempts)")
+        }
+        attempt = connection.execute(
+            "SELECT outcome, finished_at FROM publishing_attempts"
+        ).fetchone()
+        versions = connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        release_count = connection.execute("SELECT COUNT(*) FROM releases").fetchone()[0]
+    assert "lease_owner" not in columns
+    assert "lease_expires_at" not in columns
+    assert attempt == ("running", None)
+    assert versions == [(1,), (2,)]
+    assert release_count == 0
+
+
+def _prepare_v2_helper_attempt(path):
+    store = OperationStore(path)
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    with store._connection() as connection:
+        connection.execute(
+            """INSERT INTO publishing_attempts
+               (job_id, platform, retry_cycle, attempt_number, max_attempts,
+                trigger, started_at, metadata_json, lease_owner, lease_expires_at)
+               VALUES (?, 'youtube', 1, 1, 3, 'automatic', ?, ?, NULL, NULL)""",
+            (job["id"], "2026-07-22T12:00:00+00:00", '{"title":"Legacy helper metadata"}'),
+        )
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute(
+            "ALTER TABLE publishing_attempts DROP COLUMN lease_expires_at"
+        )
+        connection.execute("ALTER TABLE publishing_attempts DROP COLUMN lease_owner")
+    return store, job["id"]
+
+
 def test_failed_migration_rolls_back_schema_and_data_changes(tmp_path):
     path = tmp_path / "rollback.db"
     connection = sqlite3.connect(path)

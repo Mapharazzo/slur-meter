@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import uuid
@@ -21,6 +22,7 @@ from api.domain import (
 )
 from api.errors import sanitize_text
 from api.migrations import apply_migrations
+from src.publishing.errors import normalized_remote_id as _normalized_remote_id
 
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "slur_meter.db"
 _ACTIVE_STATES = (JobState.QUEUED.value, JobState.RUNNING.value)
@@ -1818,7 +1820,9 @@ class OperationStore:
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Finish an attempt, release summary, and event in one transaction."""
         now = self._now_text()
-        normalized_remote_id = str(remote_id or "").strip() or None
+        normalized_remote_id = (
+            _normalized_remote_id(remote_id) if remote_id is not None else None
+        )
         if release_status == "uploaded" and normalized_remote_id is None:
             raise ValueError("An uploaded release requires a non-empty remote ID")
         with self._mutation() as connection:
@@ -1922,7 +1926,9 @@ class OperationStore:
         """Record an operator's explicit resolution of an ambiguous upload."""
         now = self._now_text()
         normalized_platform = str(platform).strip().lower()
-        normalized_remote_id = str(remote_id or "").strip() or None
+        normalized_remote_id = (
+            _normalized_remote_id(remote_id) if remote_id is not None else None
+        )
         if outcome not in {"uploaded", "not_uploaded"}:
             raise ValueError("Unknown publishing reconciliation outcome")
         if outcome == "uploaded" and normalized_remote_id is None:
@@ -1994,15 +2000,41 @@ class OperationStore:
         """Atomically store one verified metrics snapshot and its event."""
         now = self._now_text()
         normalized_platform = str(platform).strip().lower()
+        count_fields = ("views", "likes", "comments", "shares")
+        if any(
+            isinstance(metrics.get(field), bool)
+            or not isinstance(metrics.get(field), int)
+            or metrics[field] < 0
+            for field in count_fields
+        ):
+            raise ValueError("Publishing count metrics must be non-negative integers")
+        revenue = metrics.get("revenue_usd")
+        if (
+            isinstance(revenue, bool)
+            or not isinstance(revenue, (int, float))
+            or not math.isfinite(revenue)
+            or revenue < 0
+        ):
+            raise ValueError("Publishing revenue metrics must be finite and non-negative")
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
             release = connection.execute(
                 "SELECT remote_id, status FROM releases WHERE job_id = ? AND platform = ?",
                 (resolved, normalized_platform),
             ).fetchone()
-            if release is None or release["status"] != "uploaded" or not str(
-                release["remote_id"] or ""
-            ).strip():
+            try:
+                confirmed_remote_id = (
+                    _normalized_remote_id(release["remote_id"])
+                    if release is not None
+                    else None
+                )
+            except ValueError:
+                confirmed_remote_id = None
+            if (
+                release is None
+                or release["status"] != "uploaded"
+                or confirmed_remote_id is None
+            ):
                 raise ValueError("Statistics require a confirmed remote publication")
             connection.execute(
                 """INSERT INTO revenue
@@ -2038,118 +2070,6 @@ class OperationStore:
                 (resolved, normalized_platform, str(date)),
             ).fetchone()
             return self._revenue_dto(row)
-
-    def start_publishing_attempt(
-        self,
-        job_id: str,
-        platform: str,
-        *,
-        retry_cycle: int = 1,
-        max_attempts: int = 3,
-        trigger: AttemptTrigger | str = AttemptTrigger.AUTOMATIC,
-        metadata: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        now = self._now_text()
-        with self._mutation() as connection:
-            resolved = self._require_job_id(connection, job_id)
-            release = connection.execute(
-                "SELECT status, remote_id FROM releases WHERE job_id = ? AND platform = ?",
-                (resolved, platform),
-            ).fetchone()
-            if (
-                release is not None
-                and release["status"] == "uploaded"
-                and str(release["remote_id"] or "").strip()
-            ):
-                latest = connection.execute(
-                    """SELECT * FROM publishing_attempts
-                       WHERE job_id = ? AND platform = ? ORDER BY id DESC LIMIT 1""",
-                    (resolved, platform),
-                ).fetchone()
-                if latest is not None:
-                    return self._publishing_dto(latest)
-                raise ValueError("Platform has already been uploaded")
-            active = connection.execute(
-                """SELECT * FROM publishing_attempts
-                   WHERE job_id = ? AND platform = ? AND finished_at IS NULL
-                   ORDER BY id DESC LIMIT 1""",
-                (resolved, platform),
-            ).fetchone()
-            if active is not None:
-                return self._publishing_dto(active)
-            original = connection.execute(
-                """SELECT metadata_json FROM publishing_attempts
-                   WHERE job_id = ? AND platform = ? ORDER BY id LIMIT 1""",
-                (resolved, platform),
-            ).fetchone()
-            metadata_json = (
-                original["metadata_json"]
-                if original is not None
-                else _safe_json_dump(metadata or {})
-            )
-            number = int(
-                connection.execute(
-                    """SELECT COALESCE(MAX(attempt_number), 0) + 1 FROM publishing_attempts
-                       WHERE job_id = ? AND platform = ? AND retry_cycle = ?""",
-                    (resolved, platform, int(retry_cycle)),
-                ).fetchone()[0]
-            )
-            cursor = connection.execute(
-                """INSERT INTO publishing_attempts
-                   (job_id, platform, retry_cycle, attempt_number, max_attempts,
-                    trigger, started_at, metadata_json)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    resolved,
-                    platform,
-                    int(retry_cycle),
-                    number,
-                    int(max_attempts),
-                    _enum_value(AttemptTrigger, trigger),
-                    now,
-                    metadata_json,
-                ),
-            )
-            row = connection.execute(
-                "SELECT * FROM publishing_attempts WHERE id = ?", (cursor.lastrowid,)
-            ).fetchone()
-            return self._publishing_dto(row)
-
-    def finish_publishing_attempt(
-        self,
-        attempt_id: int,
-        outcome: str,
-        *,
-        retryable: bool = False,
-        safe_error_code: str | None = None,
-        safe_error_message: object | None = None,
-        remote_id: str | None = None,
-    ) -> dict[str, Any] | None:
-        now = self._now_text()
-        with self._mutation() as connection:
-            row = connection.execute(
-                "SELECT * FROM publishing_attempts WHERE id = ?", (int(attempt_id),)
-            ).fetchone()
-            if row is None:
-                return None
-            if row["finished_at"] is None:
-                connection.execute(
-                    """UPDATE publishing_attempts SET finished_at = ?, outcome = ?, retryable = ?,
-                           safe_error_code = ?, safe_error_message = ?, remote_id = ? WHERE id = ?""",
-                    (
-                        now,
-                        _safe_text(outcome),
-                        int(bool(retryable)),
-                        _safe_text(safe_error_code),
-                        _safe_text(safe_error_message),
-                        _safe_text(remote_id),
-                        int(attempt_id),
-                    ),
-                )
-            updated = connection.execute(
-                "SELECT * FROM publishing_attempts WHERE id = ?", (int(attempt_id),)
-            ).fetchone()
-            return self._publishing_dto(updated)
 
     def record_cost(
         self,
@@ -2231,7 +2151,9 @@ class OperationStore:
         metadata: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         now = self._now_text()
-        normalized_remote_id = str(remote_id or "").strip() or None
+        normalized_remote_id = (
+            _normalized_remote_id(remote_id) if remote_id is not None else None
+        )
         if status == "uploaded" and normalized_remote_id is None:
             raise ValueError("An uploaded release requires a non-empty remote ID")
         uploaded_at = now if status == "uploaded" else None

@@ -12,12 +12,13 @@ from google.auth.exceptions import TransportError
 from requests.exceptions import ConnectionError as RequestsConnectionError
 from requests.exceptions import Timeout as RequestsTimeout
 
-from api.errors import AmbiguousPublishOutcome
+from api.errors import AmbiguousPublishOutcome, OperationalError
 from src.publishing.errors import (
     PlatformConfirmationError,
     PlatformCredentialsError,
     PlatformStatsError,
     PlatformTransientError,
+    normalized_remote_id,
 )
 
 
@@ -78,6 +79,8 @@ class YouTubeClient:
             )
             creds.refresh(Request())
             self._youtube = build("youtube", "v3", credentials=creds)
+        except OperationalError:
+            raise
         except (
             TimeoutError,
             ConnectionError,
@@ -132,12 +135,16 @@ class YouTubeClient:
             request = self.youtube.videos().insert(
                 part=",".join(body), body=body, media_body=media
             )
+        except OperationalError:
+            raise
         except Exception as exc:
             raise PlatformTransientError(technical_detail=type(exc).__name__) from None
         response: Mapping[str, Any] | None = None
         try:
             while response is None:
                 _, response = request.next_chunk()
+        except OperationalError:
+            raise
         except Exception as exc:
             raise AmbiguousPublishOutcome(
                 "YouTube may have accepted the upload; reconcile it before retrying.",
@@ -147,27 +154,31 @@ class YouTubeClient:
             raise AmbiguousPublishOutcome(
                 "YouTube returned an invalid upload confirmation; reconcile before retrying."
             )
-        video_id = str(response.get("id") or "").strip()
-        if not video_id:
+        try:
+            video_id = normalized_remote_id(response.get("id"))
+        except ValueError:
             raise AmbiguousPublishOutcome(
                 "YouTube did not return a video ID; reconcile before retrying."
-            )
+            ) from None
         return video_id
 
     def get_video_stats(self, video_id: str) -> dict[str, int | float]:
         """Return a complete snapshot or raise instead of synthesizing success."""
-        normalized = str(video_id or "").strip()
-        if not normalized:
+        try:
+            normalized = normalized_remote_id(video_id)
+        except ValueError:
             raise PlatformConfirmationError(
                 "YouTube statistics require a confirmed video ID.",
                 actions=("reconcile_publishing",),
-            )
+            ) from None
         try:
             result = (
                 self.youtube.videos()
                 .list(part="statistics", id=normalized)
                 .execute()
             )
+        except OperationalError:
+            raise
         except Exception as exc:
             raise PlatformStatsError(technical_detail=type(exc).__name__) from None
         items = result.get("items", []) if isinstance(result, Mapping) else []
@@ -214,6 +225,8 @@ def _verified_supplemental_stats(
         )
     try:
         values = provider(remote_id)
+    except OperationalError:
+        raise
     except PlatformStatsError:
         raise
     except Exception as exc:
@@ -225,12 +238,20 @@ def _verified_supplemental_stats(
     result: dict[str, int | float] = {}
     for field in fields:
         value = values[field]
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
-            or value < 0
-        ):
+        if field == "revenue_usd":
+            valid = (
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                and value >= 0
+            )
+        else:
+            valid = (
+                not isinstance(value, bool)
+                and isinstance(value, int)
+                and value >= 0
+            )
+        if not valid:
             raise PlatformStatsError(
                 "The supplemental statistics snapshot is invalid."
             )

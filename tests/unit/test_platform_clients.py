@@ -72,6 +72,105 @@ def test_youtube_missing_credentials_raise_typed_error_before_sdk_import(monkeyp
         _ = YouTubeClient().youtube
 
 
+def test_youtube_missing_credentials_remain_one_attempt_through_service(
+    tmp_path, monkeypatch
+):
+    for name in (
+        "YOUTUBE_CLIENT_ID",
+        "YOUTUBE_CLIENT_SECRET",
+        "YOUTUBE_REFRESH_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    client = YouTubeClient(media_upload_factory=lambda *args, **kwargs: object())
+    store = OperationStore(
+        tmp_path / "youtube-credentials.db",
+        clock=lambda: datetime(2026, 7, 22, 12, 0, tzinfo=UTC),
+    )
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    video = tmp_path / "youtube-credentials.mp4"
+    video.write_bytes(b"video")
+    service = PublishingService(store, {"youtube": client}, sleep=lambda _: None)
+    service.request(job["id"], "youtube", title="Pulp Fiction", summary={})
+
+    with pytest.raises(PlatformCredentialsError):
+        service.publish(job["id"], "youtube", video)
+
+    detail = store.get_job_detail(job["id"])
+    assert len(detail["publishing_attempts"]) == 1
+    assert detail["publishing_attempts"][0]["safe_error"]["code"] == (
+        "publishing_credentials_required"
+    )
+
+
+def test_youtube_stats_preserve_typed_credentials_error_through_service(
+    tmp_path, monkeypatch
+):
+    for name in (
+        "YOUTUBE_CLIENT_ID",
+        "YOUTUBE_CLIENT_SECRET",
+        "YOUTUBE_REFRESH_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    client = YouTubeClient()
+    store = OperationStore(
+        tmp_path / "youtube-stats-credentials.db",
+        clock=lambda: datetime(2026, 7, 22, 12, 0, tzinfo=UTC),
+    )
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    store.upsert_release(
+        job["id"],
+        "youtube",
+        status="uploaded",
+        remote_id="remote-1",
+        metadata={"title": "Stable"},
+    )
+    service = PublishingService(store, {"youtube": client})
+
+    with pytest.raises(PlatformCredentialsError):
+        service.refresh_stats(job["id"], "youtube")
+
+
+def test_youtube_supplemental_credentials_error_remains_typed_through_service(
+    tmp_path,
+):
+    videos = FakeYouTubeVideos(
+        stats_result={
+            "items": [
+                {
+                    "statistics": {
+                        "viewCount": "10",
+                        "likeCount": "2",
+                        "commentCount": "1",
+                    }
+                }
+            ]
+        }
+    )
+
+    def missing_supplemental_credentials(_remote_id):
+        raise PlatformCredentialsError()
+
+    client = YouTubeClient(
+        youtube=FakeYouTubeService(videos),
+        supplemental_stats=missing_supplemental_credentials,
+    )
+    store = OperationStore(tmp_path / "youtube-supplemental-credentials.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.upsert_release(
+        job["id"], "youtube", status="uploaded", remote_id="remote-1"
+    )
+    service = PublishingService(store, {"youtube": client})
+
+    with pytest.raises(PlatformCredentialsError):
+        service.refresh_stats(job["id"], "youtube")
+
+    assert store.list_revenue(job["id"]) == []
+
+
 def test_youtube_authentication_timeout_is_typed_transient(monkeypatch):
     for name in (
         "YOUTUBE_CLIENT_ID",
@@ -175,6 +274,24 @@ def test_youtube_malformed_upload_response_is_typed_confirmation_failure(tmp_pat
         client.upload(tmp_path / "video.mp4", title="Title", description="Description")
 
 
+@pytest.mark.parametrize(
+    "malformed_id",
+    [{"nested": "id"}, object(), "remote\nid", "remote\x00id"],
+)
+def test_youtube_malformed_remote_id_is_ambiguous_not_stringified(
+    tmp_path, malformed_id
+):
+    client = YouTubeClient(
+        youtube=FakeYouTubeService(
+            FakeYouTubeVideos(upload_result={"id": malformed_id})
+        ),
+        media_upload_factory=lambda *args, **kwargs: object(),
+    )
+
+    with pytest.raises(AmbiguousPublishOutcome):
+        client.upload(tmp_path / "video.mp4", title="Title", description="Description")
+
+
 def test_youtube_missing_stats_item_raises_instead_of_returning_zero_snapshot():
     videos = FakeYouTubeVideos(stats_result={"items": []})
     client = YouTubeClient(
@@ -264,11 +381,13 @@ def test_youtube_stats_reject_unavailable_supplemental_dimensions():
 
 
 class FakeElement:
-    def __init__(self, text="0"):
+    def __init__(self, text="0", *, click_error=False):
         self.text = text
         self.filled = []
         self.files = []
         self.clicked = False
+        self.click_calls = 0
+        self.click_error = click_error
 
     def set_input_files(self, value):
         self.files.append(value)
@@ -278,6 +397,9 @@ class FakeElement:
 
     def click(self):
         self.clicked = True
+        self.click_calls += 1
+        if self.click_error:
+            raise RuntimeError("click dispatched before browser error")
 
     def inner_text(self):
         return self.text
@@ -296,6 +418,7 @@ class FakePage:
         confirmation_error=False,
         new_post_fallback=False,
         missing_remote_id=False,
+        irreversible_click_error=False,
         stats_text=None,
     ):
         self.platform = platform
@@ -307,13 +430,15 @@ class FakePage:
         self.confirmation_error = confirmation_error
         self.new_post_fallback = new_post_fallback
         self.missing_remote_id = missing_remote_id
+        self.irreversible_click_error = irreversible_click_error
+        self.submit_clicks = 0
         self.file_queries = 0
         self.stats_text = stats_text or {}
         self.url = "https://platform.invalid/upload"
         self.handlers = {}
         self.file = FakeElement()
         self.caption = FakeElement()
-        self.share = FakeElement()
+        self.share = FakeElement(click_error=irreversible_click_error)
 
     def goto(self, url, **kwargs):
         if self.stats_timeout and ("/video/" in url or "/p/" in url):
@@ -344,6 +469,10 @@ class FakePage:
         return None
 
     def click(self, selector):
+        if selector == '[data-e2e="upload-button"]':
+            self.submit_clicks += 1
+            if self.irreversible_click_error:
+                raise RuntimeError("click dispatched before browser error")
         return None
 
     def fill(self, selector, value):
@@ -523,6 +652,41 @@ def test_browser_post_submit_timeout_is_ambiguous_and_resources_close(
 
     assert context.closed is True
     assert browser.closed is True
+
+
+@pytest.mark.parametrize(
+    ("client_class", "platform", "env_name"),
+    [
+        (TikTokClient, "tiktok", "TIKTOK_SESSION_ID"),
+        (InstagramClient, "instagram", "INSTAGRAM_SESSION_ID"),
+    ],
+)
+def test_click_that_dispatches_then_raises_is_ambiguous_once_through_service(
+    tmp_path, monkeypatch, client_class, platform, env_name
+):
+    monkeypatch.setenv(env_name, "safe-session")
+    client, page, _, _ = browser_client(
+        client_class, platform, irreversible_click_error=True
+    )
+    store = OperationStore(
+        tmp_path / f"{platform}-click.db",
+        clock=lambda: datetime(2026, 7, 22, 12, 0, tzinfo=UTC),
+    )
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    video = tmp_path / f"{platform}-click.mp4"
+    video.write_bytes(b"video")
+    service = PublishingService(store, {platform: client}, sleep=lambda _: None)
+    service.request(job["id"], platform, title="Pulp Fiction", summary={})
+
+    with pytest.raises(AmbiguousPublishOutcome):
+        service.publish(job["id"], platform, video)
+
+    clicks = page.submit_clicks if platform == "tiktok" else page.share.click_calls
+    assert clicks == 1
+    detail = store.get_job_detail(job["id"])
+    assert len(detail["publishing_attempts"]) == 1
+    assert detail["releases"][0]["status"] == "needs_attention"
 
 
 @pytest.mark.parametrize(

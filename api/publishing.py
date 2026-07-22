@@ -13,7 +13,11 @@ from typing import Any, Protocol
 
 from api.domain import AttemptTrigger, FailureCategory
 from api.errors import AmbiguousPublishOutcome, OperationalError, classify_exception
-from src.publishing.errors import PlatformConfirmationError, PlatformStatsError
+from src.publishing.errors import (
+    PlatformConfirmationError,
+    PlatformStatsError,
+    normalized_remote_id,
+)
 from src.publishing.metadata import generate_metadata
 
 _PLATFORMS = frozenset({"youtube", "tiktok", "instagram"})
@@ -26,7 +30,7 @@ _LIVE_ATTEMPTS_LOCK = threading.RLock()
 class PublishingClient(Protocol):
     """Minimum injected platform interface used by the workflow."""
 
-    def upload(self, video_path: str | Path, **metadata: Any) -> str: ...
+    def upload(self, video_path: str | Path, **metadata: Any) -> object: ...
 
     def get_video_stats(self, remote_id: str) -> Mapping[str, Any]: ...
 
@@ -246,8 +250,11 @@ class PublishingService:
         """Fetch and atomically store a complete verified metrics snapshot."""
         normalized = self._platform(platform)
         release = self._require_release(job_id, normalized)
-        remote_id = str(release.get("remote_id") or "").strip()
-        if release["status"] != "uploaded" or not remote_id:
+        try:
+            remote_id = normalized_remote_id(release.get("remote_id"))
+        except ValueError:
+            remote_id = None
+        if release["status"] != "uploaded" or remote_id is None:
             error = PlatformConfirmationError(
                 "Statistics require a confirmed remote publication."
             )
@@ -297,10 +304,13 @@ class PublishingService:
                     remote_id = self._upload_with_heartbeat(
                         client, attempt, video_path
                     )
-                    if not remote_id:
+                    try:
+                        remote_id = normalized_remote_id(remote_id)
+                    except ValueError:
                         raise AmbiguousPublishOutcome(
-                            "The platform did not return a remote ID; reconcile before retrying."
-                        )
+                            "The platform did not return a valid remote ID; "
+                            "reconcile before retrying."
+                        ) from None
                 except Exception as exc:
                     error = classify_exception(exc, f"{platform} publishing")
                     is_ambiguous = (
@@ -364,7 +374,7 @@ class PublishingService:
         client: PublishingClient,
         attempt: Mapping[str, Any],
         video_path: str | Path,
-    ) -> str:
+    ) -> object:
         stop = threading.Event()
         lost = threading.Event()
 
@@ -390,9 +400,9 @@ class PublishingService:
         )
         worker.start()
         try:
-            remote_id = str(
-                client.upload(video_path, **_upload_metadata(attempt["metadata"])) or ""
-            ).strip()
+            remote_id = client.upload(
+                video_path, **_upload_metadata(attempt["metadata"])
+            )
         finally:
             stop.set()
             worker.join(timeout=max(self.heartbeat_interval, 1.0))
@@ -497,12 +507,16 @@ def _validated_metrics(value: Mapping[str, Any]) -> dict[str, int | float]:
     result: dict[str, int | float] = {}
     for field in _METRIC_FIELDS:
         raw = value[field]
-        if (
-            isinstance(raw, bool)
-            or not isinstance(raw, (int, float))
-            or not math.isfinite(raw)
-            or raw < 0
-        ):
+        if field == "revenue_usd":
+            valid = (
+                not isinstance(raw, bool)
+                and isinstance(raw, (int, float))
+                and math.isfinite(raw)
+                and raw >= 0
+            )
+        else:
+            valid = not isinstance(raw, bool) and isinstance(raw, int) and raw >= 0
+        if not valid:
             raise PlatformStatsError("The platform returned an invalid statistics snapshot.")
         result[field] = float(raw) if field == "revenue_usd" else int(raw)
     return result

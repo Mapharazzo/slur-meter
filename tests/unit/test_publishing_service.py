@@ -135,7 +135,7 @@ def test_missing_credentials_are_one_sanitized_deterministic_attempt(
     secret = "super-secret-cookie"
     monkeypatch.setenv("TIKTOK_SESSION_ID", secret)
     unsafe = (
-        f"Bearer abc Cookie: sessionid={secret} "
+        f"Bearer raw-bearer-token Cookie: sessionid={secret} "
         "https://upstream.test/x?access_token=query-secret "
         "/home/mapha/slur-meter/private/raw-body"
     )
@@ -159,7 +159,7 @@ def test_missing_credentials_are_one_sanitized_deterministic_attempt(
     assert len(detail["publishing_attempts"]) == 1
     serialized = repr(detail)
     for forbidden in (
-        "abc",
+        "raw-bearer-token",
         secret,
         "query-secret",
         "/home/mapha",
@@ -242,6 +242,31 @@ def test_empty_remote_id_is_ambiguous_and_requires_reconciliation(store, job, vi
     detail = store.get_job_detail(job["id"])
     assert detail["publishing_attempts"][0]["remote_id"] is None
     assert detail["publishing_attempts"][0]["outcome"] == "ambiguous"
+    assert detail["releases"][0]["status"] == "needs_attention"
+
+
+@pytest.mark.parametrize(
+    "malformed_remote_id",
+    [
+        {"id": "mapping-is-not-an-id"},
+        object(),
+        "remote\nid",
+        "remote\x00id",
+    ],
+)
+def test_malformed_remote_identity_is_ambiguous_not_stringified(
+    store, job, video, malformed_remote_id
+):
+    client = FakeClient(uploads=(malformed_remote_id,))
+    service = PublishingService(store, {"youtube": client}, sleep=lambda _: None)
+    request(service, job["id"])
+
+    with pytest.raises(AmbiguousPublishOutcome):
+        service.publish(job["id"], "youtube", video)
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["publishing_attempts"][0]["remote_id"] is None
+    assert detail["releases"][0]["remote_id"] is None
     assert detail["releases"][0]["status"] == "needs_attention"
 
 
@@ -504,6 +529,8 @@ VALID_STATS = {
         {**VALID_STATS, "views": "not-a-number"},
         {**VALID_STATS, "revenue_usd": math.nan},
         {**VALID_STATS, "views": math.inf},
+        {**VALID_STATS, "views": 1.5},
+        {**VALID_STATS, "shares": 2.5},
     ],
 )
 def test_stats_failures_preserve_exact_last_good_snapshot(
@@ -542,6 +569,24 @@ def test_stats_require_nonempty_remote_identity_and_resolve_imdb_alias(store, jo
 
     assert client.stats_calls == []
     assert store.list_revenue(job["id"]) == []
+
+
+@pytest.mark.parametrize("remote_id", [{"id": "mapping"}, object(), "bad\nidentity"])
+def test_stats_reject_malformed_remote_identity_without_client_call(
+    store, job, monkeypatch, remote_id
+):
+    client = FakeClient(stats=(VALID_STATS,))
+    service = PublishingService(store, {"youtube": client})
+    monkeypatch.setattr(
+        service,
+        "_require_release",
+        lambda *_: {"status": "uploaded", "remote_id": remote_id},
+    )
+
+    with pytest.raises(PlatformConfirmationError):
+        service.refresh_stats(job["id"], "youtube")
+
+    assert client.stats_calls == []
 
 
 def test_publish_rejects_missing_or_empty_video_before_client_call(store, job, tmp_path):

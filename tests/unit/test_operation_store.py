@@ -378,35 +378,60 @@ def test_request_cancel_is_idempotent_for_queued_work(store):
     assert store.get_job_detail(job["id"])["stages"][0]["state"] == "cancelled"
 
 
-def test_concurrent_duplicate_publishing_attempt_is_coalesced(store):
-    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+def test_legacy_publishing_attempt_helpers_are_removed(store):
+    assert not hasattr(store, "start_publishing_attempt")
+    assert not hasattr(store, "finish_publishing_attempt")
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        attempts = list(
-            pool.map(
-                lambda _: store.start_publishing_attempt(job["id"], "youtube"),
-                range(2),
-            )
+
+@pytest.mark.parametrize(
+    "malformed_remote_id",
+    [{"id": "mapping"}, object(), "remote\nid", "remote\x00id"],
+)
+def test_store_rejects_malformed_uploaded_remote_identity(
+    store, malformed_remote_id
+):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    attempt, claimed, _ = store.claim_publishing_attempt(
+        job["id"], "youtube", retry_cycle=1, lease_owner="worker-a"
+    )
+    assert claimed is True
+
+    with pytest.raises(ValueError, match="remote ID"):
+        store.complete_publishing_attempt(
+            attempt["id"],
+            outcome="completed",
+            release_status="uploaded",
+            remote_id=malformed_remote_id,
+            lease_owner="worker-a",
         )
 
-    assert len({attempt["id"] for attempt in attempts}) == 1
-    assert len(store.get_job_detail(job["id"])["publishing_attempts"]) == 1
-
-
-def test_publishing_rejects_empty_remote_id_and_reuses_metadata(store):
-    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
-    first = store.start_publishing_attempt(
-        job["id"], "youtube", metadata={"title": "Original"}
-    )
-    store.finish_publishing_attempt(first["id"], "failed", retryable=True)
-
-    second = store.start_publishing_attempt(
-        job["id"], "youtube", metadata={"title": "Changed"}
-    )
-
-    assert second["metadata"] == {"title": "Original"}
     with pytest.raises(ValueError, match="remote ID"):
-        store.upsert_release(job["id"], "youtube", status="uploaded", remote_id="")
+        store.upsert_release(
+            job["id"],
+            "youtube",
+            status="uploaded",
+            remote_id=malformed_remote_id,
+        )
+
+
+@pytest.mark.parametrize("field", ["views", "likes", "comments", "shares"])
+def test_store_rejects_fractional_count_metrics(store, field):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.upsert_release(job["id"], "youtube", status="uploaded", remote_id="video-1")
+    metrics = {
+        "views": 1,
+        "likes": 1,
+        "comments": 1,
+        "shares": 1,
+        "revenue_usd": 1.5,
+    }
+    metrics[field] = 1.5
+
+    with pytest.raises(ValueError, match="metrics"):
+        store.store_publishing_stats(
+            job["id"], "youtube", "2026-07-22", metrics
+        )
 
 
 def test_publication_request_rolls_back_release_when_event_insert_fails(

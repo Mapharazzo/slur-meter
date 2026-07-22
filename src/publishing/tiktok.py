@@ -14,6 +14,7 @@ from src.publishing.errors import (
     PlatformCredentialsError,
     PlatformStatsError,
     PlatformTransientError,
+    normalized_remote_id,
 )
 from src.publishing.youtube import _verified_supplemental_stats
 
@@ -98,8 +99,8 @@ class TikTokClient:
                 )
                 if caption is not None:
                     caption.fill(f"{title} {description}".strip())
-                page.click('[data-e2e="upload-button"]')
                 submitted = True
+                page.click('[data-e2e="upload-button"]')
                 page.wait_for_url("**/video/**", timeout=30_000)
                 remote_id = _remote_id(page.url, "video")
                 if remote_id is None:
@@ -126,11 +127,12 @@ class TikTokClient:
 
     def get_video_stats(self, video_id: str) -> dict[str, int | float]:
         """Return a complete verified snapshot or raise a typed failure."""
-        normalized = str(video_id or "").strip()
-        if not normalized:
+        try:
+            normalized = normalized_remote_id(video_id)
+        except ValueError:
             raise PlatformConfirmationError(
                 "TikTok statistics require a confirmed video ID."
-            )
+            ) from None
         cookie = self._cookie()
         browser = None
         context = None
