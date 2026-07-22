@@ -177,6 +177,88 @@ def test_resume_finishes_interrupted_promotion_before_exposing_selected_candidat
     assert len([attempt for attempt in detail["attempts"] if attempt["candidate_id"]]) == 1
 
 
+def _validated_candidate_after_interrupted_promotion(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+    original_store = service.cache.store
+    service.cache.store = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("promotion interrupted"))
+    with pytest.raises(RuntimeError, match="interrupted"):
+        service.select(job["id"])
+    service.cache.store = original_store
+    candidate = store.list_candidates(job["id"])[0]
+    artifact = Path(store.get_candidate(candidate["id"], include_internal=True)["artifact_path"])
+    return service, job, candidate, artifact
+
+
+def test_tampered_validated_artifact_reapplies_automatic_quality_before_promotion(store, configured):
+    service, job, candidate, artifact = _validated_candidate_after_interrupted_promotion(store, configured)
+    artifact.write_bytes(SHORT_SRT)
+
+    with pytest.raises(AttentionRequired):
+        service.select(job["id"])
+
+    updated = store.get_candidate(candidate["id"], include_internal=True)
+    assert updated["status"] == "rejected"
+    assert "coverage_below_threshold" in updated["rejection_reasons"]
+    assert service.cache.has("tt0110912") is None
+
+
+def test_missing_validated_artifact_becomes_safe_rejection(store, configured):
+    service, job, candidate, artifact = _validated_candidate_after_interrupted_promotion(store, configured)
+    artifact.unlink()
+
+    with pytest.raises(AttentionRequired):
+        service.select(job["id"])
+
+    updated = store.get_candidate(candidate["id"])
+    assert updated["status"] == "rejected"
+    assert updated["parse_error"] == "Subtitle candidate could not be parsed."
+
+
+def test_resume_finishes_open_attempt_after_stage_completion_failure(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+    original_finish = store.finish_attempt
+    store.finish_attempt = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("after stage completion"))
+
+    with pytest.raises(RuntimeError, match="after stage completion"):
+        service.select(job["id"])
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["stages"][0]["state"] == "completed"
+    assert detail["attempts"][0]["finished_at"] is None
+    store.finish_attempt = original_finish
+
+    selected = service.select(job["id"])
+    detail = store.get_job_detail(job["id"])
+    assert selected["status"] == "selected"
+    assert detail["attempts"][0]["outcome"] == "completed"
+    assert detail["attempts"][0]["finished_at"] is not None
+    assert len(detail["attempts"]) == 1
+
+
+def test_query_only_selection_resumes_without_a_cache_entry(store, configured):
+    job, _ = store.create_or_get_active_job("", "query only film", "Query Only Film")
+    result = SubtitleResult("1", "one.srt", "Query Only Film", "1994", "en", None, None, runtime_seconds=100 * 60)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+
+    first = service.select(job["id"])
+    selected_at = first["selected_at"]
+    second = service.select(job["id"])
+    detail = store.get_job_detail(job["id"])
+
+    assert service.cache.has("") is None
+    assert second["id"] == first["id"]
+    assert second["selected_at"] == selected_at
+    assert len([event for event in detail["events"] if event["type"] == "subtitle_selected"]) == 1
+    assert len([attempt for attempt in detail["attempts"] if attempt["candidate_id"]]) == 1
+
+
 def test_upload_is_confined_and_resume_does_not_repeat_selection(store, configured):
     job = make_job(store)
     service = make_service(store, configured, [], {})

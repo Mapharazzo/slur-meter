@@ -273,21 +273,95 @@ class SubtitleService:
     def _resume_validated(self, job_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
         stored = self.store.get_candidate(candidate["id"], include_internal=True)
         if stored is None or not stored.get("artifact_path"):
-            raise SubtitleParseError("Candidate file is unavailable")
+            return self._reject_resumed_artifact(job_id, candidate)
         path = Path(stored["artifact_path"])
-        inspection = inspect_subtitle(path)
-        _write_normalized(path, inspection.normalized_utf8)
-        if _hash(path) != candidate["content_hash"]:
-            candidate = self.store.update_candidate(candidate["id"], content_hash=_hash(path)) or candidate
-        stage = self._selection_stage(job_id)
-        attempt = (
-            self.store.start_attempt(
-                job_id, "subtitle_selection", max_attempts=3, candidate_id=candidate["id"]
-            )
-            if StageState(stage["state"]) is StageState.RUNNING
-            else None
+        try:
+            inspection = inspect_subtitle(path)
+            _write_normalized(path, inspection.normalized_utf8)
+        except (OSError, ValueError, SubtitleParseError):
+            return self._reject_resumed_artifact(job_id, candidate)
+        attempt = self._active_candidate_attempt(job_id, candidate["id"])
+        if _hash(path) == candidate["content_hash"]:
+            return self._complete_validated(job_id, candidate, path, attempt)
+        return self._reapply_quality(job_id, candidate, path, inspection, attempt)
+
+    def _reapply_quality(
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        path: Path,
+        inspection,
+        attempt: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        quality = evaluate_quality(
+            inspection,
+            candidate["expected_runtime_seconds"],
+            self.settings.subtitle_coverage_threshold,
         )
-        return self._complete_validated(job_id, candidate, path, attempt)
+        reasons = list(quality.reasons)
+        accepted = quality.accepted
+        if candidate["selection_method"] == "manual" and not accepted:
+            accepted = True
+            reasons.append("manual_threshold_override")
+        fields = {
+            "detected_encoding": inspection.detected_encoding,
+            "cue_count": inspection.cue_count,
+            "first_cue_seconds": inspection.first_cue_seconds,
+            "final_cue_seconds": inspection.final_cue_seconds,
+            "parsed_duration_seconds": inspection.parsed_duration_seconds,
+            "coverage_percent": quality.coverage_percent,
+            "quality_reasons": reasons,
+            "content_hash": _hash(path),
+            "artifact_path": str(path),
+        }
+        if accepted:
+            updated = self.store.update_candidate(
+                candidate["id"], status="validated", rejection_reasons=[], **fields
+            ) or candidate
+            return self._complete_validated(job_id, updated, path, attempt)
+        updated = self.store.update_candidate(
+            candidate["id"], status="rejected", rejection_reasons=reasons, **fields
+        ) or candidate
+        if attempt is not None:
+            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reasons": reasons})
+        return self._raise_resume_attention(job_id, updated)
+
+    def _reject_resumed_artifact(
+        self, job_id: str, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        updated = self.store.update_candidate(
+            candidate["id"],
+            status="rejected",
+            parse_error=_SAFE_PARSE_ERROR,
+            rejection_reasons=["invalid_srt"],
+        ) or candidate
+        attempt = self._active_candidate_attempt(job_id, candidate["id"])
+        if attempt is not None:
+            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "invalid_srt"})
+        return self._raise_resume_attention(job_id, updated)
+
+    def _raise_resume_attention(
+        self, job_id: str, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        stage = self._selection_stage(job_id)
+        if StageState(stage["state"]) is StageState.RUNNING:
+            self._exhaust(
+                job_id,
+                attempted=1,
+                limit=min(3, self.settings.subtitle_candidates_per_cycle),
+            )
+        self.store.record_event(
+            job_id,
+            event_type="subtitle_candidate_rejected",
+            message="A validated subtitle candidate could not be resumed.",
+            severity="warning",
+            data={"candidate_id": candidate["id"]},
+        )
+        raise AttentionRequired(
+            "A subtitle candidate needs operator attention.",
+            code="subtitle_candidate_invalid",
+            actions=_EXHAUSTION_ACTIONS,
+        )
 
     def _complete_validated(
         self,
@@ -297,6 +371,7 @@ class SubtitleService:
         attempt: dict[str, Any] | None,
     ) -> dict[str, Any]:
         """Complete durable promotion before marking a candidate selected."""
+        attempt = attempt or self._active_candidate_attempt(job_id, candidate["id"])
         job = self._job(job_id)
         if job["source_imdb_id"]:
             self.cache.store(job["source_imdb_id"], path, replace=True)
@@ -339,13 +414,27 @@ class SubtitleService:
         if stored is None or not stored.get("artifact_path"):
             return False
         path = Path(stored["artifact_path"])
-        cache_path = self.cache.has(self._job(job_id)["source_imdb_id"] or "")
-        return (
+        job = self._job(job_id)
+        cache_path = self.cache.has(job["source_imdb_id"]) if job["source_imdb_id"] else None
+        artifact_valid = (
             path.exists()
             and candidate["content_hash"] == _hash(path)
-            and cache_path is not None
-            and cache_path.read_bytes() == path.read_bytes()
             and StageState(self._selection_stage(job_id)["state"]) is StageState.COMPLETED
+        )
+        return artifact_valid and (
+            cache_path is None or cache_path.read_bytes() == path.read_bytes()
+        )
+
+    def _active_candidate_attempt(
+        self, job_id: str, candidate_id: str
+    ) -> dict[str, Any] | None:
+        return next(
+            (
+                attempt
+                for attempt in reversed(self.store.get_job_detail(job_id)["attempts"])
+                if attempt["candidate_id"] == candidate_id and attempt["finished_at"] is None
+            ),
+            None,
         )
 
     def _selection_stage(self, job_id: str) -> dict[str, Any]:
