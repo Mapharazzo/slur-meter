@@ -203,8 +203,7 @@ class GenerationPipelineServices:
         output_manifest: Mapping[str, Any],
     ) -> bool:
         if (
-            output_manifest.get("manifest_version")
-            != self.artifacts.manifest_version
+            output_manifest.get("manifest_version") != self.artifacts.manifest_version
             or output_manifest.get("stage") != stage_name
             or output_manifest.get("job_id") != expected_job_id
         ):
@@ -219,8 +218,7 @@ class GenerationPipelineServices:
                 and artifact.get("sha256") == candidate["content_hash"]
                 and dict(output_manifest.get("input_hashes", {}))
                 == self._input_hashes(stage_name, expected_job_id)
-                and output_manifest.get("config_hash")
-                == self._config_hash(stage_name)
+                and output_manifest.get("config_hash") == self._config_hash(stage_name)
             )
         validation_stage = (
             "composite" if stage_name.startswith("composite.") else stage_name
@@ -231,7 +229,7 @@ class GenerationPipelineServices:
                 input_hashes=self._input_hashes(validation_stage, expected_job_id),
                 config_hash=self._config_hash(validation_stage),
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, OSError, TypeError, ValueError):
             return False
 
     def retry_policy(self, stage_name: str) -> RetryPolicy:
@@ -294,7 +292,13 @@ class GenerationPipelineServices:
                 )
             candidates = [selected]
         else:
-            candidates = self.subtitle_service.discover(job_id)
+            candidates = self.subtitle_service.discover(
+                job_id,
+                lease_owner=getattr(progress, "lease_owner", None),
+                cancel_requested=partial(
+                    self._subtitle_cancel_requested, job_id, progress
+                ),
+            )
         if candidates:
             self._report(
                 job_id, progress, len(candidates), len(candidates), "candidates"
@@ -321,7 +325,13 @@ class GenerationPipelineServices:
     ) -> Mapping[str, Any]:
         candidate = self._selected_candidate(job_id)
         if candidate is None and self.subtitle_service is not None:
-            candidate = self.subtitle_service.select(job_id)
+            candidate = self.subtitle_service.select(
+                job_id,
+                lease_owner=getattr(progress, "lease_owner", None),
+                cancel_requested=partial(
+                    self._subtitle_cancel_requested, job_id, progress
+                ),
+            )
         if candidate is None:
             raise AttentionRequired(
                 "A validated subtitle candidate must be selected.",
@@ -453,6 +463,8 @@ class GenerationPipelineServices:
         if count < 1:
             raise ValueError("Graph frame count must be positive")
         staging = self.artifacts.new_staging_directory(job_id, "graph")
+        frame_directory = staging / "frames"
+        frame_directory.mkdir()
 
         def report(_message: str, current: int, total: int) -> None:
             self._report(job_id, progress, current, total, "frames")
@@ -460,23 +472,36 @@ class GenerationPipelineServices:
         try:
             paths = plotter.generate_frames(
                 analysis.get("binned", []),
-                staging,
+                frame_directory,
                 n_frames=count,
                 runtime_min=_runtime_minutes(self._metadata_value(job_id)),
                 progress_cb=report,
             )
             if len(paths) != count:
                 raise ValueError("Plotter did not produce the requested frame count")
-            return self.artifacts.promote_frame_directory(
-                job_id,
-                "graph",
-                staging,
-                final_name="frames",
+            frame_artifact = self.artifacts.verify_frame_directory(
+                frame_directory,
                 expected_count=count,
                 dimensions=(int(plotter.W), int(plotter.H)),
                 prefix="frame_",
+            )
+            shutil.copy2(paths[-1], staging / "preview.png")
+            return self.artifacts.promote_directory(
+                job_id,
+                "graph",
+                staging,
+                final_name="graph",
                 input_hashes=self._input_hashes("graph", job_id),
                 config_hash=self._config_hash("graph"),
+                details={
+                    "frame_count": frame_artifact["frame_count"],
+                    "width": frame_artifact["width"],
+                    "height": frame_artifact["height"],
+                    "prefix": frame_artifact["prefix"],
+                    "digits": frame_artifact["digits"],
+                    "frames_directory": "frames",
+                    "preview_file": "preview.png",
+                },
                 publish_allowed=partial(self._publication_allowed, job_id, progress),
             )
         finally:
@@ -487,7 +512,11 @@ class GenerationPipelineServices:
         lease_owner = getattr(progress, "lease_owner", None)
         graph_manifest = self._stage_manifest(job_id, "graph")
         graph_dir = self.artifacts.artifact_path(graph_manifest)
-        plotter_frames = sorted(graph_dir.glob("frame_*.png"))
+        graph_details = graph_manifest.get("details", {})
+        frames_directory = graph_details.get("frames_directory", "frames")
+        if frames_directory != "frames":
+            raise ValueError("Graph artifact has an invalid frame directory")
+        plotter_frames = sorted((graph_dir / frames_directory).glob("frame_*.png"))
         analysis = self._analysis_value(job_id)
         metadata = self._metadata_value(job_id)
         compositor = self.compositor_factory(self.config)
@@ -506,7 +535,10 @@ class GenerationPipelineServices:
                 child_name,
                 ordinal=parent["ordinal"] * 100 + index,
                 parent_name="composite",
+                lease_owner=lease_owner,
             )
+            if child is None:
+                raise asyncio.CancelledError
             children[name] = child
 
         def report(name: str, current: int, total: int) -> None:
@@ -658,6 +690,7 @@ class GenerationPipelineServices:
         composite = self._stage_manifest(job_id, "composite")
         timing = composite.get("details", {}).get("timing", {})
         metadata = self._metadata_value(job_id)
+        input_hashes = self._input_hashes("audio", job_id)
         staging = self.artifacts.new_staging_directory(job_id, "audio")
         try:
             pipeline = self.audio_pipeline_factory(
@@ -686,13 +719,15 @@ class GenerationPipelineServices:
             pipeline.mix(mixed, cancel_requested=cancel_requested)
             if cancel_requested():
                 raise asyncio.CancelledError("Audio generation was cancelled")
+            if self._input_hashes("audio", job_id) != input_hashes:
+                raise RuntimeError("A local audio source changed during generation")
             return self.artifacts.promote_file(
                 job_id,
                 "audio",
                 mixed,
                 final_name="mixed.m4a",
                 media_kind="audio",
-                input_hashes=self._input_hashes("audio", job_id),
+                input_hashes=input_hashes,
                 config_hash=self._config_hash("audio"),
                 details={"layer_count": len(pipeline.timeline.layers)},
                 publish_allowed=partial(self._publication_allowed, job_id, progress),
@@ -792,6 +827,7 @@ class GenerationPipelineServices:
             return {
                 "analysis": self._artifact_hash(job_id, "analysis"),
                 "composite": self._artifact_hash(job_id, "composite"),
+                **self._audio_file_provider_hashes(),
             }
         if stage_name == "encode":
             return {
@@ -799,6 +835,79 @@ class GenerationPipelineServices:
                 "composite": self._artifact_hash(job_id, "composite"),
             }
         raise KeyError(stage_name)
+
+    def _audio_file_provider_hashes(self) -> dict[str, str]:
+        audio = self.config.get("audio", {})
+        if not isinstance(audio, Mapping):
+            raise ValueError("Audio configuration must be a mapping")
+        sources: list[tuple[str, Mapping[str, Any]]] = []
+
+        def collect(
+            name: str,
+            *,
+            enabled_by_default: bool,
+            provider_by_default: str,
+        ) -> tuple[str, Mapping[str, Any]] | None:
+            section = audio.get(name, {})
+            if not isinstance(section, Mapping):
+                raise ValueError(f"Audio section {name} must be a mapping")
+            if not section.get("enabled", enabled_by_default):
+                return None
+            provider = section.get("provider", provider_by_default)
+            provider_config = section.get("provider_config", {})
+            if provider == "file":
+                if not isinstance(provider_config, Mapping):
+                    raise ValueError(
+                        f"FileProvider configuration for {name} is invalid"
+                    )
+                sources.append((name, provider_config))
+            return str(provider), provider_config
+
+        collect("intro_tts", enabled_by_default=True, provider_by_default="edge")
+        collect("outro_tts", enabled_by_default=True, provider_by_default="edge")
+        collect(
+            "background_music",
+            enabled_by_default=False,
+            provider_by_default="file",
+        )
+        verdict = collect(
+            "verdict_sfx",
+            enabled_by_default=False,
+            provider_by_default="file",
+        )
+        if verdict is not None:
+            verdict_provider, verdict_provider_config = verdict
+            verdict_section = audio.get("verdict_sfx", {})
+            rating = verdict_section.get("rating", {})
+            if not isinstance(rating, Mapping):
+                raise ValueError("Audio verdict rating configuration must be a mapping")
+            rating_provider = rating.get("provider", verdict_provider)
+            rating_provider_config = rating.get(
+                "provider_config", verdict_provider_config
+            )
+            if rating_provider == "file":
+                if not isinstance(rating_provider_config, Mapping):
+                    raise ValueError(
+                        "FileProvider configuration for verdict_sfx.rating is invalid"
+                    )
+                sources.append(("verdict_sfx.rating", rating_provider_config))
+
+        hashes: dict[str, str] = {}
+        for name, provider_config in sources:
+            configured_path = provider_config.get("path")
+            if not isinstance(configured_path, (str, os.PathLike)) or not str(
+                configured_path
+            ):
+                raise FileNotFoundError(
+                    f"FileProvider source for {name} is not configured"
+                )
+            path = Path(configured_path)
+            if not path.is_file():
+                raise FileNotFoundError(
+                    f"FileProvider source for {name} is unavailable"
+                )
+            hashes[f"file_provider:{name}"] = self.artifacts.hash_file(path)
+        return hashes
 
     def _config_hash(self, stage_name: str) -> str:
         config: Any
@@ -935,6 +1044,13 @@ class GenerationPipelineServices:
             )
         )
 
+    def _subtitle_cancel_requested(
+        self,
+        job_id: str,
+        progress: ProgressReporter,
+    ) -> bool:
+        return not self._publication_allowed(job_id, progress)
+
     def _job(self, job_id: str) -> dict[str, Any]:
         job = self.store.get_job(job_id)
         if job is None:
@@ -992,7 +1108,9 @@ class PipelineStore(Protocol):
 
     def get_job_detail(self, job_id: str) -> dict[str, Any] | None: ...
 
-    def ensure_stage(self, job_id: str, name: str, **fields: Any) -> dict[str, Any]: ...
+    def ensure_stage(
+        self, job_id: str, name: str, **fields: Any
+    ) -> dict[str, Any] | None: ...
 
     def transition_stage(
         self, job_id: str, stage_name: str, new_state: object, **fields: Any
@@ -1050,7 +1168,7 @@ class PipelineRunner:
         job = self.store.get_job(job_id)
         if job is None or job["state"] != JobState.RUNNING.value:
             return
-        self._ensure_stages(job_id)
+        self._ensure_stages(job_id, lease_owner)
 
         for stage_index, stage_name in enumerate(self.stages):
             if self._cancel_requested(job_id):
@@ -1218,16 +1336,19 @@ class PipelineRunner:
             if completed_job is None:
                 raise asyncio.CancelledError("The worker no longer owns the job lease")
 
-    def _ensure_stages(self, job_id: str) -> None:
+    def _ensure_stages(self, job_id: str, lease_owner: str) -> None:
         for ordinal, stage_name in enumerate(self.stages, 1):
             policy = self._policy(stage_name)
-            self.store.ensure_stage(
+            stage = self.store.ensure_stage(
                 job_id,
                 stage_name,
                 ordinal=ordinal,
                 state=StageState.PENDING,
                 max_auto_attempts=policy.max_attempts,
+                lease_owner=lease_owner,
             )
+            if stage is None:
+                raise asyncio.CancelledError("The worker no longer owns the job lease")
 
     async def _execute_stage(
         self, job_id: str, stage_name: str, lease_owner: str

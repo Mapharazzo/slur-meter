@@ -102,7 +102,7 @@ def test_encode_uses_argument_array_and_reports_real_ffmpeg_frames(tmp_path):
     assert output.read_bytes() == b"video"
 
 
-def test_failed_encode_preserves_last_validated_output_and_bounds_sanitized_stderr(
+def test_failed_encode_preserves_output_and_retains_only_bounded_structured_progress(
     tmp_path,
 ):
     output = tmp_path / "final.mp4"
@@ -114,7 +114,18 @@ def test_failed_encode_preserves_last_validated_output_and_bounds_sanitized_stde
     encoder = FFmpegEncoder(
         ffmpeg="ffmpeg",
         popen=lambda args, **_kwargs: FakeProcess(
-            args, stderr=stderr, returncode=1, output=b"failed-partial"
+            args,
+            stdout=(
+                "frame=2\n"
+                "fps=24.5\n"
+                "out_time_us=12345\n"
+                "progress=continue\n"
+                f"source_path={private}\n"
+                f"token={secret}\n"
+            ),
+            stderr=stderr,
+            returncode=1,
+            output=b"failed-partial",
         ),
         which=lambda _name: "/fake/ffmpeg",
         stderr_limit=64,
@@ -134,6 +145,19 @@ def test_failed_encode_preserves_last_validated_output_and_bounds_sanitized_stde
 
     assert output.read_bytes() == b"last-good"
     assert len(captured.value.stderr_tail) <= 64
+    diagnostics = json.loads(captured.value.stderr_tail)
+    assert diagnostics["frame"] == 2
+    assert set(diagnostics) <= {
+        "bitrate",
+        "drop_frames",
+        "dup_frames",
+        "fps",
+        "frame",
+        "out_time_us",
+        "progress",
+        "speed",
+        "total_size",
+    }
     assert str(tmp_path) not in captured.value.stderr_tail
     assert secret[-32:] not in captured.value.stderr_tail
     assert not list(tmp_path.glob("*.partial*.mp4"))

@@ -29,7 +29,9 @@ class RecordingDispatcher:
 
 
 @pytest.mark.anyio
-async def test_generation_submission_only_durably_enqueues_and_wakes(tmp_path, monkeypatch):
+async def test_generation_submission_only_durably_enqueues_and_wakes(
+    tmp_path, monkeypatch
+):
     from api import main
 
     store = OperationStore(tmp_path / "route.db")
@@ -108,7 +110,9 @@ async def test_startup_service_factory_failure_happens_before_dispatcher_start(
 
 
 @pytest.mark.anyio
-async def test_default_unavailable_services_fail_durably_without_external_calls(tmp_path):
+async def test_default_unavailable_services_fail_durably_without_external_calls(
+    tmp_path,
+):
     store = OperationStore(tmp_path / "unavailable.db")
     store.initialize()
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
@@ -136,6 +140,22 @@ async def test_versioned_video_frames_and_publish_routes_resolve_current_artifac
     job, _ = store.create_or_get_active_job("tt0110912", "", "Fixture Movie")
     artifacts = ArtifactManager(tmp_path / "output")
 
+    graph_bundle = artifacts.new_staging_directory(job["id"], "graph")
+    graph_frames = graph_bundle / "frames"
+    graph_frames.mkdir()
+    (graph_frames / "frame_00000.png").write_bytes(b"graph-frame")
+    (graph_bundle / "preview.png").write_bytes(b"durable-preview")
+    graph = artifacts.promote_directory(
+        job["id"],
+        "graph",
+        graph_bundle,
+        final_name="graph",
+        details={
+            "frames_directory": "frames",
+            "preview_file": "preview.png",
+            "frame_count": 1,
+        },
+    )
     render = artifacts.new_staging_directory(job["id"], "composite")
     segment = render / "intro_hold"
     segment.mkdir()
@@ -160,12 +180,11 @@ async def test_versioned_video_frames_and_publish_routes_resolve_current_artifac
         artifact_kind="file",
     )
 
-    for ordinal, (name, manifest) in enumerate(
-        (("composite", composite), ("encode", encoded)), 1
-    ):
+    staged_manifests = (("graph", graph), ("composite", composite), ("encode", encoded))
+    for ordinal, (name, _manifest) in enumerate(staged_manifests, 1):
         store.ensure_stage(job["id"], name, ordinal=ordinal)
-        if ordinal == 1:
-            store.claim_next_job("worker", lease_seconds=30)
+    store.claim_next_job("worker", lease_seconds=30)
+    for name, manifest in staged_manifests:
         store.transition_stage(job["id"], name, "queued", lease_owner="worker")
         store.transition_stage(job["id"], name, "running", lease_owner="worker")
         store.transition_stage(
@@ -193,6 +212,11 @@ async def test_versioned_video_frames_and_publish_routes_resolve_current_artifac
     assert frame_response.path == str(
         artifacts.artifact_path(composite) / "intro_hold" / "00000.png"
     )
+    opaque_preview = await main.serve_preview_frame(job["id"])
+    alias_preview = await main.serve_preview_frame("tt0110912")
+    assert opaque_preview.body == b"durable-preview"
+    assert alias_preview.body == b"durable-preview"
+    assert opaque_preview.headers["cache-control"] == "no-store"
 
     published = []
 

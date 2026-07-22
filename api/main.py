@@ -232,11 +232,20 @@ async def serve_frame(imdb_id: str, segment: str, frame_num: int):
 @app.get("/api/jobs/{imdb_id}/preview")
 async def serve_preview_frame(imdb_id: str):
     from fastapi.responses import Response
-    preview_path = BASE_DIR / "output" / imdb_id / "preview.png"
-    if preview_path.exists():
-        data = preview_path.read_bytes()
-        return Response(content=data, media_type="image/png",
-                        headers={"Cache-Control": "no-store"})
+
+    current = _current_artifact(imdb_id, "graph")
+    if current is not None:
+        _job, manifest, graph = current
+        preview_file = manifest.get("details", {}).get("preview_file")
+        if preview_file == "preview.png":
+            preview_path = graph / preview_file
+            if preview_path.is_file():
+                data = preview_path.read_bytes()
+                return Response(
+                    content=data,
+                    media_type="image/png",
+                    headers={"Cache-Control": "no-store"},
+                )
     raise HTTPException(status_code=404, detail="Preview not ready")
 
 @app.get("/api/costs")

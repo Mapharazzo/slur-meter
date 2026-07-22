@@ -279,3 +279,107 @@ Modified `api/artifacts.py`, `api/database.py`, `api/dispatcher.py`, `api/domain
 `src/audio/providers.py`, `src/data/movie_metadata.py`, `src/video/encoder.py`, and their
 focused unit/integration tests. Added the implementation plan at
 `docs/superpowers/plans/2026-07-22-task-5-recovery-fixes.md`.
+
+---
+
+## Final lease and provenance review follow-up (2026-07-22)
+
+This section supersedes the recovery review verdict for the four gaps found by the final
+Task 5 audit. The patch remains schema-neutral and its tests use only injected local fakes;
+no subtitle, metadata, paid-audio, publishing, TMDB, or OMDb provider was called. The local
+user change in `scripts/get_youtube_token.py` remains outside the patch.
+
+### Root causes and RED/GREEN evidence
+
+- **Real subtitle execution dropped the runner's lease capability.** Discovery and selection
+  called `SubtitleService` without the exact owner or cancellation callback, while candidate,
+  decision, and stage-creation store mutations had no lease fence. The RED set failed all
+  three intended scenarios: stale store mutations were accepted, a rejected first candidate
+  never advanced to the valid second candidate, and a reclaimed owner could still be mutated.
+  GREEN threads one immutable execution context through discovery, evaluation, resume, cache,
+  exhaustion, and completion; every attempt/candidate/event/decision/job/stage mutation
+  supplies the owner and treats rejection as cancellation. The focused command finished
+  `3 passed in 1.98s`.
+- **Preview publication bypassed the version pointer.** `RagePlotter` wrote a sibling preview
+  into `.staging`, while the route guessed `BASE_DIR/output/{imdb}/preview.png`. The three RED
+  cases observed that side-channel file, a 404 for a valid opaque job, and an incomplete graph
+  contract. GREEN renders only frames, verifies them, places `frames/` and `preview.png` in one
+  graph staging bundle, and atomically selects that immutable directory. The route resolves
+  the current graph manifest for either opaque job ID or IMDb alias. The focused command
+  finished `3 passed in 7.34s`.
+- **Audio provenance bound the configured path but not its bytes.** The RED reuse regression
+  raised a missing provenance-key failure, demonstrating that replacing a source at the same
+  path could leave audio reusable. GREEN projects the same enabled/default/override rules as
+  `AudioPipeline` and hashes every effective FileProvider source: intro, outro, background,
+  verdict default, and verdict rating. Missing/non-file inputs fail closed; generation hashes
+  before provider work and rechecks before publication. Same-path mutation and deletion now
+  invalidate the manifest; the focused regression passed.
+- **Encoder failure diagnostics discarded all useful facts.** RED proved the compatibility
+  `stderr_tail` was empty despite valid progress facts. GREEN retains only fixed-key values
+  accepted by strict numeric/enumerated grammars from `-progress pipe:1`, serializes the latest
+  values as JSON within `stderr_limit`, and continues to drain/discard raw stderr and unknown
+  stdout keys. The structured-diagnostic, long-secret, and progress tests finished `3 passed`.
+
+### Final invariants
+
+- A real subtitle worker can mutate durable execution state only while its exact live lease
+  owner remains valid. Cancellation is checked around provider, filesystem, normalization,
+  quality, and cache boundaries; a replacement owner cannot be changed by stale work.
+- The graph preview becomes readable only with the same atomic current-pointer swap as its
+  verified frame sequence. Routes never inspect staging or construct a legacy output path.
+- Audio reuse binds every byte copied by an effective FileProvider, not merely its pathname or
+  surrounding config. A source change during generation aborts publication.
+- Encoder diagnostics have a fixed key space, fixed value grammars, and a hard serialized
+  bound. Raw provider paths, command text, stderr, and arbitrary progress fields are never
+  retained.
+
+### Verification
+
+Fresh affected suite:
+
+```text
+.venv/bin/python -m pytest tests/unit/test_operation_store.py \
+  tests/unit/test_subtitle_service.py tests/unit/test_encoder.py \
+  tests/unit/test_plotter.py tests/unit/test_artifacts.py \
+  tests/integration/test_pipeline_runner.py \
+  tests/integration/test_generation_scenarios.py \
+  tests/integration/test_job_submission.py -q
+
+109 passed, 7 warnings
+```
+
+Fresh full repository suite:
+
+```text
+.venv/bin/python -m pytest -q
+
+236 passed, 1 failed, 26 warnings
+```
+
+The sole failure remains the disclosed, unchanged
+`tests/integration/test_pipeline.py::TestAnalysisEngineIntegration::test_django_srt_pipeline`
+baseline: the analysis engine reports 200 f-bombs while the test expects 100. Ruff reported
+`All checks passed!`, and `git diff --check` exited 0.
+
+### Independent final re-review and acknowledged Minors
+
+The independent final re-review returned **Ready** with no Critical or Important findings.
+It confirmed all four requested contracts, the focused/full verification results, the absence
+of schema/Task 6 expansion, and exclusion of the protected token helper.
+
+- The reviewer noted one non-blocking Minor: graph publication copies `paths[-1]` after exact
+  directory validation. The production plotter returns ordered paths, so current behavior and
+  atomicity are correct; selecting the deterministic final filename directly would make that
+  assumption explicit in a later cleanup.
+- Broad graph/composite hashing of the complete `video` mapping can over-invalidate an
+  otherwise reusable stage. This remains safe and is deferred as a stage-minimality cleanup.
+- `ArtifactManager`'s secondary media probe can take up to its bounded timeout to observe
+  cancellation. The locked live-lease guard still prevents stale publication, so this remains
+  shutdown latency rather than an artifact-correctness gap.
+
+### Final-fix files
+
+Modified `api/database.py`, `api/main.py`, `api/pipeline.py`, `api/subtitles.py`,
+`src/video/encoder.py`, `src/video/plotter.py`, and their focused unit/integration tests.
+Added the implementation plan at
+`docs/superpowers/plans/2026-07-22-task-5-final-review-fixes.md`.

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -34,6 +37,22 @@ _SAFE_PARSE_ERROR = "Subtitle candidate could not be parsed."
 _SAFE_ARCHIVE_ERROR = "Subtitle archive could not be safely read."
 
 
+@dataclass(frozen=True)
+class _ExecutionContext:
+    lease_owner: str | None
+    cancel_requested: Callable[[], bool] | None
+
+    def check(self) -> None:
+        if self.cancel_requested is not None and self.cancel_requested():
+            raise asyncio.CancelledError("Subtitle work no longer owns the job lease")
+
+    @staticmethod
+    def require(value: Any) -> Any:
+        if value is None:
+            raise asyncio.CancelledError("Subtitle work no longer owns the job lease")
+        return value
+
+
 class SubtitleService:
     """Coordinates provider work while preserving candidate history in the store."""
 
@@ -50,78 +69,131 @@ class SubtitleService:
         self.settings = settings
         self._root = settings.results_dir / "subtitle-candidates"
 
-    def discover(self, job_id: str) -> list[dict[str, Any]]:
+    def discover(
+        self,
+        job_id: str,
+        *,
+        lease_owner: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]]:
         """Persist ranked provider metadata; no provider filename becomes a path."""
+        context = _ExecutionContext(lease_owner, cancel_requested)
+        context.check()
         job = self._job(job_id)
-        cycle = max((item["discovery_cycle"] for item in self.store.list_candidates(job_id)), default=0) + 1
+        cycle = (
+            max(
+                (
+                    item["discovery_cycle"]
+                    for item in self.store.list_candidates(job_id)
+                ),
+                default=0,
+            )
+            + 1
+        )
         results = self.client.search(
             query=job["query"] or None,
             imdb_id=job["source_imdb_id"] or None,
             language="en",
             limit=20,
         )
+        context.check()
         request = SubtitleRequest(
             imdb_id=job["source_imdb_id"], language="en", title=job["label"], year=None
         )
         created: list[dict[str, Any]] = []
         for rank, ranked in enumerate(rank_candidates(results, request), start=1):
             candidate = ranked.candidate
-            row, _ = self.store.record_candidate(
-                job_id,
-                "opensubtitles",
-                candidate.file_id,
-                provider_filename=candidate.file_name,
-                source_type="provider",
-                language=candidate.language,
-                fps=candidate.fps,
-                title=candidate.movie_title,
-                year=_year(candidate.movie_year),
-                imdb_match=bool(
-                    job["source_imdb_id"]
-                    and candidate.imdb_id
-                    and candidate.imdb_id.casefold() == job["source_imdb_id"].casefold()
-                ),
-                provider_rating=candidate.provider_rating,
-                provider_download_count=candidate.download_count,
-                discovery_cycle=cycle,
-                rank=rank,
-                rank_reasons=list(ranked.reasons),
-                expected_runtime_seconds=candidate.runtime_seconds,
-                status="discovered",
+            context.check()
+            row, _ = context.require(
+                self.store.record_candidate(
+                    job_id,
+                    "opensubtitles",
+                    candidate.file_id,
+                    lease_owner=context.lease_owner,
+                    provider_filename=candidate.file_name,
+                    source_type="provider",
+                    language=candidate.language,
+                    fps=candidate.fps,
+                    title=candidate.movie_title,
+                    year=_year(candidate.movie_year),
+                    imdb_match=bool(
+                        job["source_imdb_id"]
+                        and candidate.imdb_id
+                        and candidate.imdb_id.casefold()
+                        == job["source_imdb_id"].casefold()
+                    ),
+                    provider_rating=candidate.provider_rating,
+                    provider_download_count=candidate.download_count,
+                    discovery_cycle=cycle,
+                    rank=rank,
+                    rank_reasons=list(ranked.reasons),
+                    expected_runtime_seconds=candidate.runtime_seconds,
+                    status="discovered",
+                )
             )
             created.append(row)
-        self.store.record_event(
-            job_id,
-            event_type="subtitle_discovered",
-            message=f"Discovered {len(created)} subtitle candidates.",
-            data={"discovery_cycle": cycle, "candidate_count": len(created)},
+        context.check()
+        context.require(
+            self.store.record_event(
+                job_id,
+                event_type="subtitle_discovered",
+                message=f"Discovered {len(created)} subtitle candidates.",
+                data={"discovery_cycle": cycle, "candidate_count": len(created)},
+                lease_owner=context.lease_owner,
+            )
         )
         return created
 
     def select(
-        self, job_id: str, manual_candidate_id: str | None = None
+        self,
+        job_id: str,
+        manual_candidate_id: str | None = None,
+        *,
+        lease_owner: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Select one validated candidate, or leave a durable attention state."""
+        context = _ExecutionContext(lease_owner, cancel_requested)
+        context.check()
         selected = next(
-            (row for row in self.store.list_candidates(job_id) if row["status"] == "selected"),
+            (
+                row
+                for row in self.store.list_candidates(job_id)
+                if row["status"] == "selected"
+            ),
             None,
         )
-        if selected is not None and self._selected_contract_valid(job_id, selected):
+        if selected is not None and self._selected_contract_valid(
+            job_id, selected, context
+        ):
             return selected
         if selected is not None:
-            self.store.update_candidate(selected["id"], status="validated")
-        self._start_selection(job_id)
+            context.check()
+            context.require(
+                self.store.update_candidate(
+                    selected["id"],
+                    lease_owner=context.lease_owner,
+                    status="validated",
+                )
+            )
+        self._start_selection(job_id, context)
         validated = next(
-            (row for row in self.store.list_candidates(job_id) if row["status"] == "validated"),
+            (
+                row
+                for row in self.store.list_candidates(job_id)
+                if row["status"] == "validated"
+            ),
             None,
         )
         if validated is not None:
-            return self._resume_validated(job_id, validated)
+            return self._resume_validated(job_id, validated, context)
         if manual_candidate_id is not None:
-            candidate = self.store.get_candidate(manual_candidate_id, include_internal=True)
+            candidate = self.store.get_candidate(
+                manual_candidate_id, include_internal=True
+            )
             if candidate is None or candidate["job_id"] != job_id:
                 raise ValueError("Subtitle candidate does not belong to this run")
-            return self._evaluate(job_id, candidate, manual=True)
+            return self._evaluate(job_id, candidate, manual=True, context=context)
 
         limit = min(3, self.settings.subtitle_candidates_per_cycle)
         candidates = [
@@ -130,69 +202,116 @@ class SubtitleService:
             if row["status"] == "discovered"
         ][:limit]
         for candidate in candidates:
-            selected = self._evaluate(job_id, candidate, manual=False)
+            context.check()
+            selected = self._evaluate(job_id, candidate, manual=False, context=context)
             if selected["status"] == "selected":
                 return selected
-        self._exhaust(job_id, attempted=len(candidates), limit=limit)
+        self._exhaust(job_id, attempted=len(candidates), limit=limit, context=context)
         raise AttentionRequired(
             _exhaustion_message(len(candidates)),
             code="subtitle_candidates_exhausted",
             actions=_EXHAUSTION_ACTIONS,
         )
 
-    def upload(self, job_id: str, filename: str, content: bytes) -> dict[str, Any]:
+    def upload(
+        self,
+        job_id: str,
+        filename: str,
+        content: bytes,
+        *,
+        lease_owner: str | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         """Store uploads below a generated candidate directory, never their filename."""
-        if not isinstance(content, bytes) or len(content) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES:
+        context = _ExecutionContext(lease_owner, cancel_requested)
+        context.check()
+        if (
+            not isinstance(content, bytes)
+            or len(content) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES
+        ):
             raise ValueError("Uploaded subtitle exceeds the size limit")
         digest = sha256(content).hexdigest()
-        row, _ = self.store.record_candidate(
-            job_id,
-            "upload",
-            digest,
-            provider_filename=Path(filename).name,
-            source_type="upload",
-            discovery_cycle=max((item["discovery_cycle"] for item in self.store.list_candidates(job_id)), default=0) + 1,
-            rank=0,
-            rank_reasons=["operator_upload"],
-            status="uploaded",
-            content_hash=digest,
+        row, _ = context.require(
+            self.store.record_candidate(
+                job_id,
+                "upload",
+                digest,
+                lease_owner=context.lease_owner,
+                provider_filename=Path(filename).name,
+                source_type="upload",
+                discovery_cycle=max(
+                    (
+                        item["discovery_cycle"]
+                        for item in self.store.list_candidates(job_id)
+                    ),
+                    default=0,
+                )
+                + 1,
+                rank=0,
+                rank_reasons=["operator_upload"],
+                status="uploaded",
+                content_hash=digest,
+            )
         )
         destination = confined_path(self._root, job_id, row["id"], "subtitle.srt")
         destination.parent.mkdir(parents=True, exist_ok=True)
+        context.check()
         destination.write_bytes(content)
+        context.check()
         try:
             inspection = inspect_subtitle(destination)
         except SubtitleParseError:
-            return self.store.update_candidate(
-                row["id"],
-                status="rejected",
-                parse_error=_SAFE_PARSE_ERROR,
-                rejection_reasons=["invalid_srt"],
-            ) or row
+            return context.require(
+                self.store.update_candidate(
+                    row["id"],
+                    lease_owner=context.lease_owner,
+                    status="rejected",
+                    parse_error=_SAFE_PARSE_ERROR,
+                    rejection_reasons=["invalid_srt"],
+                )
+            )
+        context.check()
         _write_normalized(destination, inspection.normalized_utf8)
-        return self.store.update_candidate(
-            row["id"],
-            detected_encoding=inspection.detected_encoding,
-            cue_count=inspection.cue_count,
-            first_cue_seconds=inspection.first_cue_seconds,
-            final_cue_seconds=inspection.final_cue_seconds,
-            parsed_duration_seconds=inspection.parsed_duration_seconds,
-            content_hash=_hash(destination),
-            artifact_path=str(destination),
-        ) or row
+        context.check()
+        return context.require(
+            self.store.update_candidate(
+                row["id"],
+                lease_owner=context.lease_owner,
+                detected_encoding=inspection.detected_encoding,
+                cue_count=inspection.cue_count,
+                first_cue_seconds=inspection.first_cue_seconds,
+                final_cue_seconds=inspection.final_cue_seconds,
+                parsed_duration_seconds=inspection.parsed_duration_seconds,
+                content_hash=_hash(destination),
+                artifact_path=str(destination),
+            )
+        )
 
     def _evaluate(
-        self, job_id: str, candidate: dict[str, Any], *, manual: bool) -> dict[str, Any]:
-        attempt = self.store.start_attempt(
-            job_id,
-            "subtitle_selection",
-            max_attempts=3,
-            candidate_id=candidate["id"],
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        *,
+        manual: bool,
+        context: _ExecutionContext,
+    ) -> dict[str, Any]:
+        context.check()
+        attempt = context.require(
+            self.store.start_attempt(
+                job_id,
+                "subtitle_selection",
+                max_attempts=3,
+                candidate_id=candidate["id"],
+                lease_owner=context.lease_owner,
+            )
         )
         try:
-            path = self._candidate_path(job_id, candidate)
+            path = self._candidate_path(job_id, candidate, context)
+            context.check()
             inspection = inspect_subtitle(path)
+            context.check()
             _write_normalized(path, inspection.normalized_utf8)
+            context.check()
             quality = evaluate_quality(
                 inspection,
                 candidate["expected_runtime_seconds"],
@@ -203,59 +322,101 @@ class SubtitleService:
             if manual and not accepted:
                 accepted = True
                 reasons.append("manual_threshold_override")
+            candidate_fields = {
+                "detected_encoding": inspection.detected_encoding,
+                "cue_count": inspection.cue_count,
+                "first_cue_seconds": inspection.first_cue_seconds,
+                "final_cue_seconds": inspection.final_cue_seconds,
+                "parsed_duration_seconds": inspection.parsed_duration_seconds,
+                "coverage_percent": quality.coverage_percent,
+                "quality_reasons": reasons,
+                "content_hash": _hash(path),
+                "artifact_path": str(path),
+            }
+            context.check()
             if accepted:
-                validated = self.store.update_candidate(
-                    candidate["id"],
-                    detected_encoding=inspection.detected_encoding,
-                    cue_count=inspection.cue_count,
-                    first_cue_seconds=inspection.first_cue_seconds,
-                    final_cue_seconds=inspection.final_cue_seconds,
-                    parsed_duration_seconds=inspection.parsed_duration_seconds,
-                    coverage_percent=quality.coverage_percent,
-                    quality_reasons=reasons,
-                    rejection_reasons=[],
-                    status="validated",
-                    content_hash=_hash(path),
-                    artifact_path=str(path),
-                    selection_method="manual" if manual else "automatic",
+                validated = context.require(
+                    self.store.update_candidate(
+                        candidate["id"],
+                        lease_owner=context.lease_owner,
+                        rejection_reasons=[],
+                        status="validated",
+                        selection_method="manual" if manual else "automatic",
+                        **candidate_fields,
+                    )
                 )
-                return self._complete_validated(job_id, validated, path, attempt)
-            updated = self.store.update_candidate(
-                candidate["id"],
-                detected_encoding=inspection.detected_encoding,
-                cue_count=inspection.cue_count,
-                first_cue_seconds=inspection.first_cue_seconds,
-                final_cue_seconds=inspection.final_cue_seconds,
-                parsed_duration_seconds=inspection.parsed_duration_seconds,
-                coverage_percent=quality.coverage_percent,
-                quality_reasons=reasons,
-                rejection_reasons=reasons,
-                status="rejected",
-                content_hash=_hash(path),
-                artifact_path=str(path),
+                return self._complete_validated(
+                    job_id, validated, path, attempt, context
+                )
+            updated = context.require(
+                self.store.update_candidate(
+                    candidate["id"],
+                    lease_owner=context.lease_owner,
+                    rejection_reasons=reasons,
+                    status="rejected",
+                    **candidate_fields,
+                )
             )
-            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reasons": reasons})
+            context.check()
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "rejected",
+                    diagnostics={"reasons": reasons},
+                    lease_owner=context.lease_owner,
+                )
+            )
             return updated
         except UnsafeArchiveError:
-            updated = self.store.update_candidate(
-                candidate["id"],
-                status="rejected",
-                download_error=_SAFE_ARCHIVE_ERROR,
-                rejection_reasons=["unsafe_download"],
+            context.check()
+            updated = context.require(
+                self.store.update_candidate(
+                    candidate["id"],
+                    lease_owner=context.lease_owner,
+                    status="rejected",
+                    download_error=_SAFE_ARCHIVE_ERROR,
+                    rejection_reasons=["unsafe_download"],
+                )
             )
-            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "unsafe_download"})
-            return updated or candidate
+            context.check()
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "rejected",
+                    diagnostics={"reason": "unsafe_download"},
+                    lease_owner=context.lease_owner,
+                )
+            )
+            return updated
         except (OSError, ValueError, SubtitleParseError):
-            updated = self.store.update_candidate(
-                candidate["id"],
-                status="rejected",
-                parse_error=_SAFE_PARSE_ERROR,
-                rejection_reasons=["invalid_srt"],
+            context.check()
+            updated = context.require(
+                self.store.update_candidate(
+                    candidate["id"],
+                    lease_owner=context.lease_owner,
+                    status="rejected",
+                    parse_error=_SAFE_PARSE_ERROR,
+                    rejection_reasons=["invalid_srt"],
+                )
             )
-            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "invalid_srt"})
-            return updated or candidate
+            context.check()
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "rejected",
+                    diagnostics={"reason": "invalid_srt"},
+                    lease_owner=context.lease_owner,
+                )
+            )
+            return updated
 
-    def _candidate_path(self, job_id: str, candidate: dict[str, Any]) -> Path:
+    def _candidate_path(
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        context: _ExecutionContext,
+    ) -> Path:
+        context.check()
         if candidate["source_type"] in {"upload", "cache"}:
             stored = self.store.get_candidate(candidate["id"], include_internal=True)
             if stored and stored.get("artifact_path"):
@@ -263,27 +424,43 @@ class SubtitleService:
             raise SubtitleParseError("Candidate file is unavailable")
         destination = confined_path(self._root, job_id, candidate["id"], "subtitle.srt")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        downloaded = self.client.download(candidate["provider_id"], destination).resolve()
+        downloaded = self.client.download(
+            candidate["provider_id"], destination
+        ).resolve()
+        context.check()
         try:
             downloaded.relative_to(destination.parent.resolve())
         except ValueError as exc:
-            raise UnsafeArchiveError("Provider download escaped its generated destination") from exc
+            raise UnsafeArchiveError(
+                "Provider download escaped its generated destination"
+            ) from exc
         return downloaded
 
-    def _resume_validated(self, job_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+    def _resume_validated(
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        context: _ExecutionContext,
+    ) -> dict[str, Any]:
+        context.check()
         stored = self.store.get_candidate(candidate["id"], include_internal=True)
         if stored is None or not stored.get("artifact_path"):
-            return self._reject_resumed_artifact(job_id, candidate)
+            return self._reject_resumed_artifact(job_id, candidate, context)
         path = Path(stored["artifact_path"])
         try:
+            context.check()
             inspection = inspect_subtitle(path)
+            context.check()
             _write_normalized(path, inspection.normalized_utf8)
+            context.check()
         except (OSError, ValueError, SubtitleParseError):
-            return self._reject_resumed_artifact(job_id, candidate)
+            return self._reject_resumed_artifact(job_id, candidate, context)
         attempt = self._active_candidate_attempt(job_id, candidate["id"])
         if _hash(path) == candidate["content_hash"]:
-            return self._complete_validated(job_id, candidate, path, attempt)
-        return self._reapply_quality(job_id, candidate, path, inspection, attempt)
+            return self._complete_validated(job_id, candidate, path, attempt, context)
+        return self._reapply_quality(
+            job_id, candidate, path, inspection, attempt, context
+        )
 
     def _reapply_quality(
         self,
@@ -292,7 +469,9 @@ class SubtitleService:
         path: Path,
         inspection,
         attempt: dict[str, Any] | None,
+        context: _ExecutionContext,
     ) -> dict[str, Any]:
+        context.check()
         quality = evaluate_quality(
             inspection,
             candidate["expected_runtime_seconds"],
@@ -315,71 +494,131 @@ class SubtitleService:
             "artifact_path": str(path),
         }
         if accepted:
-            updated = self.store.update_candidate(
-                candidate["id"], status="validated", rejection_reasons=[], **fields
-            ) or candidate
-            return self._complete_validated(job_id, updated, path, attempt)
-        updated = self.store.update_candidate(
-            candidate["id"], status="rejected", rejection_reasons=reasons, **fields
-        ) or candidate
+            updated = context.require(
+                self.store.update_candidate(
+                    candidate["id"],
+                    lease_owner=context.lease_owner,
+                    status="validated",
+                    rejection_reasons=[],
+                    **fields,
+                )
+            )
+            return self._complete_validated(job_id, updated, path, attempt, context)
+        updated = context.require(
+            self.store.update_candidate(
+                candidate["id"],
+                lease_owner=context.lease_owner,
+                status="rejected",
+                rejection_reasons=reasons,
+                **fields,
+            )
+        )
         if attempt is not None:
-            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reasons": reasons})
-        return self._raise_resume_attention(job_id, updated)
+            context.check()
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "rejected",
+                    diagnostics={"reasons": reasons},
+                    lease_owner=context.lease_owner,
+                )
+            )
+        return self._raise_resume_attention(job_id, updated, context)
 
     def _reject_resumed_artifact(
-        self, job_id: str, candidate: dict[str, Any]
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        context: _ExecutionContext,
     ) -> dict[str, Any]:
-        updated = self.store.update_candidate(
-            candidate["id"],
-            status="rejected",
-            parse_error=_SAFE_PARSE_ERROR,
-            rejection_reasons=["invalid_srt"],
-        ) or candidate
+        context.check()
+        updated = context.require(
+            self.store.update_candidate(
+                candidate["id"],
+                lease_owner=context.lease_owner,
+                status="rejected",
+                parse_error=_SAFE_PARSE_ERROR,
+                rejection_reasons=["invalid_srt"],
+            )
+        )
         attempt = self._active_candidate_attempt(job_id, candidate["id"])
         if attempt is not None:
-            self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "invalid_srt"})
-        return self._raise_resume_attention(job_id, updated)
+            context.check()
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "rejected",
+                    diagnostics={"reason": "invalid_srt"},
+                    lease_owner=context.lease_owner,
+                )
+            )
+        return self._raise_resume_attention(job_id, updated, context)
 
     def _raise_resume_attention(
-        self, job_id: str, candidate: dict[str, Any]
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        context: _ExecutionContext,
     ) -> dict[str, Any]:
+        context.check()
         stage = self._selection_stage(job_id)
         if StageState(stage["state"]) is StageState.COMPLETED:
             job = self._job(job_id)
             if JobState(job["state"]) is JobState.COMPLETED:
-                self.store.transition_job(
-                    job_id, JobState.QUEUED, expected_state=JobState.COMPLETED
+                context.require(
+                    self.store.transition_job(
+                        job_id,
+                        JobState.QUEUED,
+                        expected_state=JobState.COMPLETED,
+                        lease_owner=context.lease_owner,
+                    )
                 )
-                self.store.transition_job(
-                    job_id, JobState.RUNNING, expected_state=JobState.QUEUED
+                context.require(
+                    self.store.transition_job(
+                        job_id,
+                        JobState.RUNNING,
+                        expected_state=JobState.QUEUED,
+                        lease_owner=context.lease_owner,
+                    )
                 )
-            self.store.transition_stage(
-                job_id,
-                "subtitle_selection",
-                StageState.QUEUED,
-                trigger=AttemptTrigger.ARTIFACT_INVALIDATION,
-                expected_state=StageState.COMPLETED,
+            context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.QUEUED,
+                    trigger=AttemptTrigger.ARTIFACT_INVALIDATION,
+                    expected_state=StageState.COMPLETED,
+                    lease_owner=context.lease_owner,
+                )
             )
-            self.store.transition_stage(
-                job_id,
-                "subtitle_selection",
-                StageState.RUNNING,
-                expected_state=StageState.QUEUED,
+            context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.RUNNING,
+                    expected_state=StageState.QUEUED,
+                    lease_owner=context.lease_owner,
+                )
             )
             stage = self._selection_stage(job_id)
+        context.check()
+        context.require(
+            self.store.record_event(
+                job_id,
+                event_type="subtitle_candidate_rejected",
+                message="A validated subtitle candidate could not be resumed.",
+                severity="warning",
+                data={"candidate_id": candidate["id"]},
+                lease_owner=context.lease_owner,
+            )
+        )
         if StageState(stage["state"]) is StageState.RUNNING:
             self._exhaust(
                 job_id,
                 attempted=1,
                 limit=min(3, self.settings.subtitle_candidates_per_cycle),
+                context=context,
             )
-        self.store.record_event(
-            job_id,
-            event_type="subtitle_candidate_rejected",
-            message="A validated subtitle candidate could not be resumed.",
-            severity="warning",
-            data={"candidate_id": candidate["id"]},
-        )
         raise AttentionRequired(
             "A subtitle candidate needs operator attention.",
             code="subtitle_candidate_invalid",
@@ -392,63 +631,104 @@ class SubtitleService:
         candidate: dict[str, Any],
         path: Path,
         attempt: dict[str, Any] | None,
+        context: _ExecutionContext,
     ) -> dict[str, Any]:
         """Complete durable promotion before marking a candidate selected."""
+        context.check()
         attempt = attempt or self._active_candidate_attempt(job_id, candidate["id"])
         job = self._job(job_id)
         if job["source_imdb_id"]:
             self.cache.store(job["source_imdb_id"], path, replace=True)
+            context.check()
         if not any(
-            event["type"] == "subtitle_selected" and event["data"].get("candidate_id") == candidate["id"]
+            event["type"] == "subtitle_selected"
+            and event["data"].get("candidate_id") == candidate["id"]
             for event in self.store.list_events(job_id)
         ):
-            self.store.record_event(
-                job_id,
-                event_type="subtitle_selected",
-                message="A subtitle candidate was selected.",
-                data={"candidate_id": candidate["id"], "selection_method": candidate["selection_method"]},
+            context.require(
+                self.store.record_event(
+                    job_id,
+                    event_type="subtitle_selected",
+                    message="A subtitle candidate was selected.",
+                    data={
+                        "candidate_id": candidate["id"],
+                        "selection_method": candidate["selection_method"],
+                    },
+                    lease_owner=context.lease_owner,
+                )
             )
         if candidate["selection_method"] == "manual":
-            self.store.record_decision(
-                job_id,
-                "select_subtitle",
-                candidate_id=candidate["id"],
-                accepted=True,
-                reason="Manual subtitle selection accepted a parsed threshold override.",
-                idempotency_key=f"subtitle-selected:{candidate['id']}",
+            context.require(
+                self.store.record_decision(
+                    job_id,
+                    "select_subtitle",
+                    candidate_id=candidate["id"],
+                    accepted=True,
+                    reason=(
+                        "Manual subtitle selection accepted a parsed threshold override."
+                    ),
+                    idempotency_key=f"subtitle-selected:{candidate['id']}",
+                    lease_owner=context.lease_owner,
+                )
             )
         stage = self._selection_stage(job_id)
         if StageState(stage["state"]) is StageState.RUNNING:
-            self.store.transition_stage(
-                job_id, "subtitle_selection", StageState.COMPLETED, expected_state=StageState.RUNNING
+            context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.COMPLETED,
+                    expected_state=StageState.RUNNING,
+                    lease_owner=context.lease_owner,
+                )
             )
         elif StageState(stage["state"]) is not StageState.COMPLETED:
             raise RuntimeError("Subtitle selection stage cannot be completed")
         if attempt is not None:
-            self.store.finish_attempt(
-                attempt["id"], "completed", output={"candidate_id": candidate["id"]}
+            context.require(
+                self.store.finish_attempt(
+                    attempt["id"],
+                    "completed",
+                    output={"candidate_id": candidate["id"]},
+                    lease_owner=context.lease_owner,
+                )
             )
-        return self.store.update_candidate(
-            candidate["id"], status="selected", selected_at=datetime.now(UTC).isoformat()
-        ) or candidate
+        return context.require(
+            self.store.update_candidate(
+                candidate["id"],
+                lease_owner=context.lease_owner,
+                status="selected",
+                selected_at=datetime.now(UTC).isoformat(),
+            )
+        )
 
-    def _selected_contract_valid(self, job_id: str, candidate: dict[str, Any]) -> bool:
+    def _selected_contract_valid(
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        context: _ExecutionContext,
+    ) -> bool:
+        context.check()
         stored = self.store.get_candidate(candidate["id"], include_internal=True)
         if stored is None or not stored.get("artifact_path"):
             return False
         path = Path(stored["artifact_path"])
         job = self._job(job_id)
-        cache_path = self.cache.has(job["source_imdb_id"]) if job["source_imdb_id"] else None
+        cache_path = (
+            self.cache.has(job["source_imdb_id"]) if job["source_imdb_id"] else None
+        )
         artifact_valid = (
             path.exists()
             and candidate["content_hash"] == _hash(path)
-            and StageState(self._selection_stage(job_id)["state"]) is StageState.COMPLETED
+            and StageState(self._selection_stage(job_id)["state"])
+            is StageState.COMPLETED
         )
         cache_valid = (
             cache_path is not None and cache_path.read_bytes() == path.read_bytes()
             if job["source_imdb_id"]
             else True
         )
+        context.check()
         return artifact_valid and cache_valid
 
     def _active_candidate_attempt(
@@ -458,7 +738,8 @@ class SubtitleService:
             (
                 attempt
                 for attempt in reversed(self.store.get_job_detail(job_id)["attempts"])
-                if attempt["candidate_id"] == candidate_id and attempt["finished_at"] is None
+                if attempt["candidate_id"] == candidate_id
+                and attempt["finished_at"] is None
             ),
             None,
         )
@@ -470,51 +751,106 @@ class SubtitleService:
             if stage["name"] == "subtitle_selection"
         )
 
-    def _start_selection(self, job_id: str) -> None:
+    def _start_selection(self, job_id: str, context: _ExecutionContext) -> None:
+        context.check()
         job = self._job(job_id)
         state = JobState(job["state"])
         if state in {JobState.NEEDS_ATTENTION, JobState.FAILED, JobState.CANCELLED}:
-            self.store.transition_job(job_id, JobState.QUEUED, trigger=AttemptTrigger.RESUME)
+            context.require(
+                self.store.transition_job(
+                    job_id,
+                    JobState.QUEUED,
+                    trigger=AttemptTrigger.RESUME,
+                    lease_owner=context.lease_owner,
+                )
+            )
             state = JobState.QUEUED
         if state is JobState.QUEUED:
-            self.store.transition_job(job_id, JobState.RUNNING, expected_state=JobState.QUEUED)
-        stage = self.store.ensure_stage(
-            job_id, "subtitle_selection", ordinal=4, state=StageState.PENDING, max_auto_attempts=3
+            context.require(
+                self.store.transition_job(
+                    job_id,
+                    JobState.RUNNING,
+                    expected_state=JobState.QUEUED,
+                    lease_owner=context.lease_owner,
+                )
+            )
+        stage = context.require(
+            self.store.ensure_stage(
+                job_id,
+                "subtitle_selection",
+                ordinal=4,
+                state=StageState.PENDING,
+                max_auto_attempts=3,
+                lease_owner=context.lease_owner,
+            )
         )
         stage_state = StageState(stage["state"])
         if stage_state in {StageState.NEEDS_ATTENTION, StageState.FAILED}:
-            stage = self.store.transition_stage(
-                job_id, "subtitle_selection", StageState.QUEUED, trigger=AttemptTrigger.RESUME
+            stage = context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.QUEUED,
+                    trigger=AttemptTrigger.RESUME,
+                    lease_owner=context.lease_owner,
+                )
             )
             stage_state = StageState(stage["state"])
         if stage_state is StageState.PENDING:
-            stage = self.store.transition_stage(job_id, "subtitle_selection", StageState.QUEUED)
+            stage = context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.QUEUED,
+                    lease_owner=context.lease_owner,
+                )
+            )
             stage_state = StageState(stage["state"])
         if stage_state is StageState.QUEUED:
-            self.store.transition_stage(
-                job_id, "subtitle_selection", StageState.RUNNING, expected_state=StageState.QUEUED
+            context.require(
+                self.store.transition_stage(
+                    job_id,
+                    "subtitle_selection",
+                    StageState.RUNNING,
+                    expected_state=StageState.QUEUED,
+                    lease_owner=context.lease_owner,
+                )
             )
 
-    def _exhaust(self, job_id: str, *, attempted: int, limit: int) -> None:
-        self.store.transition_stage(
-            job_id,
-            "subtitle_selection",
-            StageState.NEEDS_ATTENTION,
-            expected_state=StageState.RUNNING,
-            progress_numerator=attempted,
-            progress_denominator=limit,
-            progress_unit="candidates",
-            safe_error_code="subtitle_candidates_exhausted",
-            safe_error_message="No acceptable subtitle candidate was found.",
-            next_action="select_subtitle",
+    def _exhaust(
+        self,
+        job_id: str,
+        *,
+        attempted: int,
+        limit: int,
+        context: _ExecutionContext,
+    ) -> None:
+        context.check()
+        context.require(
+            self.store.transition_stage(
+                job_id,
+                "subtitle_selection",
+                StageState.NEEDS_ATTENTION,
+                expected_state=StageState.RUNNING,
+                progress_numerator=attempted,
+                progress_denominator=limit,
+                progress_unit="candidates",
+                safe_error_code="subtitle_candidates_exhausted",
+                safe_error_message="No acceptable subtitle candidate was found.",
+                next_action="select_subtitle",
+                lease_owner=context.lease_owner,
+            )
         )
-        self.store.transition_job(
-            job_id,
-            JobState.NEEDS_ATTENTION,
-            expected_state=JobState.RUNNING,
-            safe_error_code="subtitle_candidates_exhausted",
-            safe_error_message=_exhaustion_message(attempted),
-            next_action="select_subtitle",
+        context.require(
+            self.store.transition_job(
+                job_id,
+                JobState.NEEDS_ATTENTION,
+                expected_state=JobState.RUNNING,
+                safe_error_code="subtitle_candidates_exhausted",
+                safe_error_message=_exhaustion_message(attempted),
+                next_action="select_subtitle",
+                lease_owner=context.lease_owner,
+            )
         )
 
     def _job(self, job_id: str) -> dict[str, Any]:

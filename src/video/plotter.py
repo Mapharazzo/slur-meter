@@ -9,9 +9,6 @@ Portrait format: 540×640 px per frame (scaled to 1080×1280 by the compositor).
 """
 
 import io
-import os
-import shutil
-import uuid
 from pathlib import Path
 
 import matplotlib
@@ -71,8 +68,6 @@ class RagePlotter:
                 base, max_x, display_max, progress, output_dir / f"frame_{i:05d}.png"
             )
             frames.append(path)
-            if i % 15 == 0:
-                self._atomic_preview(path, output_dir.parent / "preview.png")
             if progress_cb:
                 progress_cb("Generating...", i + 1, n_frames)
         base.close()
@@ -340,18 +335,6 @@ class RagePlotter:
             if progress_cb:
                 progress_cb("Generating...", i + 1, n)
         return frames
-
-    @staticmethod
-    def _atomic_preview(source: Path, destination: Path) -> None:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        partial = destination.with_name(
-            f".{destination.stem}.{uuid.uuid4().hex}.partial{destination.suffix}"
-        )
-        try:
-            shutil.copy2(source, partial)
-            os.replace(partial, destination)
-        finally:
-            partial.unlink(missing_ok=True)
 
     @staticmethod
     def _hex(h: str) -> tuple:

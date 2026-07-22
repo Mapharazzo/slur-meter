@@ -17,6 +17,7 @@ from api.domain import StageState
 from api.errors import AttentionRequired, TransientFailure
 from api.pipeline import GenerationPipelineServices, PipelineRunner
 from api.settings import Settings
+from api.subtitles import SubtitleService
 from src.audio.layers import AudioLayer
 from src.audio.mixer import AudioMixer
 from src.audio.pipeline import AudioPipeline
@@ -27,6 +28,7 @@ from src.audio.providers import (
     _cache_key,
 )
 from src.data.movie_metadata import MovieMetadataClient, MovieMetadataResult
+from src.data.opensubtitles import SubtitleCache, SubtitleResult
 
 
 @pytest.fixture
@@ -175,6 +177,31 @@ def _selected_subtitle(store, job_id, path):
     )
 
 
+class FakeSubtitleClient:
+    def __init__(self, results, payloads, *, before_download=None):
+        self.results = results
+        self.payloads = payloads
+        self.before_download = before_download
+
+    def search(self, **_kwargs):
+        return self.results
+
+    def download(self, file_id, destination):
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(self.payloads[file_id])
+        if self.before_download is not None:
+            self.before_download()
+        return path
+
+
+SHORT_PROVIDER_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nToo short\n"
+VALID_PROVIDER_SRT = (
+    b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n"
+    b"2\n01:20:00,000 --> 01:25:00,000\nBye\n"
+)
+
+
 @pytest.mark.anyio
 async def test_real_generation_handlers_persist_actual_progress_children_and_manifests(
     tmp_path,
@@ -256,9 +283,7 @@ async def test_real_generation_handlers_persist_actual_progress_children_and_man
         assert manifest["artifact"]["sha256"]
         assert manifest["input_hashes"]
         assert manifest["config_hash"]
-        assert services.validate_stage(
-            f"composite.{name}", job["id"], manifest
-        )
+        assert services.validate_stage(f"composite.{name}", job["id"], manifest)
     events = detail["events"]
     intro_progress = next(
         event["id"]
@@ -276,6 +301,13 @@ async def test_real_generation_handlers_persist_actual_progress_children_and_man
     assert intro_progress < transition_start
     encoded = artifacts.artifact_path(parents["encode"]["output_manifest"])
     assert encoded.read_bytes() == b"final-video"
+    graph_manifest = parents["graph"]["output_manifest"]
+    graph_artifact = artifacts.artifact_path(graph_manifest)
+    assert graph_manifest["details"]["frames_directory"] == "frames"
+    assert graph_manifest["details"]["preview_file"] == "preview.png"
+    assert (graph_artifact / "preview.png").is_file()
+    assert len(list((graph_artifact / "frames").glob("frame_*.png"))) == 2
+    assert not (settings.output_dir / job["id"] / "preview.png").exists()
     assert not (settings.output_dir / job["id"] / "final.mp4").exists()
     assert all(
         services.validate_stage(stage, job["id"], parents[stage]["output_manifest"])
@@ -300,8 +332,86 @@ async def test_real_generation_handlers_persist_actual_progress_children_and_man
     wrong_stage["stage"] = "graph"
     assert not services.validate_stage("analysis", job["id"], wrong_stage)
     assert not services.validate_stage(
-        "analysis", "job_00000000000000000000000000000000", parents["analysis"]["output_manifest"]
+        "analysis",
+        "job_00000000000000000000000000000000",
+        parents["analysis"]["output_manifest"],
     )
+
+
+def test_audio_manifest_reuse_tracks_same_path_file_provider_content(tmp_path):
+    store = OperationStore(tmp_path / "audio-provenance.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Fixture Movie")
+    source = tmp_path / "intro-source.mp3"
+    source.write_bytes(b"original-local-audio")
+    config = {
+        "video": {"fps": 30},
+        "audio": {
+            "intro_tts": {
+                "enabled": True,
+                "provider": "file",
+                "provider_config": {"path": str(source)},
+            },
+            "outro_tts": {
+                "enabled": True,
+                "provider": "file",
+                "provider_config": {"path": str(source)},
+            },
+            "background_music": {
+                "enabled": True,
+                "provider": "file",
+                "provider_config": {"path": str(source)},
+            },
+            "verdict_sfx": {
+                "enabled": True,
+                "provider": "file",
+                "provider_config": {"path": str(source)},
+                "rating": {
+                    "provider": "file",
+                    "provider_config": {"path": str(source)},
+                },
+            },
+        },
+    }
+    artifacts = ArtifactManager(tmp_path / "output")
+    services = GenerationPipelineServices(
+        store,
+        Settings(base_dir=tmp_path, output_dir=tmp_path / "output"),
+        config=config,
+        artifacts=artifacts,
+        metadata_client=FakeMetadataClient(),
+        encoder=FakeEncoder(),
+    )
+    services._artifact_hash = lambda _job_id, stage: f"{stage}-hash"
+    inputs = services._input_hashes("audio", job["id"])
+    source_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert {
+        key: value for key, value in inputs.items() if key.startswith("file_provider:")
+    } == {
+        "file_provider:intro_tts": source_hash,
+        "file_provider:outro_tts": source_hash,
+        "file_provider:background_music": source_hash,
+        "file_provider:verdict_sfx": source_hash,
+        "file_provider:verdict_sfx.rating": source_hash,
+    }
+
+    staged = artifacts.new_staging_file(job["id"], "audio", suffix=".m4a")
+    staged.write_bytes(b"mixed-output")
+    manifest = artifacts.promote_file(
+        job["id"],
+        "audio",
+        staged,
+        final_name="mixed.m4a",
+        artifact_kind="file",
+        input_hashes=inputs,
+        config_hash=services._config_hash("audio"),
+    )
+    assert services.validate_stage("audio", job["id"], manifest)
+
+    source.write_bytes(b"changed-at-the-same-path")
+    assert not services.validate_stage("audio", job["id"], manifest)
+    source.unlink()
+    assert not services.validate_stage("audio", job["id"], manifest)
 
 
 def test_metadata_client_distinguishes_optional_absence_and_transient_failure():
@@ -330,9 +440,9 @@ def test_metadata_client_distinguishes_optional_absence_and_transient_failure():
             raise requests.exceptions.ChunkedEncodingError("truncated response")
 
     with pytest.raises(TransientFailure):
-        MovieMetadataClient(
-            tmdb_token="configured", session=BrokenBodySession()
-        ).fetch("tt0110912")
+        MovieMetadataClient(tmdb_token="configured", session=BrokenBodySession()).fetch(
+            "tt0110912"
+        )
 
 
 def test_metadata_client_rejects_omdb_error_flags_and_invalid_poster_bytes():
@@ -398,6 +508,7 @@ def test_ffprobe_failure_is_emitted_as_warning_instead_of_swallowed(
             "num_frames": 2,
         }
     }
+
     class FailedProbe:
         returncode = 1
         stdout = io.StringIO("")
@@ -672,6 +783,165 @@ async def test_stage_that_lost_its_lease_cannot_publish_an_artifact(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_real_subtitle_service_rejects_first_candidate_then_selects_second(
+    tmp_path,
+):
+    store = OperationStore(tmp_path / "real-subtitle.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "pulp fiction", "Pulp Fiction")
+    store.claim_next_job("subtitle-worker", lease_seconds=30)
+    settings = Settings(
+        base_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        results_dir=tmp_path / "results",
+    )
+    results = [
+        SubtitleResult(
+            str(index),
+            f"{index}.srt",
+            "Pulp Fiction",
+            "1994",
+            "en",
+            None,
+            "tt0110912",
+            runtime_seconds=100 * 60,
+        )
+        for index in (1, 2)
+    ]
+    client = FakeSubtitleClient(
+        results,
+        {"1": SHORT_PROVIDER_SRT, "2": VALID_PROVIDER_SRT},
+    )
+    service = SubtitleService(
+        store,
+        client,
+        SubtitleCache(settings.results_dir),
+        settings,
+    )
+    services = GenerationPipelineServices(
+        store,
+        settings,
+        config=_config(),
+        artifacts=ArtifactManager(settings.output_dir),
+        metadata_client=FakeMetadataClient(),
+        subtitle_service=service,
+        encoder=FakeEncoder(),
+    )
+
+    await PipelineRunner(
+        store,
+        services,
+        stages=("subtitle_discovery", "subtitle_selection"),
+        settings=settings,
+    ).run(job["id"], "subtitle-worker")
+
+    detail = store.get_job_detail(job["id"])
+    candidates = detail["candidates"]
+    candidate_attempts = [
+        attempt for attempt in detail["attempts"] if attempt["candidate_id"]
+    ]
+    selection = next(
+        stage for stage in detail["stages"] if stage["name"] == "subtitle_selection"
+    )
+    assert [candidate["status"] for candidate in candidates] == [
+        "rejected",
+        "selected",
+    ], detail
+    assert [attempt["outcome"] for attempt in candidate_attempts] == [
+        "rejected",
+        "completed",
+    ]
+    assert detail["run"]["state"] == "completed"
+    assert selection["state"] == "completed"
+    assert (
+        selection["output_manifest"]["artifact"]["candidate_id"] == candidates[1]["id"]
+    )
+    assert (
+        len(
+            [
+                event
+                for event in detail["events"]
+                if event["type"] == "subtitle_selected"
+            ]
+        )
+        == 1
+    )
+
+
+@pytest.mark.anyio
+async def test_real_subtitle_service_stops_mutating_after_lease_reclamation(tmp_path):
+    store = OperationStore(tmp_path / "stale-subtitle.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "pulp fiction", "Pulp Fiction")
+    store.claim_next_job("stale-subtitle-worker", lease_seconds=30)
+    settings = Settings(
+        base_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        results_dir=tmp_path / "results",
+    )
+    snapshot = None
+
+    def reclaim_lease():
+        nonlocal snapshot
+        with store._mutation() as connection:
+            connection.execute(
+                "UPDATE job_runs SET lease_expires_at = "
+                "'2000-01-01T00:00:00+00:00' WHERE id = ?",
+                (job["id"],),
+            )
+        store.recover_expired_leases()
+        assert (
+            store.claim_next_job("replacement-subtitle-worker", lease_seconds=30)
+            is not None
+        )
+        snapshot = store.get_job_detail(job["id"])
+
+    result = SubtitleResult(
+        "1",
+        "one.srt",
+        "Pulp Fiction",
+        "1994",
+        "en",
+        None,
+        "tt0110912",
+        runtime_seconds=100 * 60,
+    )
+    client = FakeSubtitleClient(
+        [result],
+        {"1": VALID_PROVIDER_SRT},
+        before_download=reclaim_lease,
+    )
+    services = GenerationPipelineServices(
+        store,
+        settings,
+        config=_config(),
+        artifacts=ArtifactManager(settings.output_dir),
+        metadata_client=FakeMetadataClient(),
+        subtitle_service=SubtitleService(
+            store,
+            client,
+            SubtitleCache(settings.results_dir),
+            settings,
+        ),
+        encoder=FakeEncoder(),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await PipelineRunner(
+            store,
+            services,
+            stages=("subtitle_discovery", "subtitle_selection"),
+            settings=settings,
+        ).run(job["id"], "stale-subtitle-worker")
+
+    assert snapshot is not None
+    after = store.get_job_detail(job["id"])
+    assert after["run"] == snapshot["run"]
+    for key in ("stages", "attempts", "candidates", "events", "decisions"):
+        assert after[key] == snapshot[key]
+
+
+@pytest.mark.anyio
 async def test_automatic_subtitle_completion_persists_a_resumable_manifest(tmp_path):
     store = OperationStore(tmp_path / "subtitle-resume.db")
     store.initialize()
@@ -693,13 +963,17 @@ async def test_automatic_subtitle_completion_persists_a_resumable_manifest(tmp_p
     )
 
     class CompletingSubtitleService:
-        def select(self, job_id):
-            selected = store.update_candidate(candidate["id"], status="selected")
+        def select(self, job_id, *, lease_owner, cancel_requested):
+            assert not cancel_requested()
+            selected = store.update_candidate(
+                candidate["id"], status="selected", lease_owner=lease_owner
+            )
             store.transition_stage(
                 job_id,
                 "subtitle_selection",
                 StageState.COMPLETED,
                 expected_state=StageState.RUNNING,
+                lease_owner=lease_owner,
             )
             return selected
 
@@ -770,9 +1044,7 @@ def test_audio_cache_keys_cover_output_settings_and_promotions_are_atomic(tmp_pa
             return output_path
 
         def _validate_audio(self, path, **_kwargs):
-            return not (
-                self.reject_cache_probe and Path(path).parent == self.cache_dir
-            )
+            return not (self.reject_cache_probe and Path(path).parent == self.cache_dir)
 
     provider = CachedFixtureProvider({"cache_dir": tmp_path / "cache"})
     first_output = provider.generate("hello", tmp_path / "first.m4a")

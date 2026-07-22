@@ -329,7 +329,9 @@ def test_running_job_events_are_fenced_by_lease_owner(store):
 
     assert stale is None
     assert owned["type"] == "owned_diagnostic"
-    assert not any(event["type"] == "stale_diagnostic" for event in store.list_events(job["id"]))
+    assert not any(
+        event["type"] == "stale_diagnostic" for event in store.list_events(job["id"])
+    )
 
 
 def test_queue_summary_omits_internal_and_large_detail_fields(store):
@@ -420,11 +422,15 @@ def test_repeating_terminal_stage_transition_preserves_timestamp_and_history(sto
     assert len(store.list_events(job["id"])) == event_count
 
 
-def test_stage_and_job_terminal_transition_is_atomic_and_lease_fenced(store, monkeypatch):
+def test_stage_and_job_terminal_transition_is_atomic_and_lease_fenced(
+    store, monkeypatch
+):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     store.ensure_stage(job["id"], "analysis", state=StageState.QUEUED)
     store.claim_next_job("worker-a", lease_seconds=30)
-    store.transition_stage(job["id"], "analysis", StageState.RUNNING, lease_owner="worker-a")
+    store.transition_stage(
+        job["id"], "analysis", StageState.RUNNING, lease_owner="worker-a"
+    )
 
     assert (
         store.transition_stage_and_job(
@@ -478,8 +484,12 @@ def test_composite_completion_atomically_finishes_running_children(store, monkey
     )
     for name in ("intro", "graph"):
         stage = f"composite.{name}"
-        store.transition_stage(job["id"], stage, StageState.QUEUED, lease_owner="worker-a")
-        store.transition_stage(job["id"], stage, StageState.RUNNING, lease_owner="worker-a")
+        store.transition_stage(
+            job["id"], stage, StageState.QUEUED, lease_owner="worker-a"
+        )
+        store.transition_stage(
+            job["id"], stage, StageState.RUNNING, lease_owner="worker-a"
+        )
 
     assert (
         store.complete_stage_and_children(
@@ -517,7 +527,8 @@ def test_composite_completion_atomically_finishes_running_children(store, monkey
         )
 
     assert {
-        stage["name"]: stage["state"] for stage in store.get_job_detail(job["id"])["stages"]
+        stage["name"]: stage["state"]
+        for stage in store.get_job_detail(job["id"])["stages"]
     } == {
         "composite": "running",
         "composite.intro": "running",
@@ -532,7 +543,8 @@ def test_composite_completion_atomically_finishes_running_children(store, monkey
         lease_owner="worker-a",
     )
     assert {
-        stage["name"]: stage["state"] for stage in store.get_job_detail(job["id"])["stages"]
+        stage["name"]: stage["state"]
+        for stage in store.get_job_detail(job["id"])["stages"]
     } == {
         "composite": "completed",
         "composite.intro": "completed",
@@ -585,7 +597,9 @@ def _completed_generation_tree(store):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     for ordinal, name in enumerate(("metadata", "analysis", "composite", "audio"), 1):
         store.ensure_stage(job["id"], name, ordinal=ordinal, state=StageState.PENDING)
-    for index, name in enumerate(("intro_hold", "intro_transition", "graph", "verdict"), 1):
+    for index, name in enumerate(
+        ("intro_hold", "intro_transition", "graph", "verdict"), 1
+    ):
         store.ensure_stage(
             job["id"],
             f"composite.{name}",
@@ -669,7 +683,9 @@ def test_artifact_invalidation_atomically_requeues_target_and_resets_downstream(
         assert stage["warnings"] == []
         assert stage["progress"] == {"numerator": 0, "denominator": 1, "unit": ""}
         assert stage["safe_error"] is None
-    assert any(event["type"] == "artifact_validation_failed" for event in detail["events"])
+    assert any(
+        event["type"] == "artifact_validation_failed" for event in detail["events"]
+    )
 
 
 def test_artifact_invalidation_is_lease_fenced_and_rolls_back_event_failure(
@@ -707,6 +723,53 @@ def test_artifact_invalidation_is_lease_fenced_and_rolls_back_event_failure(
             safe_error_message="invalid",
         )
 
+    assert store.get_job_detail(job["id"]) == before
+
+
+def test_subtitle_owned_mutations_reject_a_stale_lease_owner(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.ensure_stage(job["id"], "subtitle_selection", ordinal=1)
+    candidate, _ = store.record_candidate(
+        job["id"], "provider", "candidate-1", status="discovered"
+    )
+    store.claim_next_job("current-owner", lease_seconds=30)
+    before = store.get_job_detail(job["id"])
+
+    assert (
+        store.ensure_stage(
+            job["id"],
+            "subtitle_selection",
+            ordinal=1,
+            lease_owner="stale-owner",
+        )
+        is None
+    )
+    assert (
+        store.record_candidate(
+            job["id"],
+            "provider",
+            "candidate-2",
+            status="discovered",
+            lease_owner="stale-owner",
+        )
+        is None
+    )
+    assert (
+        store.update_candidate(
+            candidate["id"], status="rejected", lease_owner="stale-owner"
+        )
+        is None
+    )
+    assert (
+        store.record_decision(
+            job["id"],
+            "select_subtitle",
+            candidate_id=candidate["id"],
+            accepted=True,
+            lease_owner="stale-owner",
+        )
+        is None
+    )
     assert store.get_job_detail(job["id"]) == before
 
 

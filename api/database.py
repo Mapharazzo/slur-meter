@@ -434,18 +434,28 @@ class OperationStore:
                             },
                             created_at=now,
                         )
-            stage_finished = now if target_stage in {
-                StageState.COMPLETED,
-                StageState.FAILED,
-                StageState.CANCELLED,
-                StageState.SKIPPED,
-                StageState.NEEDS_ATTENTION,
-            } else None
-            job_finished = now if target_job in {
-                JobState.COMPLETED,
-                JobState.FAILED,
-                JobState.CANCELLED,
-            } else None
+            stage_finished = (
+                now
+                if target_stage
+                in {
+                    StageState.COMPLETED,
+                    StageState.FAILED,
+                    StageState.CANCELLED,
+                    StageState.SKIPPED,
+                    StageState.NEEDS_ATTENTION,
+                }
+                else None
+            )
+            job_finished = (
+                now
+                if target_job
+                in {
+                    JobState.COMPLETED,
+                    JobState.FAILED,
+                    JobState.CANCELLED,
+                }
+                else None
+            )
             connection.execute(
                 """UPDATE pipeline_stages SET state = ?, updated_at = ?, finished_at = ?,
                        progress_unit = COALESCE(?, progress_unit), warnings_json = ?,
@@ -456,7 +466,9 @@ class OperationStore:
                     now,
                     stage_finished,
                     _safe_text(progress_unit) if progress_unit is not None else None,
-                    _safe_json_dump(warnings) if warnings is not None else stage["warnings_json"],
+                    _safe_json_dump(warnings)
+                    if warnings is not None
+                    else stage["warnings_json"],
                     _safe_json_dump(output_manifest)
                     if output_manifest is not None
                     else stage["output_manifest_json"],
@@ -492,7 +504,11 @@ class OperationStore:
                 stage_id=int(stage["id"]),
                 event_type="stage_state_changed",
                 message=f"Stage {stage_name} moved from {old_stage.value} to {target_stage.value}.",
-                data={"from": old_stage.value, "to": target_stage.value, "trigger": None},
+                data={
+                    "from": old_stage.value,
+                    "to": target_stage.value,
+                    "trigger": None,
+                },
                 created_at=now,
             )
             self._insert_event(
@@ -509,7 +525,10 @@ class OperationStore:
             updated_job = connection.execute(
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
             ).fetchone()
-            return {"stage": self._stage_dto(updated_stage), "run": self._job_dto(updated_job)}
+            return {
+                "stage": self._stage_dto(updated_stage),
+                "run": self._job_dto(updated_job),
+            }
 
     def complete_stage_and_children(
         self,
@@ -630,7 +649,9 @@ class OperationStore:
             job = connection.execute(
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
             ).fetchone()
-            if job["state"] != JobState.RUNNING.value or job["lease_owner"] != str(owner):
+            if job["state"] != JobState.RUNNING.value or job["lease_owner"] != str(
+                owner
+            ):
                 return False
             if job["cancel_requested_at"] is not None:
                 self._cancel_job_work(connection, resolved, now)
@@ -658,7 +679,9 @@ class OperationStore:
                        WHERE stage_id = ? AND finished_at IS NULL""",
                     (
                         now,
-                        _safe_json_dump({"reason": "Worker shutdown interrupted the attempt."}),
+                        _safe_json_dump(
+                            {"reason": "Worker shutdown interrupted the attempt."}
+                        ),
                         stage["id"],
                     ),
                 )
@@ -887,11 +910,17 @@ class OperationStore:
         parent_name: str | None = None,
         state: StageState | str = StageState.PENDING,
         max_auto_attempts: int = 1,
-    ) -> dict[str, Any]:
+        lease_owner: str | None = None,
+    ) -> dict[str, Any] | None:
         stage_state = _enum_value(StageState, state)
         now = self._now_text()
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, now):
+                return None
             parent_id = None
             if parent_name is not None:
                 parent = connection.execute(
@@ -1117,13 +1146,6 @@ class OperationStore:
                 return None
             if stage["state"] != StageState.RUNNING.value:
                 raise ValueError("Stage must be running before an attempt starts")
-            active = connection.execute(
-                """SELECT * FROM pipeline_attempts
-                   WHERE stage_id = ? AND finished_at IS NULL ORDER BY id DESC LIMIT 1""",
-                (stage["id"],),
-            ).fetchone()
-            if active is not None:
-                return self._attempt_dto(active)
             if candidate_id is not None:
                 candidate = connection.execute(
                     "SELECT job_id FROM subtitle_candidates WHERE id = ?",
@@ -1131,6 +1153,29 @@ class OperationStore:
                 ).fetchone()
                 if candidate is None or candidate["job_id"] != resolved:
                     raise ValueError("Subtitle candidate does not belong to this run")
+            active = connection.execute(
+                """SELECT * FROM pipeline_attempts
+                   WHERE stage_id = ? AND finished_at IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (stage["id"],),
+            ).fetchone()
+            if active is not None:
+                if candidate_id is not None and active["candidate_id"] is None:
+                    connection.execute(
+                        "UPDATE pipeline_attempts SET candidate_id = ? WHERE id = ?",
+                        (candidate_id, active["id"]),
+                    )
+                    active = connection.execute(
+                        "SELECT * FROM pipeline_attempts WHERE id = ?",
+                        (active["id"],),
+                    ).fetchone()
+                elif (
+                    candidate_id is not None and active["candidate_id"] != candidate_id
+                ):
+                    raise RuntimeError(
+                        "Another subtitle candidate attempt is still active"
+                    )
+                return self._attempt_dto(active)
             cycle = int(stage["retry_cycle"])
             attempt_number = int(
                 connection.execute(
@@ -1263,8 +1308,10 @@ class OperationStore:
         job_id: str,
         provider: str,
         provider_id: str,
+        *,
+        lease_owner: str | None = None,
         **fields: Any,
-    ) -> tuple[dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], bool] | None:
         now = self._now_text()
         allowed = {
             "provider_filename",
@@ -1304,6 +1351,11 @@ class OperationStore:
         cycle = int(fields.get("discovery_cycle", 1))
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, now):
+                return None
             existing = connection.execute(
                 """SELECT * FROM subtitle_candidates
                    WHERE job_id = ? AND provider = ? AND provider_id = ? AND discovery_cycle = ?""",
@@ -1352,7 +1404,11 @@ class OperationStore:
     add_candidate = record_candidate
 
     def update_candidate(
-        self, candidate_id: str, **fields: Any
+        self,
+        candidate_id: str,
+        *,
+        lease_owner: str | None = None,
+        **fields: Any,
     ) -> dict[str, Any] | None:
         allowed = {
             "rank",
@@ -1396,6 +1452,11 @@ class OperationStore:
                 "SELECT * FROM subtitle_candidates WHERE id = ?", (candidate_id,)
             ).fetchone()
             if row is None:
+                return None
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (row["job_id"],)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, updates["updated_at"]):
                 return None
             if updates:
                 clause = ", ".join(f"{column} = ?" for column in updates)
@@ -1453,10 +1514,16 @@ class OperationStore:
         platform: str | None = None,
         accepted: bool,
         reason: object = "",
-    ) -> tuple[dict[str, Any], bool]:
+        lease_owner: str | None = None,
+    ) -> tuple[dict[str, Any], bool] | None:
         now = self._now_text()
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, now):
+                return None
             if candidate_id is not None:
                 candidate = connection.execute(
                     "SELECT job_id FROM subtitle_candidates WHERE id = ?",

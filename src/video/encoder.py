@@ -29,6 +29,28 @@ class FFmpegEncoder:
     """Encode validated PNG frames while reporting ffmpeg's real frame counter."""
 
     _FRAME_RE = re.compile(r"^frame=(\d+)\s*$")
+    _INTEGER_PROGRESS_KEYS = {
+        "frame",
+        "total_size",
+        "out_time_us",
+        "dup_frames",
+        "drop_frames",
+    }
+    _INTEGER_PROGRESS_RE = re.compile(r"\d{1,20}\Z")
+    _FPS_RE = re.compile(r"\d{1,6}(?:\.\d{1,6})?\Z")
+    _BITRATE_RE = re.compile(r"(?:N/A|\d{1,12}(?:\.\d{1,6})?kbits/s)\Z")
+    _SPEED_RE = re.compile(r"(?:N/A|\d{1,6}(?:\.\d{1,6})?x)\Z")
+    _DIAGNOSTIC_PRIORITY = (
+        "frame",
+        "progress",
+        "fps",
+        "out_time_us",
+        "total_size",
+        "dup_frames",
+        "drop_frames",
+        "bitrate",
+        "speed",
+    )
 
     def __init__(
         self,
@@ -139,6 +161,7 @@ class FFmpegEncoder:
         stdout_done = False
         cancelled = False
         last_frame = -1
+        diagnostics: dict[str, int | float | str] = {}
         try:
             while not stdout_done:
                 if cancel_requested is not None and cancel_requested():
@@ -152,6 +175,7 @@ class FFmpegEncoder:
                 if line is None:
                     stdout_done = True
                     continue
+                self._capture_progress_diagnostic(line.strip(), diagnostics)
                 match = self._FRAME_RE.fullmatch(line.strip())
                 if match is None:
                     continue
@@ -168,7 +192,7 @@ class FFmpegEncoder:
             if returncode != 0:
                 raise EncodingError(
                     f"ffmpeg exited with status {returncode}",
-                    stderr_tail="",
+                    stderr_tail=self._render_progress_diagnostics(diagnostics),
                 )
             if cancel_requested is not None and cancel_requested():
                 raise asyncio.CancelledError("Encoding was cancelled")
@@ -186,6 +210,48 @@ class FFmpegEncoder:
                 self._stop(process)
             partial.unlink(missing_ok=True)
             raise
+
+    @classmethod
+    def _capture_progress_diagnostic(
+        cls,
+        line: str,
+        diagnostics: dict[str, int | float | str],
+    ) -> None:
+        key, separator, value = line.partition("=")
+        if not separator:
+            return
+        if key in cls._INTEGER_PROGRESS_KEYS:
+            if cls._INTEGER_PROGRESS_RE.fullmatch(value):
+                diagnostics[key] = int(value)
+            return
+        if key == "fps":
+            if cls._FPS_RE.fullmatch(value):
+                diagnostics[key] = float(value)
+            return
+        if key == "bitrate":
+            if cls._BITRATE_RE.fullmatch(value):
+                diagnostics[key] = value
+            return
+        if key == "speed":
+            if cls._SPEED_RE.fullmatch(value):
+                diagnostics[key] = value
+            return
+        if key == "progress" and value in {"continue", "end"}:
+            diagnostics[key] = value
+
+    def _render_progress_diagnostics(
+        self, diagnostics: dict[str, int | float | str]
+    ) -> str:
+        retained: dict[str, int | float | str] = {}
+        for key in self._DIAGNOSTIC_PRIORITY:
+            if key not in diagnostics:
+                continue
+            candidate = {**retained, key: diagnostics[key]}
+            encoded = json.dumps(candidate, separators=(",", ":"), sort_keys=True)
+            if len(encoded) <= self.stderr_limit:
+                retained = candidate
+        encoded = json.dumps(retained, separators=(",", ":"), sort_keys=True)
+        return encoded if retained and len(encoded) <= self.stderr_limit else ""
 
     def _frame_input(
         self, frames: str | Path | Sequence[str | Path]
@@ -282,7 +348,9 @@ class FFmpegEncoder:
                     if raw_frames not in (None, "N/A"):
                         frame_count = int(raw_frames)
                     if duration is None and frame_count is None:
-                        raise EncodingError("Encoded output validation returned no media facts")
+                        raise EncodingError(
+                            "Encoded output validation returned no media facts"
+                        )
                 except asyncio.CancelledError:
                     raise
                 except EncodingError:
@@ -296,7 +364,9 @@ class FFmpegEncoder:
         if duration is not None and duration <= 0:
             raise EncodingError("Encoded output has no positive duration")
         if duration is not None and abs(duration - expected_duration) > (1 / self.fps):
-            raise EncodingError("Encoded output duration does not match its frame count")
+            raise EncodingError(
+                "Encoded output duration does not match its frame count"
+            )
 
     @staticmethod
     def _stop(process: Any) -> None:
