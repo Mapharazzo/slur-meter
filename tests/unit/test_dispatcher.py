@@ -320,3 +320,18 @@ async def test_supervisor_error_cancels_and_observes_active_runner():
     assert dispatcher.active_count == 0
     assert len(store.released) == 1
     await dispatcher.stop()
+
+
+@pytest.mark.anyio
+async def test_runner_factory_failure_occurs_before_job_claim(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+
+    def fail_factory():
+        raise RuntimeError("invalid runner configuration")
+
+    dispatcher = JobDispatcher(store, fail_factory, poll_interval=0.01)
+    await dispatcher.start()
+    await eventually(lambda: dispatcher._supervisor is not None and dispatcher._supervisor.done())
+    await dispatcher.stop()
+
+    assert store.get_job(job["id"])["state"] == "queued"

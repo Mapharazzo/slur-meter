@@ -122,7 +122,7 @@ def assert_stage_transition(
         old is StageState.COMPLETED
         and new is StageState.QUEUED
         and trigger is AttemptTrigger.ARTIFACT_INVALIDATION
-        and stage_name == "subtitle_selection"
+        and bool(stage_name)
     ):
         return
     _assert_transition(old, new, _STAGE_TRANSITIONS, "stage")

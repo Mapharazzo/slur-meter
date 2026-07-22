@@ -458,6 +458,258 @@ def test_stage_and_job_terminal_transition_is_atomic_and_lease_fenced(store, mon
     assert detail["stages"][0]["state"] == "running"
 
 
+def test_composite_completion_atomically_finishes_running_children(store, monkeypatch):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.ensure_stage(job["id"], "composite", state=StageState.PENDING)
+    for index, name in enumerate(("intro", "graph"), 1):
+        store.ensure_stage(
+            job["id"],
+            f"composite.{name}",
+            ordinal=100 + index,
+            parent_name="composite",
+            state=StageState.PENDING,
+        )
+    store.claim_next_job("worker-a", lease_seconds=30)
+    store.transition_stage(
+        job["id"], "composite", StageState.QUEUED, lease_owner="worker-a"
+    )
+    store.transition_stage(
+        job["id"], "composite", StageState.RUNNING, lease_owner="worker-a"
+    )
+    for name in ("intro", "graph"):
+        stage = f"composite.{name}"
+        store.transition_stage(job["id"], stage, StageState.QUEUED, lease_owner="worker-a")
+        store.transition_stage(job["id"], stage, StageState.RUNNING, lease_owner="worker-a")
+
+    assert (
+        store.complete_stage_and_children(
+            job["id"],
+            "composite",
+            output_manifest={"stage": "composite"},
+            lease_owner="worker-a",
+        )
+        is None
+    )
+    for name in ("intro", "graph"):
+        store.transition_stage(
+            job["id"],
+            f"composite.{name}",
+            StageState.RUNNING,
+            expected_state=StageState.RUNNING,
+            output_manifest={"stage": f"composite.{name}"},
+            lease_owner="worker-a",
+        )
+
+    original_insert_event = store._insert_event
+
+    def fail_on_graph_event(connection, job_id, **fields):
+        if fields.get("message", "").startswith("Stage composite.graph moved"):
+            raise RuntimeError("injected child event failure")
+        return original_insert_event(connection, job_id, **fields)
+
+    monkeypatch.setattr(store, "_insert_event", fail_on_graph_event)
+    with pytest.raises(RuntimeError, match="injected child event failure"):
+        store.complete_stage_and_children(
+            job["id"],
+            "composite",
+            output_manifest={"stage": "composite"},
+            lease_owner="worker-a",
+        )
+
+    assert {
+        stage["name"]: stage["state"] for stage in store.get_job_detail(job["id"])["stages"]
+    } == {
+        "composite": "running",
+        "composite.intro": "running",
+        "composite.graph": "running",
+    }
+
+    monkeypatch.setattr(store, "_insert_event", original_insert_event)
+    store.complete_stage_and_children(
+        job["id"],
+        "composite",
+        output_manifest={"stage": "composite"},
+        lease_owner="worker-a",
+    )
+    assert {
+        stage["name"]: stage["state"] for stage in store.get_job_detail(job["id"])["stages"]
+    } == {
+        "composite": "completed",
+        "composite.intro": "completed",
+        "composite.graph": "completed",
+    }
+
+
+def test_composite_failure_atomically_resets_all_children(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.ensure_stage(job["id"], "composite", state=StageState.PENDING)
+    for index, name in enumerate(("intro", "graph"), 1):
+        store.ensure_stage(
+            job["id"],
+            f"composite.{name}",
+            ordinal=100 + index,
+            parent_name="composite",
+            state=StageState.PENDING,
+        )
+    store.claim_next_job("worker-a", lease_seconds=30)
+    store.transition_stage(
+        job["id"], "composite", StageState.QUEUED, lease_owner="worker-a"
+    )
+    store.transition_stage(
+        job["id"], "composite", StageState.RUNNING, lease_owner="worker-a"
+    )
+    store.transition_stage(
+        job["id"], "composite.intro", StageState.QUEUED, lease_owner="worker-a"
+    )
+    store.transition_stage(
+        job["id"], "composite.intro", StageState.RUNNING, lease_owner="worker-a"
+    )
+
+    store.transition_stage_and_job(
+        job["id"],
+        "composite",
+        StageState.NEEDS_ATTENTION,
+        "needs_attention",
+        reset_descendants=True,
+        lease_owner="worker-a",
+    )
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["run"]["state"] == "needs_attention"
+    children = [stage for stage in detail["stages"] if stage["parent_stage_id"]]
+    assert [stage["state"] for stage in children] == ["pending", "pending"]
+    assert all(stage["output_manifest"] == {} for stage in children)
+
+
+def _completed_generation_tree(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    for ordinal, name in enumerate(("metadata", "analysis", "composite", "audio"), 1):
+        store.ensure_stage(job["id"], name, ordinal=ordinal, state=StageState.PENDING)
+    for index, name in enumerate(("intro_hold", "intro_transition", "graph", "verdict"), 1):
+        store.ensure_stage(
+            job["id"],
+            f"composite.{name}",
+            ordinal=300 + index,
+            parent_name="composite",
+            state=StageState.PENDING,
+        )
+    store.claim_next_job("worker-a", lease_seconds=30)
+    for name in ("metadata", "analysis", "composite", "audio"):
+        store.transition_stage(
+            job["id"], name, StageState.QUEUED, lease_owner="worker-a"
+        )
+        store.transition_stage(
+            job["id"], name, StageState.RUNNING, lease_owner="worker-a"
+        )
+        store.transition_stage(
+            job["id"],
+            name,
+            StageState.COMPLETED,
+            progress_numerator=3,
+            progress_denominator=3,
+            progress_unit="items",
+            warnings=["old warning"],
+            output_manifest={"stage": name, "version": "old"},
+            lease_owner="worker-a",
+        )
+    for name in ("intro_hold", "intro_transition", "graph", "verdict"):
+        child = f"composite.{name}"
+        store.transition_stage(
+            job["id"], child, StageState.QUEUED, lease_owner="worker-a"
+        )
+        store.transition_stage(
+            job["id"], child, StageState.RUNNING, lease_owner="worker-a"
+        )
+        store.transition_stage(
+            job["id"],
+            child,
+            StageState.COMPLETED,
+            progress_numerator=2,
+            progress_denominator=2,
+            progress_unit="frames",
+            output_manifest={"stage": child, "version": "old"},
+            lease_owner="worker-a",
+        )
+    return job
+
+
+def test_artifact_invalidation_atomically_requeues_target_and_resets_downstream(store):
+    job = _completed_generation_tree(store)
+
+    outcome = store.invalidate_stage_and_downstream(
+        job["id"],
+        "analysis",
+        lease_owner="worker-a",
+        safe_error_code="invalid_completed_artifact",
+        safe_error_message="Completed analysis output no longer validates.",
+    )
+
+    assert outcome is not None
+    detail = store.get_job_detail(job["id"])
+    stages = {stage["name"]: stage for stage in detail["stages"]}
+    assert detail["run"]["state"] == "needs_attention"
+    assert not store.renew_lease(job["id"], "worker-a", lease_seconds=30)
+    assert stages["metadata"]["state"] == "completed"
+    assert stages["metadata"]["output_manifest"]["version"] == "old"
+    assert stages["analysis"]["state"] == "queued"
+    assert stages["analysis"]["retry_cycle"] == 2
+    for name in (
+        "analysis",
+        "composite",
+        "audio",
+        "composite.intro_hold",
+        "composite.intro_transition",
+        "composite.graph",
+        "composite.verdict",
+    ):
+        stage = stages[name]
+        if name != "analysis":
+            assert stage["state"] == "pending"
+        assert stage["output_manifest"] == {}
+        assert stage["warnings"] == []
+        assert stage["progress"] == {"numerator": 0, "denominator": 1, "unit": ""}
+        assert stage["safe_error"] is None
+    assert any(event["type"] == "artifact_validation_failed" for event in detail["events"])
+
+
+def test_artifact_invalidation_is_lease_fenced_and_rolls_back_event_failure(
+    store, monkeypatch
+):
+    job = _completed_generation_tree(store)
+    before = store.get_job_detail(job["id"])
+
+    assert (
+        store.invalidate_stage_and_downstream(
+            job["id"],
+            "analysis",
+            lease_owner="stale-worker",
+            safe_error_code="invalid",
+            safe_error_message="invalid",
+        )
+        is None
+    )
+    assert store.get_job_detail(job["id"]) == before
+
+    original_insert_event = store._insert_event
+
+    def fail_invalidation_event(connection, job_id, **fields):
+        if fields.get("event_type") == "artifact_validation_failed":
+            raise RuntimeError("injected invalidation event failure")
+        return original_insert_event(connection, job_id, **fields)
+
+    monkeypatch.setattr(store, "_insert_event", fail_invalidation_event)
+    with pytest.raises(RuntimeError, match="injected invalidation event failure"):
+        store.invalidate_stage_and_downstream(
+            job["id"],
+            "analysis",
+            lease_owner="worker-a",
+            safe_error_code="invalid",
+            safe_error_message="invalid",
+        )
+
+    assert store.get_job_detail(job["id"]) == before
+
+
 def test_candidate_and_financial_dtos_hide_internal_artifact_paths(store, tmp_path):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     artifact_path = tmp_path / "private" / "candidate.srt"

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 
@@ -45,7 +46,7 @@ def test_frame_manifest_rejects_missing_extra_and_wrong_dimension(tmp_path, muta
         input_hashes={"analysis": "analysis-v1"},
         config_hash="config-v1",
     )
-    frames = manager.path(JOB_ID, "graph", "frames")
+    frames = manager.artifact_path(manifest)
 
     if mutation == "missing":
         (frames / "frame_00001.png").unlink()
@@ -124,9 +125,10 @@ def test_directory_is_validated_before_atomic_promotion_and_stale_tail_is_remove
             input_hashes={"graph": "v2"},
             config_hash="v1",
         )
-    assert sorted(
-        path.name for path in manager.path(JOB_ID, "composite", "concat").glob("*.png")
-    ) == [
+    first_manifest = json.loads(
+        manager.manifest_path(JOB_ID, "composite").read_text(encoding="utf-8")
+    )
+    assert sorted(path.name for path in manager.artifact_path(first_manifest).glob("*.png")) == [
         "00000.png",
         "00001.png",
         "00002.png",
@@ -146,9 +148,7 @@ def test_directory_is_validated_before_atomic_promotion_and_stale_tail_is_remove
         config_hash="v1",
     )
 
-    assert sorted(
-        path.name for path in manager.path(JOB_ID, "composite", "concat").glob("*.png")
-    ) == [
+    assert sorted(path.name for path in manager.artifact_path(manifest).glob("*.png")) == [
         "00000.png",
         "00001.png",
     ]
@@ -184,10 +184,19 @@ def test_nonzero_media_validation_uses_probe_when_available(tmp_path):
 
 
 def test_invalid_staged_media_is_removed_without_replacing_previous_output(tmp_path):
-    manager = ArtifactManager(tmp_path / "artifacts")
-    previous = manager.path(JOB_ID, "audio", "mixed.m4a")
-    previous.parent.mkdir(parents=True)
-    previous.write_bytes(b"last-good")
+    manager = ArtifactManager(
+        tmp_path / "artifacts", probe_duration=lambda _path: 1.0
+    )
+    initial_staged = manager.new_staging_file(JOB_ID, "audio", suffix=".m4a")
+    initial_staged.write_bytes(b"last-good")
+    initial = manager.promote_file(
+        JOB_ID,
+        "audio",
+        initial_staged,
+        final_name="mixed.m4a",
+        media_kind="audio",
+    )
+    previous = manager.artifact_path(initial)
     staged = manager.new_staging_file(JOB_ID, "audio", suffix=".m4a")
     staged.write_bytes(b"")
 
@@ -201,4 +210,203 @@ def test_invalid_staged_media_is_removed_without_replacing_previous_output(tmp_p
         )
 
     assert previous.read_bytes() == b"last-good"
+    assert manager.validate(initial)
     assert not staged.exists()
+
+
+class SimulatedPromotionCrash(BaseException):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_value"),
+    [
+        ("journal_written", {"value": "old"}),
+        ("bundle_installed", {"value": "old"}),
+        ("pointer_replaced", {"value": "new"}),
+    ],
+)
+def test_version_bundle_pointer_is_always_old_or_new_after_crash(
+    tmp_path, checkpoint, expected_value
+):
+    root = tmp_path / "artifacts"
+    manager = ArtifactManager(root)
+    first = manager.write_json(
+        JOB_ID, "analysis", "analysis.json", {"value": "old"}
+    )
+    previous_path = Path(root, first["artifact"]["path"])
+
+    def crash(name):
+        if name == checkpoint:
+            raise SimulatedPromotionCrash(name)
+
+    interrupted = ArtifactManager(root, promotion_checkpoint=crash)
+    with pytest.raises(SimulatedPromotionCrash):
+        interrupted.write_json(
+            JOB_ID, "analysis", "analysis.json", {"value": "new"}
+        )
+
+    recovered = ArtifactManager(root)
+    recovered.recover(JOB_ID)
+    recovered.recover(JOB_ID)
+    current_manifest = json.loads(
+        recovered.manifest_path(JOB_ID, "analysis").read_text(encoding="utf-8")
+    )
+    assert recovered.load_json(current_manifest) == expected_value
+    assert recovered.validate(current_manifest)
+    assert previous_path.is_file()
+    assert previous_path.read_text(encoding="utf-8").strip().endswith('"old"\n}')
+    assert not list(root.rglob("*.partial*"))
+    assert not list(root.rglob("*.journal"))
+
+
+def test_recovery_removes_partial_protocol_files_without_changing_current(tmp_path):
+    root = tmp_path / "artifacts"
+    manager = ArtifactManager(root)
+    current = manager.write_json(
+        JOB_ID, "analysis", "analysis.json", {"value": "old"}
+    )
+    partial_bundle = manager.path(
+        JOB_ID, "versions", "analysis", ".orphan.partial"
+    )
+    partial_bundle.mkdir(parents=True)
+    (partial_bundle / "junk").write_bytes(b"junk")
+    partial_pointer = manager.path(JOB_ID, "current", ".analysis.partial")
+    partial_pointer.parent.mkdir(parents=True, exist_ok=True)
+    partial_pointer.write_text("partial", encoding="utf-8")
+
+    recovered = ArtifactManager(root)
+
+    assert recovered.validate(current)
+    assert recovered.load_json(current) == {"value": "old"}
+    assert not partial_bundle.exists()
+    assert not partial_pointer.exists()
+
+
+@pytest.mark.parametrize("link_kind", ["file", "directory"])
+def test_promotion_rejects_symlink_descendants(tmp_path, link_kind):
+    manager = ArtifactManager(tmp_path / "artifacts")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    staged = manager.new_staging_directory(JOB_ID, "metadata")
+    if link_kind == "file":
+        target = outside / "secret.txt"
+        target.write_text("secret", encoding="utf-8")
+        (staged / "secret.txt").symlink_to(target)
+    else:
+        (outside / "nested").mkdir()
+        (outside / "nested" / "secret.txt").write_text("secret", encoding="utf-8")
+        (staged / "nested").symlink_to(outside / "nested", target_is_directory=True)
+
+    with pytest.raises(ArtifactValidationError, match="symlink"):
+        manager.promote_directory(
+            JOB_ID, "metadata", staged, final_name="bundle"
+        )
+
+
+def test_promotion_rejects_a_symlink_staging_file(tmp_path):
+    manager = ArtifactManager(tmp_path / "artifacts")
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"secret": true}', encoding="utf-8")
+    staged = manager.new_staging_file(JOB_ID, "analysis", suffix=".json")
+    staged.symlink_to(outside)
+
+    with pytest.raises(ArtifactValidationError, match="symlink"):
+        manager.promote_file(
+            JOB_ID, "analysis", staged, final_name="analysis.json"
+        )
+
+
+def test_media_probe_failure_fails_closed_and_preserves_current(tmp_path):
+    root = tmp_path / "artifacts"
+    manager = ArtifactManager(root, probe_duration=lambda _path: 1.0)
+    initial_staged = manager.new_staging_file(JOB_ID, "audio", suffix=".m4a")
+    initial_staged.write_bytes(b"last-good")
+    initial = manager.promote_file(
+        JOB_ID,
+        "audio",
+        initial_staged,
+        final_name="mixed.m4a",
+        media_kind="audio",
+    )
+
+    def probe_failure(_path):
+        raise OSError("ffprobe failed")
+
+    failing = ArtifactManager(root, probe_duration=probe_failure)
+    staged = failing.new_staging_file(JOB_ID, "audio", suffix=".m4a")
+    staged.write_bytes(b"replacement")
+    with pytest.raises(ArtifactValidationError, match="probe"):
+        failing.promote_file(
+            JOB_ID,
+            "audio",
+            staged,
+            final_name="mixed.m4a",
+            media_kind="audio",
+        )
+
+    recovered = ArtifactManager(root, probe_duration=lambda _path: 1.0)
+    assert recovered.validate(initial)
+    assert recovered.artifact_path(initial).read_bytes() == b"last-good"
+
+
+def test_media_expected_duration_mismatch_preserves_current_version(tmp_path):
+    root = tmp_path / "artifacts"
+    manager = ArtifactManager(root, probe_duration=lambda _path: 2.0)
+    first = manager.new_staging_file(JOB_ID, "encode", suffix=".mp4")
+    first.write_bytes(b"good-video")
+    current = manager.promote_file(
+        JOB_ID,
+        "encode",
+        first,
+        final_name="final.mp4",
+        media_kind="video",
+        expected_duration=2.0,
+    )
+
+    mismatched = ArtifactManager(root, probe_duration=lambda _path: 0.25)
+    second = mismatched.new_staging_file(JOB_ID, "encode", suffix=".mp4")
+    second.write_bytes(b"truncated-video")
+    with pytest.raises(ArtifactValidationError, match="duration"):
+        mismatched.promote_file(
+            JOB_ID,
+            "encode",
+            second,
+            final_name="final.mp4",
+            media_kind="video",
+            expected_duration=2.0,
+        )
+
+    recovered = ArtifactManager(root, probe_duration=lambda _path: 2.0)
+    assert recovered.artifact_path(current).read_bytes() == b"good-video"
+
+
+def test_publication_guard_prevents_a_stale_owner_from_replacing_current(tmp_path):
+    root = tmp_path / "artifacts"
+    manager = ArtifactManager(root)
+    first = manager.new_staging_file(JOB_ID, "analysis", suffix=".json")
+    first.write_text('{"owner": "current"}', encoding="utf-8")
+    current = manager.promote_file(
+        JOB_ID,
+        "analysis",
+        first,
+        final_name="analysis.json",
+        artifact_kind="json",
+    )
+    stale = manager.new_staging_file(JOB_ID, "analysis", suffix=".json")
+    stale.write_text('{"owner": "stale"}', encoding="utf-8")
+
+    with pytest.raises(asyncio.CancelledError):
+        manager.promote_file(
+            JOB_ID,
+            "analysis",
+            stale,
+            final_name="analysis.json",
+            artifact_kind="json",
+            publish_allowed=lambda: False,
+        )
+
+    assert manager.artifact_path(current).read_text(encoding="utf-8") == (
+        '{"owner": "current"}'
+    )
+    assert not list((root / JOB_ID / "journals").glob("*.journal"))

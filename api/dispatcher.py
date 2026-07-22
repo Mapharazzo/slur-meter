@@ -129,19 +129,20 @@ class JobDispatcher:
 
     def _claim_available(self) -> None:
         while not self._stopping and len(self._active) < self.concurrency:
+            runner = self.runner_factory()
             owner = f"{self._dispatcher_id}:{uuid.uuid4().hex}"
             claimed = self.store.claim_next_job(owner, lease_seconds=self.lease_seconds)
             if claimed is None:
                 return
             task = asyncio.create_task(
-                self._execute(claimed["id"], owner),
+                self._execute(claimed["id"], owner, runner),
                 name=f"pipeline-{claimed['id']}",
             )
             self._active.add(task)
             task.add_done_callback(self._runner_done)
 
-    async def _execute(self, job_id: str, owner: str) -> None:
-        runner = asyncio.create_task(self.runner_factory().run(job_id, owner))
+    async def _execute(self, job_id: str, owner: str, job_runner: JobRunner) -> None:
+        runner = asyncio.create_task(job_runner.run(job_id, owner))
         heartbeat = asyncio.create_task(self._heartbeat(job_id, owner))
         try:
             done, _ = await asyncio.wait(

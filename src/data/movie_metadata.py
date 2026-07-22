@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass, field
 from typing import Any
 
 import requests
+from PIL import Image, UnidentifiedImageError
 
 from api.errors import AttentionRequired, TransientFailure
 from api.settings import canonical_imdb_id
@@ -140,8 +142,23 @@ class MovieMetadataClient:
                 )
             except TransientFailure:
                 raise
+            response_flag = str(omdb.get("Response", "")).strip().lower()
+            if response_flag == "false":
+                error = str(omdb.get("Error", "")).strip()
+                if "not found" in error.lower():
+                    warnings.append("No OMDb awards metadata matched the movie.")
+                else:
+                    raise AttentionRequired(
+                        "OMDb rejected the metadata request.",
+                        code="metadata_request_rejected",
+                        actions=("check_metadata_configuration", "retry"),
+                    )
             awards = omdb.get("Awards")
-            if isinstance(awards, str) and awards != "N/A":
+            if (
+                response_flag != "false"
+                and isinstance(awards, str)
+                and awards != "N/A"
+            ):
                 metadata["Awards"] = awards
 
         poster_bytes = None
@@ -152,7 +169,13 @@ class MovieMetadataClient:
             if not content:
                 warnings.append("Movie poster response was empty.")
             else:
-                poster_bytes = content
+                try:
+                    with Image.open(io.BytesIO(content)) as image:
+                        image.verify()
+                except (OSError, ValueError, UnidentifiedImageError):
+                    warnings.append("Movie poster response was not a valid image.")
+                else:
+                    poster_bytes = content
         return MovieMetadataResult(
             configured=True,
             metadata=metadata,
@@ -163,7 +186,7 @@ class MovieMetadataClient:
     def _get(self, url: str, **kwargs: Any):
         try:
             response = self.session.get(url, timeout=self.timeout, **kwargs)
-        except (requests.Timeout, requests.ConnectionError) as exc:
+        except requests.RequestException as exc:
             raise TransientFailure(
                 "Movie metadata service is temporarily unavailable.",
                 code="metadata_service_transient",

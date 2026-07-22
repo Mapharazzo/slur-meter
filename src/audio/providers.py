@@ -13,7 +13,10 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -47,16 +50,47 @@ class AudioProvider(abc.ABC):
     # generate() wrapper checks the cache before calling _generate().
     cacheable: bool = False
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        *,
+        popen: Callable[..., Any] | None = None,
+        process_timeout: float = 30.0,
+    ):
+        if process_timeout <= 0:
+            raise ValueError("Audio provider process timeout must be positive")
         self.config = config or {}
         cache_dir = self.config.get("cache_dir", str(_DEFAULT_CACHE_DIR))
         self.cache_dir = Path(cache_dir)
+        self._popen = popen or subprocess.Popen
+        self._process_timeout = float(process_timeout)
 
-    def generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
+    def generate(
+        self,
+        text: str,
+        output_path: Path,
+        *,
+        cancel_requested: Any = None,
+        **kwargs: Any,
+    ) -> Path:
         """Public entry point — checks cache, then delegates to _generate()."""
+        _raise_if_cancelled(cancel_requested)
         if self.cacheable and text:
-            return self._cached_generate(text, output_path, **kwargs)
-        return self._generate(text, output_path, **kwargs)
+            result = self._cached_generate(
+                text,
+                output_path,
+                cancel_requested=cancel_requested,
+                **kwargs,
+            )
+        else:
+            result = self._generate(
+                text,
+                output_path,
+                cancel_requested=cancel_requested,
+                **kwargs,
+            )
+        _raise_if_cancelled(cancel_requested)
+        return result
 
     @abc.abstractmethod
     def _generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
@@ -75,27 +109,158 @@ class AudioProvider(abc.ABC):
             if key not in {"cache_dir", "api_key_env"}
         }
 
-    def _cached_generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
+    def _cached_generate(
+        self,
+        text: str,
+        output_path: Path,
+        *,
+        cancel_requested: Any = None,
+        **kwargs: Any,
+    ) -> Path:
         params = self._cache_params(**kwargs)
         key = _cache_key(self.name, text, **params)
         ext = output_path.suffix or ".mp3"
         cached = self.cache_dir / f"{key}{ext}"
+        metadata = cached.with_suffix(f"{cached.suffix}.json")
 
-        if cached.is_file() and cached.stat().st_size > 0:
+        if self._valid_cache_entry(
+            cached,
+            metadata,
+            cancel_requested=cancel_requested,
+        ):
+            _raise_if_cancelled(cancel_requested)
             _atomic_copy(cached, output_path)
+            _raise_if_cancelled(cancel_requested)
             return output_path
+        cached.unlink(missing_ok=True)
+        metadata.unlink(missing_ok=True)
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         staged = _partial_path(output_path)
         try:
-            self._generate(text, staged, **kwargs)
+            self._generate(
+                text,
+                staged,
+                cancel_requested=cancel_requested,
+                **kwargs,
+            )
+            _raise_if_cancelled(cancel_requested)
             if not staged.is_file() or staged.stat().st_size <= 0:
                 raise RuntimeError(f"{self.__class__.__name__} produced empty audio")
+            if not self._validate_audio(
+                staged,
+                cancel_requested=cancel_requested,
+            ):
+                raise RuntimeError(f"{self.__class__.__name__} produced invalid audio")
+            _raise_if_cancelled(cancel_requested)
             os.replace(staged, output_path)
             _atomic_copy(output_path, cached)
+            _atomic_json(
+                metadata,
+                {
+                    "sha256": _hash_file(cached),
+                    "size": cached.stat().st_size,
+                },
+            )
         finally:
             staged.unlink(missing_ok=True)
         return output_path
+
+    def _valid_cache_entry(
+        self,
+        cached: Path,
+        metadata: Path,
+        *,
+        cancel_requested: Any = None,
+    ) -> bool:
+        try:
+            if cached.is_symlink() or metadata.is_symlink():
+                return False
+            facts = json.loads(metadata.read_text(encoding="utf-8"))
+            return bool(
+                cached.is_file()
+                and cached.stat().st_size > 0
+                and facts.get("size") == cached.stat().st_size
+                and facts.get("sha256") == _hash_file(cached)
+                and self._validate_audio(
+                    cached,
+                    cancel_requested=cancel_requested,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def _validate_audio(self, path: Path, *, cancel_requested: Any = None) -> bool:
+        """Fail closed when an available ffprobe cannot validate cached audio."""
+        executable = shutil.which("ffprobe")
+        if executable is None:
+            return path.is_file() and path.stat().st_size > 0
+        try:
+            stdout = self._run_process(
+                [
+                    executable,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    str(path),
+                ],
+                cancel_requested=cancel_requested,
+                timeout=15.0,
+                capture_stdout=True,
+            )
+            return float(stdout.strip()) > 0
+        except asyncio.CancelledError:
+            raise
+        except (OSError, TypeError, ValueError, subprocess.SubprocessError):
+            return False
+
+    def _run_process(
+        self,
+        command: list[str],
+        *,
+        cancel_requested: Any = None,
+        timeout: float | None = None,
+        capture_stdout: bool = False,
+    ) -> str:
+        process = self._popen(
+            command,
+            stdout=subprocess.PIPE if capture_stdout else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        limit = self._process_timeout if timeout is None else float(timeout)
+        deadline = time.monotonic() + limit
+        while process.poll() is None:
+            if cancel_requested is not None and cancel_requested():
+                self._stop_process(process)
+                raise asyncio.CancelledError("Audio provider process was cancelled")
+            if time.monotonic() >= deadline:
+                self._stop_process(process)
+                raise subprocess.TimeoutExpired(command, limit)
+            time.sleep(0.02)
+        returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, command)
+        if capture_stdout and process.stdout is not None:
+            return str(process.stdout.read())
+        return ""
+
+    @staticmethod
+    def _stop_process(process: Any) -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=2)
 
     def __repr__(self) -> str:
         return f"<{self.__class__.__name__}>"
@@ -230,31 +395,35 @@ class SilenceProvider(AudioProvider):
     name = "silence"
 
     def _generate(self, text: str, output_path: Path, **kwargs: Any) -> Path:
-        import subprocess
-
         duration = kwargs.get("duration") or self.config.get("duration", 1.0)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(
-            [
-                "ffmpeg",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "anullsrc=r=44100:cl=stereo",
-                "-t",
-                str(duration),
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                str(output_path),
-            ],
-            check=True,
-            capture_output=True,
-            shell=False,
-        )
-        return output_path
+        partial = _partial_path(output_path)
+        try:
+            self._run_process(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=r=44100:cl=stereo",
+                    "-t",
+                    str(duration),
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    str(partial),
+                ],
+                cancel_requested=kwargs.get("cancel_requested"),
+            )
+            _raise_if_cancelled(kwargs.get("cancel_requested"))
+            if not partial.is_file() or partial.stat().st_size <= 0:
+                raise RuntimeError("SilenceProvider produced empty audio")
+            os.replace(partial, output_path)
+            return output_path
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 class LyriaProvider(AudioProvider):
@@ -319,6 +488,7 @@ class LyriaProvider(AudioProvider):
         audio_chunks: list[str] = []
 
         for line in resp.iter_lines():
+            _raise_if_cancelled(kwargs.get("cancel_requested"))
             if not line:
                 continue
             decoded = line.decode("utf-8")
@@ -392,3 +562,29 @@ def _atomic_copy(source: Path, destination: Path) -> None:
         os.replace(partial, destination)
     finally:
         partial.unlink(missing_ok=True)
+
+
+def _atomic_json(destination: Path, value: dict[str, Any]) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    partial = _partial_path(destination)
+    try:
+        with partial.open("w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(partial, destination)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _raise_if_cancelled(cancel_requested: Any) -> None:
+    if cancel_requested is not None and cancel_requested():
+        raise asyncio.CancelledError("Audio generation was cancelled")

@@ -1,5 +1,6 @@
 import asyncio
 import io
+import json
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,28 @@ class FakeProcess:
         self.terminated = False
         self.killed = False
         Path(args[-1]).write_bytes(output)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def terminate(self):
+        self.terminated = True
+        self.returncode = -15
+
+    def kill(self):
+        self.killed = True
+        self.returncode = -9
+
+
+class FakeProbeProcess:
+    def __init__(self, payload, *, returncode=0, hanging=False):
+        self.stdout = io.StringIO(json.dumps(payload))
+        self.returncode = None if hanging else returncode
+        self.terminated = False
+        self.killed = False
 
     def poll(self):
         return self.returncode
@@ -114,6 +137,165 @@ def test_failed_encode_preserves_last_validated_output_and_bounds_sanitized_stde
     assert str(tmp_path) not in captured.value.stderr_tail
     assert secret[-32:] not in captured.value.stderr_tail
     assert not list(tmp_path.glob("*.partial*.mp4"))
+
+
+def test_failed_encode_never_retains_raw_long_token_suffix(tmp_path):
+    output = tmp_path / "staged.mp4"
+    secret = "Bearer " + ("s" * 70000)
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        popen=lambda args, **_kwargs: FakeProcess(
+            args, stderr=secret, returncode=1, output=b"failed-partial"
+        ),
+        which=lambda _name: "/fake/ffmpeg",
+        stderr_limit=128,
+        sanitize=lambda text: text.replace(secret, "[TOKEN]"),
+    )
+
+    with pytest.raises(EncodingError) as captured:
+        encoder.encode(
+            _frames(tmp_path),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: False,
+        )
+
+    assert captured.value.stderr_tail == ""
+    assert "s" * 32 not in captured.value.stderr_tail
+
+
+def test_truncated_success_is_rejected_against_expected_frame_duration(tmp_path):
+    output = tmp_path / "staged.mp4"
+    output.write_bytes(b"last-good")
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        fps=10,
+        popen=lambda args, **_kwargs: FakeProcess(args, output=b"truncated"),
+        which=lambda _name: "/fake/ffmpeg",
+        probe_duration=lambda _path: 0.2,
+    )
+
+    with pytest.raises(EncodingError, match="duration"):
+        encoder.encode(
+            _frames(tmp_path, count=10),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: False,
+        )
+
+    assert output.read_bytes() == b"last-good"
+
+
+def test_configured_probe_returning_no_duration_fails_closed(tmp_path):
+    output = tmp_path / "staged.mp4"
+    output.write_bytes(b"last-good")
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        popen=lambda args, **_kwargs: FakeProcess(args, output=b"new-video"),
+        which=lambda _name: "/fake/ffmpeg",
+        probe_duration=lambda _path: None,
+    )
+
+    with pytest.raises(EncodingError, match="validation.*facts"):
+        encoder.encode(
+            _frames(tmp_path),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: False,
+        )
+
+    assert output.read_bytes() == b"last-good"
+
+
+def test_late_cancellation_after_probe_does_not_make_output_promotable(tmp_path):
+    output = tmp_path / "staged.mp4"
+    output.write_bytes(b"last-good")
+    cancelled = False
+
+    def probe(_path):
+        nonlocal cancelled
+        cancelled = True
+        return 0.1
+
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        popen=lambda args, **_kwargs: FakeProcess(args, output=b"new-video"),
+        which=lambda _name: "/fake/ffmpeg",
+        probe_duration=probe,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        encoder.encode(
+            _frames(tmp_path),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: cancelled,
+        )
+
+    assert output.read_bytes() == b"last-good"
+
+
+def test_ffprobe_frame_count_mismatch_fails_closed(tmp_path):
+    output = tmp_path / "staged.mp4"
+    output.write_bytes(b"last-good")
+    probe = FakeProbeProcess(
+        {
+            "streams": [{"duration": "0.3", "nb_read_frames": "2"}],
+            "format": {"duration": "0.3"},
+        }
+    )
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        fps=10,
+        popen=lambda args, **_kwargs: FakeProcess(args, output=b"new-video"),
+        probe_popen=lambda _args, **_kwargs: probe,
+        which=lambda name: f"/fake/{name}",
+    )
+
+    with pytest.raises(EncodingError, match="frame count"):
+        encoder.encode(
+            _frames(tmp_path, count=3),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: False,
+        )
+
+    assert output.read_bytes() == b"last-good"
+
+
+def test_hung_ffprobe_is_terminated_when_cancellation_arrives(tmp_path):
+    output = tmp_path / "staged.mp4"
+    output.write_bytes(b"last-good")
+    probe = None
+
+    def probe_popen(_args, **_kwargs):
+        nonlocal probe
+        probe = FakeProbeProcess({}, hanging=True)
+        return probe
+
+    encoder = FFmpegEncoder(
+        ffmpeg="ffmpeg",
+        popen=lambda args, **_kwargs: FakeProcess(args, output=b"new-video"),
+        probe_popen=probe_popen,
+        which=lambda name: f"/fake/{name}",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        encoder.encode(
+            _frames(tmp_path),
+            None,
+            output,
+            lambda _frame: None,
+            lambda: probe is not None,
+        )
+
+    assert probe is not None and probe.terminated
+    assert output.read_bytes() == b"last-good"
 
 
 def test_missing_ffmpeg_is_rejected_before_process_start(tmp_path):

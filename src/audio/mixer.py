@@ -9,10 +9,14 @@ Builds an ffmpeg filtergraph that:
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
+import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 from .layers import AudioLayer, AudioTimeline
 
@@ -20,27 +24,63 @@ from .layers import AudioLayer, AudioTimeline
 class AudioMixer:
     """Stateless mixer — give it a timeline, get a mixed file."""
 
-    def __init__(self, sample_rate: int = 44100):
+    def __init__(
+        self,
+        sample_rate: int = 44100,
+        *,
+        popen: Callable[..., Any] = subprocess.Popen,
+        timeout: float = 120.0,
+    ):
+        if timeout <= 0:
+            raise ValueError("Audio mixer timeout must be positive")
         self.sample_rate = sample_rate
+        self._popen = popen
+        self._timeout = float(timeout)
 
-    def mix(self, timeline: AudioTimeline, output_path: Path) -> Path:
+    def mix(
+        self,
+        timeline: AudioTimeline,
+        output_path: Path,
+        *,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Path:
         """Render *timeline* to a single audio file at *output_path*."""
+        self._raise_if_cancelled(cancel_requested)
         layers = [
             layer for layer in timeline.layers if layer.file and layer.file.exists()
         ]
         if not layers:
             # No audio layers — produce silence for the video duration
-            return self._make_silence(timeline.total_duration, output_path)
+            return self._make_silence(
+                timeline.total_duration,
+                output_path,
+                cancel_requested=cancel_requested,
+            )
 
         if len(layers) == 1:
-            return self._mix_single(layers[0], timeline.total_duration, output_path)
+            return self._mix_single(
+                layers[0],
+                timeline.total_duration,
+                output_path,
+                cancel_requested=cancel_requested,
+            )
 
-        return self._mix_multi(layers, timeline.total_duration, output_path)
+        return self._mix_multi(
+            layers,
+            timeline.total_duration,
+            output_path,
+            cancel_requested=cancel_requested,
+        )
 
     # ── Single-layer shortcut ───────────────────
 
     def _mix_single(
-        self, layer: AudioLayer, total_dur: float, output_path: Path
+        self,
+        layer: AudioLayer,
+        total_dur: float,
+        output_path: Path,
+        *,
+        cancel_requested: Callable[[], bool] | None,
     ) -> Path:
         """Optimised path when there is only one audio layer."""
         cmd = ["ffmpeg", "-y"]
@@ -60,7 +100,8 @@ class AudioMixer:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            subprocess.run(cmd, check=True, capture_output=True, shell=False)
+            self._run(cmd, cancel_requested)
+            self._raise_if_cancelled(cancel_requested)
             return self._promote(partial, output_path)
         finally:
             partial.unlink(missing_ok=True)
@@ -68,7 +109,12 @@ class AudioMixer:
     # ── Multi-layer complex mix ─────────────────
 
     def _mix_multi(
-        self, layers: list[AudioLayer], total_dur: float, output_path: Path
+        self,
+        layers: list[AudioLayer],
+        total_dur: float,
+        output_path: Path,
+        *,
+        cancel_requested: Callable[[], bool] | None,
     ) -> Path:
         cmd = ["ffmpeg", "-y"]
 
@@ -110,7 +156,8 @@ class AudioMixer:
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            subprocess.run(cmd, check=True, capture_output=True, shell=False)
+            self._run(cmd, cancel_requested)
+            self._raise_if_cancelled(cancel_requested)
             return self._promote(partial, output_path)
         finally:
             partial.unlink(missing_ok=True)
@@ -231,11 +278,17 @@ class AudioMixer:
 
     # ── Silence fallback ────────────────────────
 
-    def _make_silence(self, duration: float, output_path: Path) -> Path:
+    def _make_silence(
+        self,
+        duration: float,
+        output_path: Path,
+        *,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         partial = self._partial(output_path)
         try:
-            subprocess.run(
+            self._run(
                 [
                     "ffmpeg",
                     "-y",
@@ -251,10 +304,9 @@ class AudioMixer:
                     "128k",
                     str(partial),
                 ],
-                check=True,
-                capture_output=True,
-                shell=False,
+                cancel_requested,
             )
+            self._raise_if_cancelled(cancel_requested)
             return self._promote(partial, output_path)
         finally:
             partial.unlink(missing_ok=True)
@@ -271,3 +323,43 @@ class AudioMixer:
             raise RuntimeError("ffmpeg produced empty audio output")
         os.replace(partial, output_path)
         return output_path
+
+    def _run(
+        self,
+        command: list[str],
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        process = self._popen(
+            command,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=False,
+        )
+        deadline = time.monotonic() + self._timeout
+        while process.poll() is None:
+            if cancel_requested is not None and cancel_requested():
+                self._stop(process)
+                raise asyncio.CancelledError("Audio mixing was cancelled")
+            if time.monotonic() >= deadline:
+                self._stop(process)
+                raise subprocess.TimeoutExpired(command, self._timeout)
+            time.sleep(0.02)
+        returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, command)
+
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        if cancel_requested is not None and cancel_requested():
+            raise asyncio.CancelledError("Audio mixing was cancelled")
+
+    @staticmethod
+    def _stop(process: Any) -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=2)

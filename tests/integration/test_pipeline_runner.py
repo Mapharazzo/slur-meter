@@ -26,6 +26,7 @@ def store(tmp_path):
 class FakeServices:
     def __init__(self):
         self.calls = []
+        self.validation_job_ids = []
         self.valid = {stage: True for stage in STAGES}
         self.handlers = {}
 
@@ -36,7 +37,8 @@ class FakeServices:
             return await handler(progress)
         return StageResult(output_manifest={"stage": stage_name})
 
-    async def validate_stage(self, stage_name, output_manifest):
+    async def validate_stage(self, stage_name, expected_job_id, output_manifest):
+        self.validation_job_ids.append(expected_job_id)
         return self.valid[stage_name] and output_manifest.get("stage") == stage_name
 
     def retry_policy(self, stage_name):
@@ -62,6 +64,7 @@ async def test_runner_executes_stages_in_order_and_records_truthful_attempts(sto
 
     detail = store.get_job_detail(job["id"])
     assert services.calls == list(STAGES)
+    assert services.validation_job_ids == [job["id"]] * len(STAGES)
     assert detail["run"]["state"] == "completed"
     assert [stage["state"] for stage in detail["stages"]] == ["completed"] * 3
     assert [attempt["outcome"] for attempt in detail["attempts"]] == ["completed"] * 3
@@ -218,7 +221,7 @@ async def test_completed_artifact_validation_exception_becomes_durable_attention
         lease_owner="test-owner",
     )
 
-    async def explode(stage_name, manifest):
+    async def explode(stage_name, expected_job_id, manifest):
         raise ValueError("invalid cached artifact")
 
     services.validate_stage = explode
@@ -228,6 +231,8 @@ async def test_completed_artifact_validation_exception_becomes_durable_attention
 
     detail = store.get_job_detail(job["id"])
     assert detail["run"]["state"] == "needs_attention"
+    assert detail["stages"][0]["state"] == "queued"
+    assert detail["stages"][0]["output_manifest"] == {}
     assert any(event["type"] == "artifact_validation_failed" for event in detail["events"])
 
 
@@ -308,7 +313,7 @@ async def test_completed_validation_event_and_attention_roll_back_together(store
     original_insert_event = store._insert_event
 
     def fail_on_job_event(connection, job_id, **fields):
-        if fields.get("event_type") == "job_state_changed":
+        if fields.get("event_type") == "artifact_validation_failed":
             raise RuntimeError("injected event failure")
         return original_insert_event(connection, job_id, **fields)
 

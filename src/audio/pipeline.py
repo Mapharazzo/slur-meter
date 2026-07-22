@@ -9,8 +9,10 @@ Usage in the render pipeline:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,13 +31,19 @@ class AudioPipeline:
         audio_dir: Path,
         segment_timing: dict[str, dict],
         warning_callback: Callable[[str], None] | None = None,
+        probe_popen: Callable[..., Any] = subprocess.Popen,
+        probe_timeout: float = 15.0,
     ):
+        if probe_timeout <= 0:
+            raise ValueError("Audio probe timeout must be positive")
         self.config = config
         self.audio_dir = Path(audio_dir)
         self.audio_dir.mkdir(parents=True, exist_ok=True)
         self.timing = segment_timing
         self.audio_cfg = config.get("audio", {})
         self.warning_callback = warning_callback
+        self._probe_popen = probe_popen
+        self._probe_timeout = float(probe_timeout)
         self.fps = config.get("video", {}).get("fps", 30)
 
         total_frames = (
@@ -238,41 +246,36 @@ class AudioPipeline:
     # ─────────────────────────────────────────────
 
     def generate_all(
-        self, progress_cb: Callable[[int, int], None] | None = None
+        self,
+        progress_cb: Callable[[int, int], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
     ) -> None:
         """Run each layer's provider to produce its audio file."""
         total = len(self.timeline.layers)
         for index, layer in enumerate(self.timeline.layers, 1):
+            self._raise_if_cancelled(cancel_requested)
             output_file = self.audio_dir / f"{layer.name}.mp3"
             provider = get_provider(layer.provider_name, layer.provider_kwargs)
             provider.generate(
                 text=layer.text,
                 output_path=output_file,
+                cancel_requested=cancel_requested,
                 **layer.provider_kwargs,
             )
+            self._raise_if_cancelled(cancel_requested)
             layer.file = output_file
 
             # For TTS layers that duck others, set end from actual audio duration
             # so the duck window matches the real voiceover length.
             if layer.duck_others and layer.end is None and output_file.exists():
                 try:
-                    result = subprocess.run(
-                        [
-                            "ffprobe",
-                            "-v",
-                            "quiet",
-                            "-print_format",
-                            "json",
-                            "-show_streams",
-                            str(output_file),
-                        ],
-                        capture_output=True,
-                        text=True,
-                        check=True,
-                        shell=False,
+                    dur = self._probe_layer_duration(
+                        output_file,
+                        cancel_requested=cancel_requested,
                     )
-                    dur = float(json.loads(result.stdout)["streams"][0]["duration"])
                     layer.end = layer.start + dur
+                except asyncio.CancelledError:
+                    raise
                 except (
                     OSError,
                     KeyError,
@@ -293,11 +296,72 @@ class AudioPipeline:
     #  Mix down to final audio track
     # ─────────────────────────────────────────────
 
-    def mix(self, output_path: Path) -> Path:
+    def mix(
+        self,
+        output_path: Path,
+        cancel_requested: Callable[[], bool] | None = None,
+    ) -> Path:
         """Combine all generated layers into one audio file."""
         mixer = AudioMixer()
-        return mixer.mix(self.timeline, output_path)
+        return mixer.mix(
+            self.timeline,
+            output_path,
+            cancel_requested=cancel_requested,
+        )
 
     def _warn(self, message: str) -> None:
         if self.warning_callback is not None:
             self.warning_callback(message)
+
+    def _probe_layer_duration(
+        self,
+        path: Path,
+        *,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> float:
+        process = self._probe_popen(
+            [
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_streams",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            shell=False,
+        )
+        deadline = time.monotonic() + self._probe_timeout
+        while process.poll() is None:
+            if cancel_requested is not None and cancel_requested():
+                self._stop(process)
+                raise asyncio.CancelledError("Audio probing was cancelled")
+            if time.monotonic() >= deadline:
+                self._stop(process)
+                raise subprocess.TimeoutExpired(["ffprobe"], self._probe_timeout)
+            time.sleep(0.02)
+        returncode = process.wait()
+        if returncode != 0:
+            raise subprocess.CalledProcessError(returncode, ["ffprobe"])
+        return float(json.loads(process.stdout.read())["streams"][0]["duration"])
+
+    @staticmethod
+    def _raise_if_cancelled(
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
+        if cancel_requested is not None and cancel_requested():
+            raise asyncio.CancelledError("Audio generation was cancelled")
+
+    @staticmethod
+    def _stop(process: Any) -> None:
+        try:
+            process.terminate()
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+            process.wait(timeout=2)

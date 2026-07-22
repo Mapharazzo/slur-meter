@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import queue
 import re
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -37,6 +39,8 @@ class FFmpegEncoder:
         preset: str = "medium",
         stderr_limit: int = 8192,
         popen: Callable[..., Any] = subprocess.Popen,
+        probe_popen: Callable[..., Any] = subprocess.Popen,
+        probe_timeout: float = 15.0,
         which: Callable[[str], str | None] = shutil.which,
         probe_duration: Callable[[Path], float | None] | None = None,
         sanitize: Callable[[str], str] | None = None,
@@ -45,12 +49,16 @@ class FFmpegEncoder:
             raise ValueError("Encoder FPS must be positive")
         if stderr_limit < 1:
             raise ValueError("stderr limit must be positive")
+        if probe_timeout <= 0:
+            raise ValueError("Probe timeout must be positive")
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
         self.fps = int(fps)
         self.preset = str(preset)
         self.stderr_limit = int(stderr_limit)
         self._popen = popen
+        self._probe_popen = probe_popen
+        self._probe_timeout = float(probe_timeout)
         self._which = which
         self._probe_duration = probe_duration
         self._sanitize = sanitize or (lambda text: text)
@@ -114,10 +122,6 @@ class FFmpegEncoder:
             shell=False,
         )
         stdout_queue: queue.Queue[str | None] = queue.Queue()
-        # Keep a bounded raw window large enough for redaction patterns to retain
-        # their identifying prefix. The public diagnostic is sanitized first and
-        # only then truncated to ``stderr_limit``.
-        stderr_tail = _BoundedTail(max(64 * 1024, self.stderr_limit * 16))
         stdout_thread = threading.Thread(
             target=_read_lines,
             args=(process.stdout, stdout_queue),
@@ -125,8 +129,8 @@ class FFmpegEncoder:
             daemon=True,
         )
         stderr_thread = threading.Thread(
-            target=_read_tail,
-            args=(process.stderr, stderr_tail),
+            target=_drain_stream,
+            args=(process.stderr,),
             name="ffmpeg-stderr-reader",
             daemon=True,
         )
@@ -161,13 +165,20 @@ class FFmpegEncoder:
             stderr_thread.join(timeout=1)
             if cancelled:
                 raise asyncio.CancelledError("Encoding was cancelled")
-            safe_tail = self._safe_tail(stderr_tail.value)
             if returncode != 0:
                 raise EncodingError(
                     f"ffmpeg exited with status {returncode}",
-                    stderr_tail=safe_tail,
+                    stderr_tail="",
                 )
-            self._validate_output(partial)
+            if cancel_requested is not None and cancel_requested():
+                raise asyncio.CancelledError("Encoding was cancelled")
+            self._validate_output(
+                partial,
+                expected_frames=total_frames,
+                cancel_requested=cancel_requested,
+            )
+            if cancel_requested is not None and cancel_requested():
+                raise asyncio.CancelledError("Encoding was cancelled")
             os.replace(partial, output_path)
             return output_path
         except BaseException:
@@ -199,10 +210,18 @@ class FFmpegEncoder:
             raise EncodingError("Frame sequence must use sequential generated names")
         return str(paths[0].parent / "%05d.png"), len(paths)
 
-    def _validate_output(self, path: Path) -> None:
+    def _validate_output(
+        self,
+        path: Path,
+        *,
+        expected_frames: int,
+        cancel_requested: Callable[[], bool] | None,
+    ) -> None:
         if not path.is_file() or path.stat().st_size <= 0:
             raise EncodingError("ffmpeg produced an empty output")
+        expected_duration = expected_frames / self.fps
         duration: float | None = None
+        frame_count: int | None = None
         if self._probe_duration is not None:
             try:
                 value = self._probe_duration(path)
@@ -211,36 +230,73 @@ class FFmpegEncoder:
                 raise EncodingError(
                     f"Encoded output validation failed ({type(exc).__name__})"
                 ) from exc
+            if duration is None:
+                raise EncodingError("Encoded output validation returned no media facts")
         else:
             probe = self._which(self.ffprobe)
             if probe is not None:
                 try:
-                    result = subprocess.run(
+                    process = self._probe_popen(
                         [
                             probe,
                             "-v",
                             "error",
+                            "-count_frames",
+                            "-select_streams",
+                            "v:0",
                             "-show_entries",
-                            "format=duration",
+                            "stream=duration,nb_read_frames:format=duration",
                             "-of",
-                            "default=noprint_wrappers=1:nokey=1",
+                            "json",
                             str(path),
                         ],
-                        check=True,
-                        capture_output=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
                         text=True,
+                        encoding="utf-8",
+                        errors="replace",
                         shell=False,
                     )
-                    duration = float(result.stdout.strip())
-                except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                    deadline = time.monotonic() + self._probe_timeout
+                    while process.poll() is None:
+                        if cancel_requested is not None and cancel_requested():
+                            self._stop(process)
+                            raise asyncio.CancelledError("Encoding was cancelled")
+                        if time.monotonic() >= deadline:
+                            self._stop(process)
+                            raise EncodingError("Encoded output validation timed out")
+                        time.sleep(0.02)
+                    if cancel_requested is not None and cancel_requested():
+                        raise asyncio.CancelledError("Encoding was cancelled")
+                    if process.wait() != 0:
+                        raise EncodingError("Encoded output validation failed")
+                    payload = json.loads(process.stdout.read())
+                    streams = payload.get("streams") or []
+                    stream = streams[0] if streams else {}
+                    raw_duration = stream.get("duration") or (
+                        payload.get("format") or {}
+                    ).get("duration")
+                    if raw_duration not in (None, "N/A"):
+                        duration = float(raw_duration)
+                    raw_frames = stream.get("nb_read_frames")
+                    if raw_frames not in (None, "N/A"):
+                        frame_count = int(raw_frames)
+                    if duration is None and frame_count is None:
+                        raise EncodingError("Encoded output validation returned no media facts")
+                except asyncio.CancelledError:
+                    raise
+                except EncodingError:
+                    raise
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
                     raise EncodingError(
                         f"Encoded output validation failed ({type(exc).__name__})"
                     ) from exc
+        if frame_count is not None and frame_count != expected_frames:
+            raise EncodingError("Encoded output frame count does not match its input")
         if duration is not None and duration <= 0:
             raise EncodingError("Encoded output has no positive duration")
-
-    def _safe_tail(self, value: str) -> str:
-        return self._sanitize(value)[-self.stderr_limit :]
+        if duration is not None and abs(duration - expected_duration) > (1 / self.fps):
+            raise EncodingError("Encoded output duration does not match its frame count")
 
     @staticmethod
     def _stop(process: Any) -> None:
@@ -252,17 +308,6 @@ class FFmpegEncoder:
             process.wait(timeout=2)
 
 
-class _BoundedTail:
-    def __init__(self, limit: int) -> None:
-        self.limit = limit
-        self.value = ""
-        self._lock = threading.Lock()
-
-    def append(self, chunk: str) -> None:
-        with self._lock:
-            self.value = (self.value + chunk)[-self.limit :]
-
-
 def _read_lines(stream: Any, destination: queue.Queue[str | None]) -> None:
     try:
         if stream is not None:
@@ -272,11 +317,10 @@ def _read_lines(stream: Any, destination: queue.Queue[str | None]) -> None:
         destination.put(None)
 
 
-def _read_tail(stream: Any, destination: _BoundedTail) -> None:
+def _drain_stream(stream: Any) -> None:
     if stream is None:
         return
     while True:
         chunk = stream.read(4096)
         if not chunk:
             return
-        destination.append(chunk)

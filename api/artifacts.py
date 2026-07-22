@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from PIL import Image
 
-from api.settings import confined_path, validate_job_id
+from api.settings import validate_job_id
 
 MANIFEST_VERSION = 1
 _STAGE_RE = re.compile(r"[a-z][a-z0-9_.-]{0,79}\Z")
@@ -35,20 +39,69 @@ class ArtifactManager:
         manifest_version: int = MANIFEST_VERSION,
         probe_duration: Callable[[Path], float | None] | None = None,
         warning_callback: Callable[[str], None] | None = None,
+        promotion_checkpoint: Callable[[str], None] | None = None,
     ) -> None:
         self.root = Path(root).resolve()
         self.manifest_version = int(manifest_version)
         self._probe_duration = probe_duration
         self._warning_callback = warning_callback
+        self._promotion_checkpoint = promotion_checkpoint
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.recover()
 
     def path(self, job_id: str, *parts: str | Path) -> Path:
         """Return a confined generated run path."""
         validated = validate_job_id(job_id)
-        return confined_path(self.root, validated, *parts)
+        candidate = self.root / validated
+        for value in parts:
+            part = Path(value)
+            if part.is_absolute() or any(item in {"", ".", ".."} for item in part.parts):
+                raise ValueError("Generated path component escapes its run")
+            candidate = candidate.joinpath(*part.parts)
+        candidate = Path(os.path.abspath(candidate))
+        self._require_in_run(validated, candidate)
+        return candidate
 
     def manifest_path(self, job_id: str, stage: str) -> Path:
         stage = self._stage(stage)
-        return self.path(job_id, "manifests", f"{stage}.json")
+        pointer = self._read_pointer(job_id, stage)
+        path = Path(self.root, str(pointer["manifest_path"]))
+        self._require_in_run(job_id, path)
+        if self.hash_file(path) != pointer.get("manifest_sha256"):
+            raise ArtifactValidationError("Current artifact manifest hash does not match")
+        return path
+
+    def recover(self, job_id: str | None = None) -> None:
+        """Resolve interrupted publications without changing a valid current pointer."""
+        if job_id is None:
+            runs = []
+            for entry in os.scandir(self.root):
+                if entry.is_symlink():
+                    raise ArtifactValidationError("Generated run root contains a symlink")
+                if entry.is_dir(follow_symlinks=False) and entry.name.startswith("job_"):
+                    try:
+                        runs.append(validate_job_id(entry.name))
+                    except ValueError:
+                        continue
+        else:
+            runs = [validate_job_id(job_id)]
+        for run_id in runs:
+            run = self.root / run_id
+            if not run.exists():
+                continue
+            self._reject_symlink_components(run, self.root)
+            journals = run / "journals"
+            if journals.is_dir():
+                for journal in list(journals.glob("*.journal")):
+                    self._recover_journal(run_id, journal)
+            for parent_name in (".staging", "current", "versions"):
+                parent = run / parent_name
+                if not parent.exists():
+                    continue
+                self._reject_symlink_tree(parent)
+                for partial in sorted(parent.rglob("*"), reverse=True):
+                    if ".partial" in partial.name:
+                        self._remove_path(partial)
 
     @staticmethod
     def fingerprint(value: Any) -> str:
@@ -97,6 +150,7 @@ class ArtifactManager:
         input_hashes: Mapping[str, str] | None = None,
         config_hash: str = "",
         details: Mapping[str, Any] | None = None,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         staged = self.new_staging_file(job_id, stage, suffix=".json")
         try:
@@ -113,6 +167,7 @@ class ArtifactManager:
                 input_hashes=input_hashes,
                 config_hash=config_hash,
                 details=details,
+                publish_allowed=publish_allowed,
             )
         finally:
             staged.unlink(missing_ok=True)
@@ -126,44 +181,37 @@ class ArtifactManager:
         final_name: str,
         media_kind: str | None = None,
         artifact_kind: str | None = None,
+        expected_duration: float | None = None,
         input_hashes: Mapping[str, str] | None = None,
         config_hash: str = "",
         details: Mapping[str, Any] | None = None,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Validate and atomically replace one file plus its manifest."""
+        """Validate a file and publish one immutable version bundle."""
         stage = self._stage(stage)
         staged = self._confined_staging(job_id, staged_path)
         kind = media_kind or artifact_kind or "file"
         try:
-            artifact = self._inspect_file(staged, kind)
+            artifact = self._inspect_file(
+                staged,
+                kind,
+                expected_duration=expected_duration,
+            )
         except BaseException:
             staged.unlink(missing_ok=True)
             raise
-        target = self.path(job_id, stage, final_name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        backup = self._backup_path(target)
-        had_target = target.exists()
-        if had_target:
-            os.replace(target, backup)
-        try:
-            os.replace(staged, target)
-            artifact["path"] = self._relative(target)
-            manifest = self._manifest(
-                job_id,
-                stage,
-                artifact,
-                input_hashes=input_hashes,
-                config_hash=config_hash,
-                details=details,
-            )
-            self._write_manifest(job_id, stage, manifest)
-        except BaseException:
-            target.unlink(missing_ok=True)
-            if had_target and backup.exists():
-                os.replace(backup, target)
-            raise
-        backup.unlink(missing_ok=True)
-        return manifest
+        return self._publish(
+            job_id,
+            stage,
+            staged,
+            artifact,
+            logical_name=final_name,
+            is_directory=False,
+            input_hashes=input_hashes,
+            config_hash=config_hash,
+            details=details,
+            publish_allowed=publish_allowed,
+        )
 
     def record_file(
         self,
@@ -173,26 +221,31 @@ class ArtifactManager:
         *,
         media_kind: str | None = None,
         artifact_kind: str | None = None,
+        expected_duration: float | None = None,
         input_hashes: Mapping[str, str] | None = None,
         config_hash: str = "",
         details: Mapping[str, Any] | None = None,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Write a manifest for an already atomically produced confined file."""
+        """Copy a confined file to staging and publish it as a new version."""
         stage = self._stage(stage)
-        candidate = Path(path).resolve()
+        candidate = Path(os.path.abspath(path))
         self._require_in_run(job_id, candidate)
-        artifact = self._inspect_file(candidate, media_kind or artifact_kind or "file")
-        artifact["path"] = self._relative(candidate)
-        manifest = self._manifest(
+        staged = self.new_staging_file(job_id, stage, suffix=candidate.suffix)
+        shutil.copy2(candidate, staged)
+        return self.promote_file(
             job_id,
             stage,
-            artifact,
+            staged,
+            final_name=candidate.name,
+            media_kind=media_kind,
+            artifact_kind=artifact_kind,
+            expected_duration=expected_duration,
             input_hashes=input_hashes,
             config_hash=config_hash,
             details=details,
+            publish_allowed=publish_allowed,
         )
-        self._write_manifest(job_id, stage, manifest)
-        return manifest
 
     def promote_frame_directory(
         self,
@@ -208,8 +261,9 @@ class ArtifactManager:
         input_hashes: Mapping[str, str] | None = None,
         config_hash: str = "",
         details: Mapping[str, Any] | None = None,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Promote a newly rendered exact PNG sequence, removing any stale tail."""
+        """Publish a newly rendered exact PNG sequence as an immutable version."""
         stage = self._stage(stage)
         staged = self._confined_staging(job_id, staged_directory)
         try:
@@ -224,33 +278,18 @@ class ArtifactManager:
             if staged.exists():
                 shutil.rmtree(staged)
             raise
-        target = self.path(job_id, stage, final_name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        backup = self._backup_path(target)
-        had_target = target.exists()
-        if had_target:
-            os.replace(target, backup)
-        try:
-            os.replace(staged, target)
-            artifact["path"] = self._relative(target)
-            manifest = self._manifest(
-                job_id,
-                stage,
-                artifact,
-                input_hashes=input_hashes,
-                config_hash=config_hash,
-                details=details,
-            )
-            self._write_manifest(job_id, stage, manifest)
-        except BaseException:
-            if target.exists():
-                shutil.rmtree(target)
-            if had_target and backup.exists():
-                os.replace(backup, target)
-            raise
-        if backup.exists():
-            shutil.rmtree(backup)
-        return manifest
+        return self._publish(
+            job_id,
+            stage,
+            staged,
+            artifact,
+            logical_name=final_name,
+            is_directory=True,
+            input_hashes=input_hashes,
+            config_hash=config_hash,
+            details=details,
+            publish_allowed=publish_allowed,
+        )
 
     def verify_frame_directory(
         self,
@@ -280,8 +319,9 @@ class ArtifactManager:
         input_hashes: Mapping[str, str] | None = None,
         config_hash: str = "",
         details: Mapping[str, Any] | None = None,
+        publish_allowed: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
-        """Atomically replace a validated generic directory tree."""
+        """Publish a validated generic directory tree as an immutable version."""
         stage = self._stage(stage)
         staged = self._confined_staging(job_id, staged_directory)
         try:
@@ -290,33 +330,18 @@ class ArtifactManager:
             if staged.exists():
                 shutil.rmtree(staged)
             raise
-        target = self.path(job_id, stage, final_name)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        backup = self._backup_path(target)
-        had_target = target.exists()
-        if had_target:
-            os.replace(target, backup)
-        try:
-            os.replace(staged, target)
-            artifact["path"] = self._relative(target)
-            manifest = self._manifest(
-                job_id,
-                stage,
-                artifact,
-                input_hashes=input_hashes,
-                config_hash=config_hash,
-                details=details,
-            )
-            self._write_manifest(job_id, stage, manifest)
-        except BaseException:
-            if target.exists():
-                shutil.rmtree(target)
-            if had_target and backup.exists():
-                os.replace(backup, target)
-            raise
-        if backup.exists():
-            shutil.rmtree(backup)
-        return manifest
+        return self._publish(
+            job_id,
+            stage,
+            staged,
+            artifact,
+            logical_name=final_name,
+            is_directory=True,
+            input_hashes=input_hashes,
+            config_hash=config_hash,
+            details=details,
+            publish_allowed=publish_allowed,
+        )
 
     def validate(
         self,
@@ -330,7 +355,39 @@ class ArtifactManager:
             if int(manifest.get("manifest_version", -1)) != self.manifest_version:
                 return False
             job_id = validate_job_id(manifest.get("job_id"))
-            self._stage(str(manifest.get("stage", "")))
+            stage = self._stage(str(manifest.get("stage", "")))
+            details = manifest.get("details")
+            embedded = bool(
+                isinstance(details, Mapping)
+                and details.get("parent_stage") == "composite"
+                and stage.startswith("composite.")
+            )
+            pointer_stage = "composite" if embedded else stage
+            current_path = self.manifest_path(job_id, pointer_stage)
+            current = json.loads(current_path.read_text(encoding="utf-8"))
+            if embedded:
+                if not self.validate(current):
+                    return False
+                if (
+                    current.get("version") != manifest.get("version")
+                    or details.get("parent_version") != current.get("version")
+                ):
+                    return False
+                parent_artifact = current.get("artifact")
+                child_artifact = manifest.get("artifact")
+                if not isinstance(parent_artifact, Mapping) or not isinstance(
+                    child_artifact, Mapping
+                ):
+                    return False
+                child_path = Path(str(child_artifact.get("path", "")))
+                parent_path = Path(str(parent_artifact.get("path", "")))
+                if child_path == parent_path:
+                    return False
+                child_path.relative_to(parent_path)
+            elif current != dict(manifest):
+                return False
+            if not isinstance(manifest.get("version"), str):
+                return False
             if input_hashes is not None and dict(
                 manifest.get("input_hashes", {})
             ) != dict(input_hashes):
@@ -340,7 +397,7 @@ class ArtifactManager:
             artifact = manifest.get("artifact")
             if not isinstance(artifact, Mapping):
                 return False
-            path = (self.root / str(artifact["path"])).resolve()
+            path = Path(self.root, str(artifact["path"]))
             self._require_in_run(job_id, path)
             kind = artifact.get("kind")
             if kind == "frames":
@@ -357,7 +414,16 @@ class ArtifactManager:
                 return actual["sha256"] == artifact.get("sha256") and actual[
                     "files"
                 ] == artifact.get("files")
-            actual = self._inspect_file(path, str(kind or "file"))
+            expected_duration = artifact.get("expected_duration")
+            actual = self._inspect_file(
+                path,
+                str(kind or "file"),
+                expected_duration=(
+                    float(expected_duration)
+                    if expected_duration is not None
+                    else None
+                ),
+            )
             if actual["size"] != artifact.get("size"):
                 return False
             if actual["sha256"] != artifact.get("sha256"):
@@ -369,14 +435,14 @@ class ArtifactManager:
             return False
 
     def load_json(self, manifest: Mapping[str, Any]) -> Any:
-        artifact = manifest.get("artifact") or {}
-        path = (self.root / str(artifact["path"])).resolve()
-        self._require_in_run(str(manifest.get("job_id")), path)
+        path = self.artifact_path(manifest)
         return json.loads(path.read_text(encoding="utf-8"))
 
     def artifact_path(self, manifest: Mapping[str, Any]) -> Path:
+        if not self.validate(manifest):
+            raise ArtifactValidationError("Artifact manifest is not the current version")
         artifact = manifest.get("artifact") or {}
-        path = (self.root / str(artifact["path"])).resolve()
+        path = Path(self.root, str(artifact["path"]))
         self._require_in_run(str(manifest.get("job_id")), path)
         return path
 
@@ -389,9 +455,11 @@ class ArtifactManager:
         input_hashes: Mapping[str, str] | None,
         config_hash: str,
         details: Mapping[str, Any] | None,
+        version: str,
     ) -> dict[str, Any]:
         return {
             "manifest_version": self.manifest_version,
+            "version": version,
             "job_id": validate_job_id(job_id),
             "stage": stage,
             "input_hashes": dict(sorted((input_hashes or {}).items())),
@@ -400,25 +468,119 @@ class ArtifactManager:
             "details": dict(details or {}),
         }
 
-    def _write_manifest(
-        self, job_id: str, stage: str, manifest: Mapping[str, Any]
-    ) -> None:
-        path = self.manifest_path(job_id, stage)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
-        try:
-            with partial.open("w", encoding="utf-8") as stream:
-                json.dump(
-                    manifest, stream, sort_keys=True, indent=2, default=_json_default
-                )
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(partial, path)
-        finally:
-            partial.unlink(missing_ok=True)
+    def _publish(
+        self,
+        job_id: str,
+        stage: str,
+        staged: Path,
+        artifact: dict[str, Any],
+        *,
+        logical_name: str,
+        is_directory: bool,
+        input_hashes: Mapping[str, str] | None,
+        config_hash: str,
+        details: Mapping[str, Any] | None,
+        publish_allowed: Callable[[], bool] | None,
+    ) -> dict[str, Any]:
+        if Path(logical_name).name != logical_name or not logical_name:
+            raise ValueError("Artifact logical name must be a simple generated name")
+        version = uuid.uuid4().hex
+        versions = self.path(job_id, "versions", stage)
+        versions.mkdir(parents=True, exist_ok=True)
+        bundle_partial = versions / f".{version}.partial"
+        bundle = versions / version
+        bundle_partial.mkdir()
+        suffix = "" if is_directory else Path(logical_name).suffix
+        artifact_name = "artifact" if is_directory else f"artifact{suffix}"
+        partial_artifact = bundle_partial / artifact_name
+        final_artifact = bundle / artifact_name
+        os.replace(staged, partial_artifact)
+        artifact["path"] = self._relative(final_artifact)
+        merged_details = {"logical_name": logical_name, **dict(details or {})}
+        manifest = self._manifest(
+            job_id,
+            stage,
+            artifact,
+            input_hashes=input_hashes,
+            config_hash=config_hash,
+            details=merged_details,
+            version=version,
+        )
+        manifest_partial = bundle_partial / "manifest.json"
+        self._write_json_file(manifest_partial, manifest)
+        journal = self.path(job_id, "journals", f"{stage}.journal")
+        previous = self._pointer_or_none(job_id, stage)
+        self._write_json_file(
+            journal,
+            {
+                "job_id": job_id,
+                "stage": stage,
+                "new_version": version,
+                "previous_version": previous.get("version") if previous else None,
+            },
+        )
+        self._checkpoint("journal_written")
+        os.replace(bundle_partial, bundle)
+        self._fsync_directory(versions)
+        self._checkpoint("bundle_installed")
+        final_manifest = bundle / "manifest.json"
+        pointer = {
+            "manifest_version": self.manifest_version,
+            "job_id": job_id,
+            "stage": stage,
+            "version": version,
+            "manifest_path": self._relative(final_manifest),
+            "manifest_sha256": self.hash_file(final_manifest),
+        }
+        with self._publication_lock(job_id, stage):
+            try:
+                if publish_allowed is not None and not publish_allowed():
+                    raise asyncio.CancelledError(
+                        "Artifact publication lease is no longer owned"
+                    )
+            except asyncio.CancelledError:
+                self._remove_path(bundle)
+                journal.unlink(missing_ok=True)
+                self._fsync_directory(versions)
+                self._fsync_directory(journal.parent)
+                raise
+            self._write_json_file(self._pointer_path(job_id, stage), pointer)
+        self._checkpoint("pointer_replaced")
+        journal.unlink(missing_ok=True)
+        self._fsync_directory(journal.parent)
+        return manifest
 
-    def _inspect_file(self, path: Path, kind: str) -> dict[str, Any]:
-        if not path.is_file():
+    @contextmanager
+    def _publication_lock(self, job_id: str, stage: str):
+        directory = self.path(job_id, ".locks")
+        directory.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path(job_id, ".locks", f"{self._stage(stage)}.lock")
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
+
+    def _inspect_file(
+        self,
+        path: Path,
+        kind: str,
+        *,
+        expected_duration: float | None = None,
+    ) -> dict[str, Any]:
+        self._reject_symlink_components(path, self.root)
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError as exc:
+            raise ArtifactValidationError("Artifact file is missing") from exc
+        if stat.S_ISLNK(mode):
+            raise ArtifactValidationError("Artifact file is a symlink")
+        if not stat.S_ISREG(mode):
             raise ArtifactValidationError("Artifact file is missing")
         size = path.stat().st_size
         if size <= 0:
@@ -437,6 +599,24 @@ class ArtifactManager:
                         f"{kind.capitalize()} artifact has no positive duration"
                     )
                 artifact["duration"] = duration
+            if expected_duration is not None:
+                expected = float(expected_duration)
+                if expected <= 0:
+                    raise ArtifactValidationError("Expected media duration must be positive")
+                if duration is None:
+                    raise ArtifactValidationError(
+                        f"{kind.capitalize()} duration could not be validated"
+                    )
+                tolerance = max(0.02, expected * 0.01)
+                if abs(duration - expected) > tolerance:
+                    raise ArtifactValidationError(
+                        f"{kind.capitalize()} duration does not match expected duration"
+                    )
+                artifact["expected_duration"] = expected
+        elif expected_duration is not None:
+            raise ArtifactValidationError(
+                "Expected duration is only valid for media artifacts"
+            )
         return artifact
 
     def _inspect_frames(
@@ -450,12 +630,13 @@ class ArtifactManager:
     ) -> dict[str, Any]:
         if expected_count < 1:
             raise ArtifactValidationError("A frame sequence must not be empty")
+        self._reject_symlink_tree(directory)
         if not directory.is_dir():
             raise ArtifactValidationError("Frame directory is missing")
         expected = [
             f"{prefix}{index:0{digits}d}.png" for index in range(expected_count)
         ]
-        actual = sorted(path.name for path in directory.glob("*.png"))
+        actual = sorted(path.name for path in directory.iterdir())
         if actual != expected:
             raise ArtifactValidationError(
                 "Frame sequence is missing frames or contains stale extra frames"
@@ -487,9 +668,25 @@ class ArtifactManager:
         }
 
     def _inspect_directory(self, directory: Path) -> dict[str, Any]:
+        self._reject_symlink_tree(directory)
         if not directory.is_dir():
             raise ArtifactValidationError("Artifact directory is missing")
-        paths = sorted(path for path in directory.rglob("*") if path.is_file())
+        paths: list[Path] = []
+        for current, directories, filenames in os.walk(directory, followlinks=False):
+            current_path = Path(current)
+            for name in directories:
+                child = current_path / name
+                if stat.S_ISLNK(child.lstat().st_mode):
+                    raise ArtifactValidationError("Artifact directory contains a symlink")
+            for name in filenames:
+                child = current_path / name
+                mode = child.lstat().st_mode
+                if stat.S_ISLNK(mode):
+                    raise ArtifactValidationError("Artifact directory contains a symlink")
+                if not stat.S_ISREG(mode):
+                    raise ArtifactValidationError("Artifact directory contains a non-file")
+                paths.append(child)
+        paths.sort()
         if not paths:
             raise ArtifactValidationError("Artifact directory is empty")
         digest = hashlib.sha256()
@@ -537,21 +734,23 @@ class ArtifactManager:
                 check=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=False,
+                timeout=15,
             )
             return float(result.stdout.strip())
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            self._warn(
-                f"ffprobe could not validate {kind} artifact ({type(exc).__name__})."
-            )
-            return None
+            raise ArtifactValidationError(
+                f"Media probe failed for {kind} artifact ({type(exc).__name__})"
+            ) from exc
 
     def _warn(self, message: str) -> None:
         if self._warning_callback is not None:
             self._warning_callback(message)
 
     def _confined_staging(self, job_id: str, path: str | Path) -> Path:
-        candidate = Path(path).resolve()
+        candidate = Path(os.path.abspath(path))
         self._require_in_run(job_id, candidate)
         staging_root = self.path(job_id, ".staging")
         try:
@@ -563,18 +762,127 @@ class ArtifactManager:
         return candidate
 
     def _require_in_run(self, job_id: str, path: Path) -> None:
-        run = self.path(validate_job_id(job_id))
+        run = Path(os.path.abspath(self.root / validate_job_id(job_id)))
+        candidate = Path(os.path.abspath(path))
         try:
-            path.resolve().relative_to(run)
+            candidate.relative_to(run)
         except ValueError as exc:
             raise ValueError("Artifact path escapes its generated run") from exc
+        self._reject_symlink_components(candidate, self.root)
 
     def _relative(self, path: Path) -> str:
-        return path.resolve().relative_to(self.root).as_posix()
+        candidate = Path(os.path.abspath(path))
+        self._reject_symlink_components(candidate, self.root)
+        return candidate.relative_to(self.root).as_posix()
+
+    def _pointer_path(self, job_id: str, stage: str) -> Path:
+        return self.path(job_id, "current", f"{self._stage(stage)}.json")
+
+    def _pointer_or_none(self, job_id: str, stage: str) -> dict[str, Any] | None:
+        try:
+            return self._read_pointer(job_id, stage)
+        except FileNotFoundError:
+            return None
+
+    def _read_pointer(self, job_id: str, stage: str) -> dict[str, Any]:
+        path = self._pointer_path(job_id, stage)
+        self._reject_symlink_components(path, self.root)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or value.get("manifest_version") != self.manifest_version
+            or value.get("job_id") != validate_job_id(job_id)
+            or value.get("stage") != self._stage(stage)
+            or not isinstance(value.get("version"), str)
+        ):
+            raise ArtifactValidationError("Current artifact pointer is invalid")
+        return value
+
+    def _recover_journal(self, job_id: str, journal: Path) -> None:
+        self._reject_symlink_components(journal, self.root)
+        try:
+            value = json.loads(journal.read_text(encoding="utf-8"))
+            stage = self._stage(str(value["stage"]))
+            version = str(value["new_version"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            journal.unlink(missing_ok=True)
+            return
+        pointer = self._pointer_or_none(job_id, stage)
+        if pointer is None or pointer.get("version") != version:
+            self._remove_path(self.path(job_id, "versions", stage, version))
+        journal.unlink(missing_ok=True)
+        self._fsync_directory(journal.parent)
+
+    def _write_json_file(self, path: Path, value: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self._reject_symlink_components(path, self.root)
+        partial = path.with_name(f".{path.name}.{uuid.uuid4().hex}.partial")
+        try:
+            with partial.open("w", encoding="utf-8") as stream:
+                json.dump(value, stream, sort_keys=True, indent=2, default=_json_default)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(partial, path)
+            self._fsync_directory(path.parent)
+        finally:
+            partial.unlink(missing_ok=True)
+
+    def _checkpoint(self, name: str) -> None:
+        if self._promotion_checkpoint is not None:
+            self._promotion_checkpoint(name)
 
     @staticmethod
-    def _backup_path(path: Path) -> Path:
-        return path.with_name(f".{path.name}.{uuid.uuid4().hex}.backup")
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _remove_path(path: Path) -> None:
+        try:
+            mode = path.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISDIR(mode) and not stat.S_ISLNK(mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+
+    @staticmethod
+    def _reject_symlink_components(path: Path, root: Path) -> None:
+        root = Path(os.path.abspath(root))
+        candidate = Path(os.path.abspath(path))
+        try:
+            relative = candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("Artifact path escapes its generated root") from exc
+        current = root
+        for part in relative.parts:
+            current /= part
+            try:
+                if stat.S_ISLNK(current.lstat().st_mode):
+                    raise ArtifactValidationError("Generated artifact path contains a symlink")
+            except FileNotFoundError:
+                continue
+
+    def _reject_symlink_tree(self, root: Path) -> None:
+        self._reject_symlink_components(root, self.root)
+        try:
+            mode = root.lstat().st_mode
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(mode):
+            raise ArtifactValidationError("Generated artifact tree is a symlink")
+        if not stat.S_ISDIR(mode):
+            return
+        for current, directories, filenames in os.walk(root, followlinks=False):
+            current_path = Path(current)
+            for name in (*directories, *filenames):
+                child = current_path / name
+                if stat.S_ISLNK(child.lstat().st_mode):
+                    raise ArtifactValidationError("Generated artifact tree contains a symlink")
 
     @staticmethod
     def _stage(stage: str) -> str:

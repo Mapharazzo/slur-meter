@@ -31,7 +31,6 @@ from api.database import (  # noqa: E402
     get_revenue,
     get_steps,
     list_jobs,
-    upsert_release,
     upsert_revenue,
 )
 from api.dispatcher import JobDispatcher  # noqa: E402
@@ -61,6 +60,7 @@ app.add_middleware(
 
 runtime_settings = Settings.from_env(BASE_DIR)
 operation_store = OperationStore(DB_PATH)
+_pipeline_services: PipelineServices | None = None
 
 
 def pipeline_services_factory() -> PipelineServices:
@@ -68,9 +68,11 @@ def pipeline_services_factory() -> PipelineServices:
 
 
 def _runner_factory() -> PipelineRunner:
+    if _pipeline_services is None:
+        raise RuntimeError("Pipeline services were not initialized at startup")
     return PipelineRunner(
         operation_store,
-        pipeline_services_factory(),
+        _pipeline_services,
         settings=runtime_settings,
     )
 
@@ -80,13 +82,17 @@ job_dispatcher = JobDispatcher(operation_store, _runner_factory)
 
 @app.on_event("startup")
 async def startup():
+    global _pipeline_services
     operation_store.initialize()
+    _pipeline_services = pipeline_services_factory()
     await job_dispatcher.start()
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    global _pipeline_services
     await job_dispatcher.stop()
+    _pipeline_services = None
 
 
 # ─── Models ────────────────────────────────────────────
@@ -152,10 +158,32 @@ async def get_job_costs(imdb_id: str):
 
 # ─── Videos & Frames ──────────────────────────────────
 
+def _current_artifact(identifier: str, stage_name: str):
+    job = operation_store.get_job(identifier)
+    if job is None:
+        return None
+    detail = operation_store.get_job_detail(job["id"])
+    if detail is None:
+        return None
+    stage = next(
+        (item for item in detail["stages"] if item["name"] == stage_name),
+        None,
+    )
+    artifacts = getattr(_pipeline_services, "artifacts", None)
+    if stage is None or not stage["output_manifest"] or artifacts is None:
+        return None
+    try:
+        path = artifacts.artifact_path(stage["output_manifest"])
+    except (KeyError, OSError, TypeError, ValueError):
+        return None
+    return job, stage["output_manifest"], path
+
+
 @app.get("/api/videos/{imdb_id}")
 async def serve_video(imdb_id: str):
-    video_path = BASE_DIR / "output" / imdb_id / "final.mp4"
-    if video_path.exists():
+    current = _current_artifact(imdb_id, "encode")
+    if current is not None:
+        _job, _manifest, video_path = current
         return FileResponse(
             str(video_path),
             media_type="video/mp4",
@@ -172,12 +200,15 @@ async def serve_segment_info(imdb_id: str, segment: str):
     """Return segment metadata and frame count."""
     if segment not in VALID_SEGMENTS:
         raise HTTPException(status_code=400, detail=f"Invalid segment: {segment}")
-    seg_dir = BASE_DIR / "output" / imdb_id / "render" / segment
-    if not seg_dir.exists():
+    current = _current_artifact(imdb_id, "composite")
+    if current is None:
+        raise HTTPException(status_code=404, detail="Segment not found")
+    _job, manifest, render = current
+    seg_dir = render / segment
+    if not seg_dir.is_dir():
         raise HTTPException(status_code=404, detail="Segment not found")
     frame_count = len(list(seg_dir.glob("*.png")))
-    job = get_job(imdb_id)
-    timing = (job.get("segment_timing") or {}).get(segment, {}) if job else {}
+    timing = (manifest.get("details", {}).get("timing", {})).get(segment, {})
     return {"segment": segment, "frame_count": frame_count, "timing": timing}
 
 
@@ -186,7 +217,11 @@ async def serve_frame(imdb_id: str, segment: str, frame_num: int):
     """Serve an individual PNG frame from a segment."""
     if segment not in VALID_SEGMENTS:
         raise HTTPException(status_code=400, detail=f"Invalid segment: {segment}")
-    frame_path = BASE_DIR / "output" / imdb_id / "render" / segment / f"{frame_num:05d}.png"
+    current = _current_artifact(imdb_id, "composite")
+    if current is None:
+        raise HTTPException(status_code=404, detail=f"Frame {frame_num} not found")
+    _job, _manifest, render = current
+    frame_path = render / segment / f"{frame_num:05d}.png"
     if not frame_path.exists():
         raise HTTPException(status_code=404, detail=f"Frame {frame_num} not found")
     return FileResponse(str(frame_path), media_type="image/png")
@@ -307,27 +342,31 @@ async def publish_video(imdb_id: str, platform: str):
     if platform not in SUPPORTED_PLATFORMS:
         raise HTTPException(400, f"platform must be one of: {', '.join(sorted(SUPPORTED_PLATFORMS))}")
 
-    job = get_job(imdb_id)
+    current = _current_artifact(imdb_id, "encode")
+    if current is None:
+        job = operation_store.get_job(imdb_id)
+        if job is None:
+            raise HTTPException(404, "Job not found")
+        raise HTTPException(404, "Video file not found")
+    job, _manifest, video_path = current
     if not job:
         raise HTTPException(404, "Job not found")
-    if job.get("status") != "done":
+    if job.get("state") != "completed":
         raise HTTPException(400, "Job must be completed (status=done) before publishing")
-
-    video_path = BASE_DIR / "output" / imdb_id / "final.mp4"
-    if not video_path.exists():
-        raise HTTPException(404, "Video file not found")
 
     analysis = job.get("analysis_json") or {}
     summary = analysis.get("summary", {}) if isinstance(analysis, dict) else {}
     from src.publishing.metadata import generate_metadata
     meta = generate_metadata(job["label"], summary)
 
-    upsert_release(imdb_id, platform, status="pending", metadata=meta)
-    asyncio.create_task(_do_publish(imdb_id, platform, video_path, meta))
+    operation_store.upsert_release(
+        job["id"], platform, status="pending", metadata=meta
+    )
+    asyncio.create_task(_do_publish(job["id"], platform, video_path, meta))
     return {"status": "publishing", "platform": platform, "imdb_id": imdb_id}
 
 
-async def _do_publish(imdb_id: str, platform: str, video_path: Path, meta: dict):
+async def _do_publish(job_id: str, platform: str, video_path: Path, meta: dict):
     try:
         if platform == "youtube":
             from src.publishing.youtube import YouTubeClient
@@ -350,9 +389,20 @@ async def _do_publish(imdb_id: str, platform: str, video_path: Path, meta: dict)
                 client.upload, video_path,
                 meta["video_title"], " ".join(meta["hashtags"]),
             )
-        upsert_release(imdb_id, platform, status="uploaded", platform_id=vid_id, metadata=meta)
+        operation_store.upsert_release(
+            job_id,
+            platform,
+            status="uploaded",
+            remote_id=vid_id,
+            metadata=meta,
+        )
     except Exception as exc:
-        upsert_release(imdb_id, platform, status="failed", error=str(exc))
+        operation_store.upsert_release(
+            job_id,
+            platform,
+            status="failed",
+            safe_error_message=exc,
+        )
 
 
 # ─── Stats Refresh ────────────────────────────────────

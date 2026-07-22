@@ -50,18 +50,18 @@ def test_restart_recovery_can_requeue_a_running_stage():
     )
 
 
-def test_only_artifact_invalidated_subtitle_selection_can_requeue_from_completed():
-    assert_stage_transition(
-        StageState.COMPLETED,
-        StageState.QUEUED,
-        trigger=AttemptTrigger.ARTIFACT_INVALIDATION,
-        stage_name="subtitle_selection",
-    )
-    with pytest.raises(InvalidTransition):
+def test_only_explicit_artifact_invalidation_can_requeue_any_completed_stage():
+    for stage_name in ("subtitle_selection", "analysis", "encode"):
         assert_stage_transition(
             StageState.COMPLETED,
             StageState.QUEUED,
             trigger=AttemptTrigger.ARTIFACT_INVALIDATION,
+            stage_name=stage_name,
+        )
+    with pytest.raises(InvalidTransition):
+        assert_stage_transition(
+            StageState.COMPLETED,
+            StageState.QUEUED,
             stage_name="analysis",
         )
 

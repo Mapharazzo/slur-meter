@@ -43,6 +43,8 @@ GENERATION_STAGES = (
     "encode",
 )
 
+_WORKER_CONTEXT = threading.local()
+
 
 @dataclass(frozen=True)
 class StageResult:
@@ -73,6 +75,7 @@ class PipelineServices(Protocol):
     def validate_stage(
         self,
         stage_name: str,
+        expected_job_id: str,
         output_manifest: Mapping[str, Any],
     ) -> bool | Awaitable[bool]: ...
 
@@ -95,7 +98,10 @@ class UnavailablePipelineServices:
         )
 
     async def validate_stage(
-        self, stage_name: str, output_manifest: Mapping[str, Any]
+        self,
+        stage_name: str,
+        expected_job_id: str,
+        output_manifest: Mapping[str, Any],
     ) -> bool:
         return False
 
@@ -191,18 +197,39 @@ class GenerationPipelineServices:
         )
 
     def validate_stage(
-        self, stage_name: str, output_manifest: Mapping[str, Any]
+        self,
+        stage_name: str,
+        expected_job_id: str,
+        output_manifest: Mapping[str, Any],
     ) -> bool:
-        if output_manifest.get("stage") != stage_name:
+        if (
+            output_manifest.get("manifest_version")
+            != self.artifacts.manifest_version
+            or output_manifest.get("stage") != stage_name
+            or output_manifest.get("job_id") != expected_job_id
+        ):
             return False
         if stage_name == "subtitle_selection":
-            return self._selected_candidate(output_manifest.get("job_id")) is not None
+            candidate = self._selected_candidate(expected_job_id)
+            artifact = output_manifest.get("artifact")
+            return bool(
+                candidate is not None
+                and isinstance(artifact, Mapping)
+                and artifact.get("candidate_id") == candidate["id"]
+                and artifact.get("sha256") == candidate["content_hash"]
+                and dict(output_manifest.get("input_hashes", {}))
+                == self._input_hashes(stage_name, expected_job_id)
+                and output_manifest.get("config_hash")
+                == self._config_hash(stage_name)
+            )
+        validation_stage = (
+            "composite" if stage_name.startswith("composite.") else stage_name
+        )
         try:
-            job_id = str(output_manifest["job_id"])
             return self.artifacts.validate(
                 output_manifest,
-                input_hashes=self._input_hashes(stage_name, job_id),
-                config_hash=self._config_hash(stage_name),
+                input_hashes=self._input_hashes(validation_stage, expected_job_id),
+                config_hash=self._config_hash(validation_stage),
             )
         except (KeyError, TypeError, ValueError):
             return False
@@ -235,7 +262,7 @@ class GenerationPipelineServices:
         return handler(job_id, progress)
 
     def _input_resolution(
-        self, job_id: str, _progress: ProgressReporter
+        self, job_id: str, progress: ProgressReporter
     ) -> Mapping[str, Any]:
         job = self._job(job_id)
         identity = {
@@ -251,6 +278,7 @@ class GenerationPipelineServices:
             identity,
             input_hashes=self._input_hashes("input_resolution", job_id),
             config_hash=self._config_hash("input_resolution"),
+            publish_allowed=partial(self._publication_allowed, job_id, progress),
         )
 
     def _subtitle_discovery(
@@ -285,6 +313,7 @@ class GenerationPipelineServices:
             safe_candidates,
             input_hashes=self._input_hashes("subtitle_discovery", job_id),
             config_hash=self._config_hash("subtitle_discovery"),
+            publish_allowed=partial(self._publication_allowed, job_id, progress),
         )
 
     def _subtitle_selection(
@@ -323,7 +352,7 @@ class GenerationPipelineServices:
             "details": {},
         }
 
-    def _metadata(self, job_id: str, _progress: ProgressReporter) -> Mapping[str, Any]:
+    def _metadata(self, job_id: str, progress: ProgressReporter) -> Mapping[str, Any]:
         from src.data.movie_metadata import MovieMetadataResult
 
         job = self._job(job_id)
@@ -363,8 +392,9 @@ class GenerationPipelineServices:
                 config_hash=self._config_hash("metadata"),
                 details={
                     "metadata_file": "metadata.json",
-                    "poster_file": "poster.jpg" if result.poster_bytes else None,
+                    **({"poster_file": "poster.jpg"} if result.poster_bytes else {}),
                 },
+                publish_allowed=partial(self._publication_allowed, job_id, progress),
             )
         finally:
             if staging.exists():
@@ -372,7 +402,7 @@ class GenerationPipelineServices:
         self._legacy_update(job_id, movie_info=metadata)
         return manifest
 
-    def _analysis(self, job_id: str, _progress: ProgressReporter) -> Mapping[str, Any]:
+    def _analysis(self, job_id: str, progress: ProgressReporter) -> Mapping[str, Any]:
         from src.analysis.engine import ProfanityEngine
 
         candidate = self._selected_candidate(job_id)
@@ -411,6 +441,7 @@ class GenerationPipelineServices:
             analysis,
             input_hashes=self._input_hashes("analysis", job_id),
             config_hash=self._config_hash("analysis"),
+            publish_allowed=partial(self._publication_allowed, job_id, progress),
         )
         self._legacy_update(job_id, analysis_json=analysis)
         return manifest
@@ -446,6 +477,7 @@ class GenerationPipelineServices:
                 prefix="frame_",
                 input_hashes=self._input_hashes("graph", job_id),
                 config_hash=self._config_hash("graph"),
+                publish_allowed=partial(self._publication_allowed, job_id, progress),
             )
         finally:
             if staging.exists():
@@ -462,7 +494,6 @@ class GenerationPipelineServices:
         staging = self.artifacts.new_staging_directory(job_id, "composite")
         children: dict[str, dict[str, Any]] = {}
         totals: dict[str, int] = {}
-        current_child: str | None = None
         parent = next(
             stage
             for stage in self.store.get_job_detail(job_id)["stages"]
@@ -476,14 +507,21 @@ class GenerationPipelineServices:
                 ordinal=parent["ordinal"] * 100 + index,
                 parent_name="composite",
             )
+            children[name] = child
+
+        def report(name: str, current: int, total: int) -> None:
+            totals[name] = total
+            child_name = f"composite.{name}"
+            child = children[name]
             if child["state"] == StageState.PENDING.value:
                 child = self.store.transition_stage(
                     job_id,
                     child_name,
                     StageState.QUEUED,
+                    expected_state=StageState.PENDING,
                     lease_owner=lease_owner,
                 )
-            if child["state"] == StageState.QUEUED.value:
+            if child is not None and child["state"] == StageState.QUEUED.value:
                 child = self.store.transition_stage(
                     job_id,
                     child_name,
@@ -491,14 +529,9 @@ class GenerationPipelineServices:
                     expected_state=StageState.QUEUED,
                     lease_owner=lease_owner,
                 )
+            if child is None:
+                raise asyncio.CancelledError("The worker no longer owns the job lease")
             children[name] = child
-
-        def report(name: str, current: int, total: int) -> None:
-            nonlocal current_child
-            current_child = name
-            totals[name] = total
-            child_name = f"composite.{name}"
-            child = children[name]
             if child["state"] == StageState.RUNNING.value:
                 children[name] = self.store.transition_stage(
                     job_id,
@@ -552,8 +585,9 @@ class GenerationPipelineServices:
                 expected_count=total_frames,
                 dimensions=dimensions,
             )
+            child_artifacts: dict[str, dict[str, Any]] = {}
             for name in self.COMPOSITE_CHILDREN:
-                self.artifacts.verify_frame_directory(
+                child_artifacts[name] = self.artifacts.verify_frame_directory(
                     staging / name,
                     expected_count=int(timing[name]["num_frames"]),
                     dimensions=dimensions,
@@ -572,47 +606,49 @@ class GenerationPipelineServices:
                     "height": dimensions[1],
                     "fps": int(compositor.fps),
                 },
+                publish_allowed=partial(self._publication_allowed, job_id, progress),
             )
             render_relative = manifest["artifact"]["path"]
+            child_inputs = self._input_hashes("composite", job_id)
+            child_config = self._config_hash("composite")
             for name in self.COMPOSITE_CHILDREN:
                 child_name = f"composite.{name}"
                 child = children[name]
-                if child["state"] == StageState.RUNNING.value:
-                    self.store.transition_stage(
-                        job_id,
-                        child_name,
-                        StageState.COMPLETED,
-                        expected_state=StageState.RUNNING,
-                        progress_unit="frames",
-                        output_manifest={
-                            "manifest_version": self.artifacts.manifest_version,
-                            "job_id": job_id,
-                            "stage": child_name,
-                            "artifact": {
-                                "kind": "frames",
-                                "path": f"{render_relative}/{name}",
-                                "frame_count": timing[name]["num_frames"],
-                            },
+                if child["state"] != StageState.RUNNING.value:
+                    raise ValueError(f"Composite child {name} did not report progress")
+                artifact = {
+                    **child_artifacts[name],
+                    "path": f"{render_relative}/{name}",
+                }
+                updated = self.store.transition_stage(
+                    job_id,
+                    child_name,
+                    StageState.RUNNING,
+                    expected_state=StageState.RUNNING,
+                    progress_numerator=int(timing[name]["num_frames"]),
+                    progress_denominator=int(timing[name]["num_frames"]),
+                    progress_unit="frames",
+                    output_manifest={
+                        "manifest_version": self.artifacts.manifest_version,
+                        "version": manifest["version"],
+                        "job_id": job_id,
+                        "stage": child_name,
+                        "input_hashes": child_inputs,
+                        "config_hash": child_config,
+                        "artifact": artifact,
+                        "details": {
+                            "parent_stage": "composite",
+                            "parent_version": manifest["version"],
                         },
-                        lease_owner=lease_owner,
+                    },
+                    lease_owner=lease_owner,
+                )
+                if updated is None:
+                    raise asyncio.CancelledError(
+                        "The worker no longer owns the job lease"
                     )
             self._legacy_update(job_id, segment_timing=timing)
             return manifest
-        except BaseException:
-            if current_child is not None:
-                child = children[current_child]
-                if child["state"] == StageState.RUNNING.value:
-                    self.store.transition_stage(
-                        job_id,
-                        f"composite.{current_child}",
-                        StageState.NEEDS_ATTENTION,
-                        expected_state=StageState.RUNNING,
-                        safe_error_code="composite_child_failed",
-                        safe_error_message="Composite child rendering failed.",
-                        next_action="retry",
-                        lease_owner=lease_owner,
-                    )
-            raise
         finally:
             if staging.exists():
                 shutil.rmtree(staging)
@@ -639,9 +675,17 @@ class GenerationPipelineServices:
             def report(current: int, total: int) -> None:
                 self._report(job_id, progress, current, max(total, 1), "layers")
 
-            pipeline.generate_all(progress_cb=report)
+            def cancel_requested() -> bool:
+                return self._cancel_requested(job_id)
+
+            pipeline.generate_all(
+                progress_cb=report,
+                cancel_requested=cancel_requested,
+            )
             mixed = staging / "mixed.m4a"
-            pipeline.mix(mixed)
+            pipeline.mix(mixed, cancel_requested=cancel_requested)
+            if cancel_requested():
+                raise asyncio.CancelledError("Audio generation was cancelled")
             return self.artifacts.promote_file(
                 job_id,
                 "audio",
@@ -651,6 +695,7 @@ class GenerationPipelineServices:
                 input_hashes=self._input_hashes("audio", job_id),
                 config_hash=self._config_hash("audio"),
                 details={"layer_count": len(pipeline.timeline.layers)},
+                publish_allowed=partial(self._publication_allowed, job_id, progress),
             )
         finally:
             if staging.exists():
@@ -664,29 +709,44 @@ class GenerationPipelineServices:
         total = int(composite.get("details", {}).get("total_frames", 0))
         if total < 1:
             raise ValueError("Composite artifact has no frames")
-        output = self.artifacts.path(job_id, "final.mp4")
+        fps = int(composite.get("details", {}).get("fps", 0))
+        if fps < 1:
+            raise ValueError("Composite artifact has no valid frame rate")
+        output = self.artifacts.new_staging_file(job_id, "encode", suffix=".mp4")
 
         def report(frame: int) -> None:
             self._report(job_id, progress, min(frame, total), total, "frames")
 
-        self.encoder.encode(
-            frames,
-            audio_path,
-            output,
-            report,
-            lambda: self._cancel_requested(job_id),
-        )
-        manifest = self.artifacts.record_file(
-            job_id,
-            "encode",
-            output,
-            media_kind="video",
-            input_hashes=self._input_hashes("encode", job_id),
-            config_hash=self._config_hash("encode"),
-            details={"frame_count": total},
-        )
-        self._legacy_update(job_id, video_path=manifest["artifact"]["path"])
-        return manifest
+        try:
+            self.encoder.encode(
+                frames,
+                audio_path,
+                output,
+                report,
+                lambda: self._cancel_requested(job_id),
+            )
+            if self._cancel_requested(job_id):
+                raise asyncio.CancelledError("Encoding was cancelled")
+            manifest = self.artifacts.promote_file(
+                job_id,
+                "encode",
+                output,
+                final_name="final.mp4",
+                media_kind="video",
+                expected_duration=total / fps,
+                input_hashes=self._input_hashes("encode", job_id),
+                config_hash=self._config_hash("encode"),
+                details={
+                    "frame_count": total,
+                    "fps": fps,
+                    "expected_duration": total / fps,
+                },
+                publish_allowed=partial(self._publication_allowed, job_id, progress),
+            )
+            self._legacy_update(job_id, video_path=manifest["artifact"]["path"])
+            return manifest
+        finally:
+            output.unlink(missing_ok=True)
 
     def _input_hashes(self, stage_name: str, job_id: str) -> dict[str, str]:
         job = self._job(job_id)
@@ -849,8 +909,31 @@ class GenerationPipelineServices:
         progress(int(numerator), int(denominator), unit)
 
     def _cancel_requested(self, job_id: str) -> bool:
+        if _worker_cancel_requested():
+            return True
         job = self.store.get_job(job_id)
         return job is None or bool(job["cancel_requested"])
+
+    def _publication_allowed(
+        self,
+        job_id: str,
+        progress: ProgressReporter,
+    ) -> bool:
+        if self._cancel_requested(job_id):
+            return False
+        lease_owner = getattr(progress, "lease_owner", None)
+        lease_seconds = getattr(progress, "lease_seconds", None)
+        if not isinstance(lease_owner, str) or not lease_owner:
+            return False
+        if not isinstance(lease_seconds, (int, float)) or lease_seconds <= 0:
+            return False
+        return bool(
+            self.store.renew_lease(
+                job_id,
+                lease_owner,
+                lease_seconds=float(lease_seconds),
+            )
+        )
 
     def _job(self, job_id: str) -> dict[str, Any]:
         job = self.store.get_job(job_id)
@@ -928,6 +1011,14 @@ class PipelineStore(Protocol):
         **fields: Any,
     ) -> dict[str, Any] | None: ...
 
+    def complete_stage_and_children(
+        self, job_id: str, stage_name: str, **fields: Any
+    ) -> dict[str, Any] | None: ...
+
+    def invalidate_stage_and_downstream(
+        self, job_id: str, stage_name: str, **fields: Any
+    ) -> dict[str, Any] | None: ...
+
     def renew_lease(self, job_id: str, owner: str, *, lease_seconds: float) -> bool: ...
 
     def record_event(self, job_id: str, **fields: Any) -> object | None: ...
@@ -971,7 +1062,7 @@ class PipelineRunner:
             if stage["state"] == StageState.COMPLETED.value:
                 try:
                     reusable = await self._validate(
-                        stage_name, stage["output_manifest"]
+                        job_id, stage_name, stage["output_manifest"]
                     )
                 except Exception as exc:
                     error = classify_exception(
@@ -1077,7 +1168,16 @@ class PipelineRunner:
                 continue
 
             progress_unit = self._stage(job_id, stage_name)["progress"]["unit"]
-            if stage_index == len(self.stages) - 1:
+            if stage_name == "composite" and stage_index != len(self.stages) - 1:
+                completed = self.store.complete_stage_and_children(
+                    job_id,
+                    stage_name,
+                    warnings=list(result.warnings),
+                    output_manifest=result.output_manifest,
+                    progress_unit=progress_unit,
+                    lease_owner=lease_owner,
+                )
+            elif stage_index == len(self.stages) - 1:
                 completed = self.store.transition_stage_and_job(
                     job_id,
                     stage_name,
@@ -1154,11 +1254,12 @@ class PipelineRunner:
             return _CompletedAwaitable()
 
         progress.lease_owner = lease_owner  # type: ignore[attr-defined]
+        progress.lease_seconds = self.lease_seconds  # type: ignore[attr-defined]
 
         value = self.services.run_stage(stage_name, job_id, progress)
         raw = await value if inspect.isawaitable(value) else value
         result = _stage_result(raw)
-        if not await self._validate(stage_name, result.output_manifest):
+        if not await self._validate(job_id, stage_name, result.output_manifest):
             raise AttentionRequired(
                 f"Output from stage {stage_name} did not pass artifact validation.",
                 code="invalid_stage_output",
@@ -1171,8 +1272,10 @@ class PipelineRunner:
             warnings=tuple(sanitize_value(result.warnings, self.settings)),
         )
 
-    async def _validate(self, stage_name: str, manifest: Mapping[str, Any]) -> bool:
-        value = self.services.validate_stage(stage_name, manifest)
+    async def _validate(
+        self, job_id: str, stage_name: str, manifest: Mapping[str, Any]
+    ) -> bool:
+        value = self.services.validate_stage(stage_name, job_id, manifest)
         return bool(await value if inspect.isawaitable(value) else value)
 
     def _policy(self, stage_name: str) -> RetryPolicy:
@@ -1207,6 +1310,7 @@ class PipelineRunner:
             safe_error_message=safe_message,
             retryable=error.retryable,
             next_action=next_action,
+            reset_descendants=stage_name == "composite",
             lease_owner=lease_owner,
         )
         if outcome is None:
@@ -1226,18 +1330,12 @@ class PipelineRunner:
             self.settings,
         )
         safe_code = sanitize_text(code, self.settings)
-        outcome = self.store.transition_job(
+        outcome = self.store.invalidate_stage_and_downstream(
             job_id,
-            JobState.NEEDS_ATTENTION,
-            expected_state=JobState.RUNNING,
+            stage_name,
             safe_error_code=safe_code,
             safe_error_message=safe_message,
-            retryable=False,
-            next_action="retry",
             lease_owner=lease_owner,
-            additional_event_type="artifact_validation_failed",
-            additional_event_message=safe_message,
-            additional_event_stage_name=stage_name,
         )
         if outcome is None:
             raise asyncio.CancelledError("The worker no longer owns the job lease")
@@ -1314,12 +1412,16 @@ def _runtime_minutes(metadata: Mapping[str, Any]) -> float | None:
 async def _run_in_worker(function: Callable[..., Any], *args: Any) -> Any:
     """Run blocking generation off-loop and join it without executor leakage."""
     outcomes: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
+    cancel_event = threading.Event()
 
     def run() -> None:
+        _WORKER_CONTEXT.cancel_event = cancel_event
         try:
             outcomes.put((True, function(*args)))
         except BaseException as exc:
             outcomes.put((False, exc))
+        finally:
+            del _WORKER_CONTEXT.cancel_event
 
     worker = threading.Thread(
         target=run,
@@ -1335,6 +1437,7 @@ async def _run_in_worker(function: Callable[..., Any], *args: Any) -> Any:
             # Retain ownership until the blocking call yields; callbacks observe
             # durable cancellation and stop render/encode loops promptly.
             cancelled = exc
+            cancel_event.set()
     worker.join()
     if cancelled is not None:
         raise cancelled
@@ -1342,6 +1445,11 @@ async def _run_in_worker(function: Callable[..., Any], *args: Any) -> Any:
     if succeeded:
         return value
     raise value
+
+
+def _worker_cancel_requested() -> bool:
+    cancel_event = getattr(_WORKER_CONTEXT, "cancel_event", None)
+    return bool(cancel_event is not None and cancel_event.is_set())
 
 
 def get_client():

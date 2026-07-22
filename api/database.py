@@ -368,6 +368,7 @@ class OperationStore:
         safe_error_message: object | None = None,
         retryable: bool = False,
         next_action: str | None = None,
+        reset_descendants: bool = False,
         lease_owner: str | None = None,
     ) -> dict[str, Any] | None:
         """Commit a stage and its owning run outcome as one fenced transaction."""
@@ -399,6 +400,40 @@ class OperationStore:
             # Validate both moves before either row changes.
             assert_stage_transition(old_stage, target_stage, stage_name=stage_name)
             assert_job_transition(old_job, target_job)
+            if reset_descendants:
+                descendants = connection.execute(
+                    "SELECT * FROM pipeline_stages WHERE parent_stage_id = ? ORDER BY ordinal, id",
+                    (stage["id"],),
+                ).fetchall()
+                for child in descendants:
+                    child_state = StageState(child["state"])
+                    connection.execute(
+                        """UPDATE pipeline_stages SET state = 'pending', updated_at = ?,
+                               started_at = NULL, finished_at = NULL,
+                               progress_numerator = NULL, progress_denominator = NULL,
+                               progress_unit = NULL, warnings_json = '[]',
+                               output_manifest_json = '{}', safe_error_code = NULL,
+                               safe_error_message = NULL, retryable = 0, next_action = NULL
+                           WHERE id = ?""",
+                        (now, child["id"]),
+                    )
+                    if child_state is not StageState.PENDING:
+                        self._insert_event(
+                            connection,
+                            resolved,
+                            stage_id=int(child["id"]),
+                            event_type="stage_state_changed",
+                            message=(
+                                f"Stage {child['name']} moved from "
+                                f"{child_state.value} to pending."
+                            ),
+                            data={
+                                "from": child_state.value,
+                                "to": StageState.PENDING.value,
+                                "trigger": None,
+                            },
+                            created_at=now,
+                        )
             stage_finished = now if target_stage in {
                 StageState.COMPLETED,
                 StageState.FAILED,
@@ -475,6 +510,115 @@ class OperationStore:
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
             ).fetchone()
             return {"stage": self._stage_dto(updated_stage), "run": self._job_dto(updated_job)}
+
+    def complete_stage_and_children(
+        self,
+        job_id: str,
+        stage_name: str,
+        *,
+        warnings: list[str] | None = None,
+        output_manifest: Mapping[str, Any] | None = None,
+        progress_unit: str | None = None,
+        lease_owner: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically complete a running parent and all of its running children."""
+        now = self._now_text()
+        with self._mutation() as connection:
+            resolved = self._resolve_job_id(connection, job_id)
+            if resolved is None:
+                return None
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            parent = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE job_id = ? AND name = ?",
+                (resolved, stage_name),
+            ).fetchone()
+            if parent is None:
+                raise KeyError("Stage was not found")
+            if not self._lease_allows(job, lease_owner, now):
+                return None
+            if (
+                JobState(job["state"]) is not JobState.RUNNING
+                or StageState(parent["state"]) is not StageState.RUNNING
+            ):
+                return None
+            children = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE parent_stage_id = ? ORDER BY ordinal, id",
+                (parent["id"],),
+            ).fetchall()
+            if not children or any(
+                StageState(child["state"]) is not StageState.RUNNING
+                or not _json_load(child["output_manifest_json"], {})
+                for child in children
+            ):
+                return None
+
+            for child in children:
+                assert_stage_transition(
+                    StageState.RUNNING,
+                    StageState.COMPLETED,
+                    stage_name=child["name"],
+                )
+                connection.execute(
+                    """UPDATE pipeline_stages SET state = 'completed', updated_at = ?,
+                           finished_at = ?, safe_error_code = NULL,
+                           safe_error_message = NULL, retryable = 0, next_action = NULL
+                       WHERE id = ? AND state = 'running'""",
+                    (now, now, child["id"]),
+                )
+                self._insert_event(
+                    connection,
+                    resolved,
+                    stage_id=int(child["id"]),
+                    event_type="stage_state_changed",
+                    message=f"Stage {child['name']} moved from running to completed.",
+                    data={"from": "running", "to": "completed", "trigger": None},
+                    created_at=now,
+                )
+
+            assert_stage_transition(
+                StageState.RUNNING,
+                StageState.COMPLETED,
+                stage_name=stage_name,
+            )
+            connection.execute(
+                """UPDATE pipeline_stages SET state = 'completed', updated_at = ?,
+                       finished_at = ?, progress_unit = COALESCE(?, progress_unit),
+                       warnings_json = ?, output_manifest_json = ?,
+                       safe_error_code = NULL, safe_error_message = NULL,
+                       retryable = 0, next_action = NULL
+                   WHERE id = ? AND state = 'running'""",
+                (
+                    now,
+                    now,
+                    _safe_text(progress_unit) if progress_unit is not None else None,
+                    _safe_json_dump(warnings)
+                    if warnings is not None
+                    else parent["warnings_json"],
+                    _safe_json_dump(output_manifest)
+                    if output_manifest is not None
+                    else parent["output_manifest_json"],
+                    parent["id"],
+                ),
+            )
+            connection.execute(
+                "UPDATE job_runs SET current_stage = ?, updated_at = ? WHERE id = ?",
+                (stage_name, now, resolved),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                stage_id=int(parent["id"]),
+                event_type="stage_state_changed",
+                message=f"Stage {stage_name} moved from running to completed.",
+                data={"from": "running", "to": "completed", "trigger": None},
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE id = ?", (parent["id"],)
+            ).fetchone()
+            return self._stage_dto(updated)
 
     def release_job_lease(self, job_id: str, owner: str) -> bool:
         """Release owned interrupted work for immediate restart recovery."""
@@ -1726,6 +1870,111 @@ class OperationStore:
             connection.execute(
                 f"UPDATE job_runs SET {clause} WHERE id = ?",
                 (*updates.values(), resolved),
+            )
+            updated = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            return self._job_dto(updated)
+
+    def invalidate_stage_and_downstream(
+        self,
+        job_id: str,
+        stage_name: str,
+        *,
+        lease_owner: str,
+        safe_error_code: str,
+        safe_error_message: object,
+    ) -> dict[str, Any] | None:
+        """Atomically reset invalid completed work and every dependent stage."""
+        now = self._now_text()
+        with self._mutation() as connection:
+            resolved = self._resolve_job_id(connection, job_id)
+            if resolved is None:
+                return None
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if not self._lease_allows(job, lease_owner, now):
+                return None
+            if JobState(job["state"]) is not JobState.RUNNING:
+                return None
+            rows = connection.execute(
+                """SELECT * FROM pipeline_stages WHERE job_id = ?
+                   ORDER BY ordinal, id""",
+                (resolved,),
+            ).fetchall()
+            target = next((row for row in rows if row["name"] == stage_name), None)
+            if target is None:
+                raise KeyError("Stage was not found")
+            old_target = StageState(target["state"])
+            if old_target is not StageState.COMPLETED:
+                return None
+            assert_stage_transition(
+                old_target,
+                StageState.QUEUED,
+                AttemptTrigger.ARTIFACT_INVALIDATION,
+                stage_name=stage_name,
+            )
+            target_ordinal = int(target["ordinal"])
+            impacted_ids = {
+                int(row["id"])
+                for row in rows
+                if row["parent_stage_id"] is None
+                and int(row["ordinal"]) >= target_ordinal
+            }
+            changed = True
+            while changed:
+                changed = False
+                for row in rows:
+                    parent_id = row["parent_stage_id"]
+                    row_id = int(row["id"])
+                    if (
+                        parent_id is not None
+                        and int(parent_id) in impacted_ids
+                        and row_id not in impacted_ids
+                    ):
+                        impacted_ids.add(row_id)
+                        changed = True
+
+            for row in rows:
+                row_id = int(row["id"])
+                if row_id not in impacted_ids:
+                    continue
+                is_target = row_id == int(target["id"])
+                state = StageState.QUEUED if is_target else StageState.PENDING
+                retry_cycle = int(row["retry_cycle"]) + (1 if is_target else 0)
+                connection.execute(
+                    """UPDATE pipeline_stages SET state = ?, retry_cycle = ?,
+                           updated_at = ?, started_at = NULL, finished_at = NULL,
+                           progress_numerator = 0, progress_denominator = 1,
+                           progress_unit = '', warnings_json = '[]',
+                           output_manifest_json = '{}', safe_error_code = NULL,
+                           safe_error_message = NULL, retryable = 0,
+                           next_action = NULL WHERE id = ?""",
+                    (state.value, retry_cycle, now, row_id),
+                )
+
+            message = _safe_text(safe_error_message)
+            code = _safe_text(safe_error_code)
+            connection.execute(
+                """UPDATE job_runs SET state = 'needs_attention', current_stage = ?,
+                       updated_at = ?, finished_at = NULL, next_action = 'retry',
+                       safe_error_code = ?, safe_error_message = ?, error_retryable = 0,
+                       lease_owner = NULL, lease_expires_at = NULL
+                   WHERE id = ? AND state = 'running'""",
+                (stage_name, now, code, message, resolved),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                stage_id=int(target["id"]),
+                event_type="artifact_validation_failed",
+                message=message,
+                data={
+                    "stage": stage_name,
+                    "trigger": AttemptTrigger.ARTIFACT_INVALIDATION.value,
+                },
+                created_at=now,
             )
             updated = connection.execute(
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
