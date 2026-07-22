@@ -1,29 +1,26 @@
-"""Instagram Reels client via headless Playwright — upload + stats scraping.
+"""Instagram Reels publishing client with explicit typed failures."""
 
-Required env var:
-  INSTAGRAM_SESSION_ID  — value of the `sessionid` cookie from a logged-in browser session
-
-Usage:
-  from src.publishing.instagram import InstagramClient
-  ig = InstagramClient()
-  post_id = ig.upload("output/final.mp4", title="My Reel", description="#shorts")
-  stats = ig.get_video_stats(post_id)
-"""
+from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
 
-
-def _parse_count(text: str) -> int:
-    text = text.strip().upper().replace(",", "")
-    try:
-        if text.endswith("K"):
-            return int(float(text[:-1]) * 1_000)
-        if text.endswith("M"):
-            return int(float(text[:-1]) * 1_000_000)
-        return int(text)
-    except (ValueError, IndexError):
-        return 0
-
+from api.errors import AmbiguousPublishOutcome
+from src.publishing.errors import (
+    PlatformConfirmationError,
+    PlatformCredentialsError,
+    PlatformStatsError,
+    PlatformTransientError,
+)
+from src.publishing.tiktok import (
+    _close_browser_resources,
+    _parse_count,
+    _remote_id,
+)
+from src.publishing.youtube import _verified_supplemental_stats
 
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -32,155 +29,179 @@ _USER_AGENT = (
 )
 
 
-def _session_cookie() -> dict:
-    return {
-        "name": "sessionid",
-        "value": os.environ["INSTAGRAM_SESSION_ID"],
-        "domain": ".instagram.com",
-        "path": "/",
-        "httpOnly": True,
-        "secure": True,
-    }
-
-
 class InstagramClient:
-    """Playwright-based Instagram Reels uploader and stats scraper."""
+    """Playwright-backed Instagram Reels uploader and statistics reader."""
+
+    def __init__(
+        self,
+        *,
+        playwright_factory: Callable[[], Any] | None = None,
+        supplemental_stats: Callable[[str], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self._playwright_factory = playwright_factory
+        self._supplemental_stats = supplemental_stats
+
+    def _playwright(self) -> Any:
+        if self._playwright_factory is not None:
+            return self._playwright_factory()
+        from playwright.sync_api import sync_playwright
+
+        return sync_playwright()
+
+    @staticmethod
+    def _cookie() -> dict[str, Any]:
+        session_id = str(os.getenv("INSTAGRAM_SESSION_ID") or "").strip()
+        if not session_id:
+            raise PlatformCredentialsError(
+                "Instagram publishing credentials are not configured."
+            )
+        return {
+            "name": "sessionid",
+            "value": session_id,
+            "domain": ".instagram.com",
+            "path": "/",
+            "httpOnly": True,
+            "secure": True,
+        }
 
     def upload(
         self,
-        video_path,
+        video_path: str | Path,
         title: str,
         description: str = "",
-        **_,
+        **_: Any,
     ) -> str:
-        """Upload a Reel to Instagram. Returns the post shortcode, or empty string on failure."""
-        from playwright.sync_api import sync_playwright
-
-        post_id = ""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent=_USER_AGENT,
-            )
-            context.add_cookies([_session_cookie()])
-            page = context.new_page()
-
-            page.goto("https://www.instagram.com/reels/create/", wait_until="networkidle")
-
-            file_input = page.query_selector('input[type="file"]')
-            if not file_input:
-                trigger = page.query_selector('[aria-label="New post"]')
-                if trigger:
-                    trigger.click()
-                    page.wait_for_selector('input[type="file"]', timeout=10_000)
-                    file_input = page.query_selector('input[type="file"]')
-
-            if not file_input:
-                raise RuntimeError("Upload input not found on Instagram page")
-
-            file_input.set_input_files(str(video_path))
-
-            page.wait_for_selector('[aria-label="Next"]', timeout=120_000)
-            page.click('[aria-label="Next"]')
-
-            page.wait_for_selector(
-                'textarea[aria-label="Write a caption..."]', timeout=30_000
-            )
-            caption = f"{title}\n\n{description}".strip() if description else title
-            page.fill('textarea[aria-label="Write a caption..."]', caption)
-
-            share_btn = page.query_selector(
-                '[aria-label="Share"]'
-            ) or page.get_by_role("button", name="Share")
-            if share_btn:
-                share_btn.click()
-            print("⬆️ Submitted to Instagram!")
-
-            try:
-                page.wait_for_url("**/p/**", timeout=30_000)
-                parts = page.url.rstrip("/").split("/")
-                if "p" in parts:
-                    post_id = parts[parts.index("p") + 1]
-            except Exception:
-                pass
-
-            browser.close()
-
-        return post_id
-
-    def get_video_stats(self, post_id: str) -> dict:
-        """Scrape stats from an Instagram post page.
-
-        Intercepts the GraphQL response where available, falls back to DOM scraping.
-        revenue_usd is always 0.0 — no public monetisation API.
-        """
-        from playwright.sync_api import sync_playwright
-
-        base = {"views": 0, "likes": 0, "comments": 0, "revenue_usd": 0.0, "shares": 0}
-        if not post_id:
-            return base
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(user_agent=_USER_AGENT)
-            context.add_cookies([_session_cookie()])
-            page = context.new_page()
-
-            try:
-                api_stats: dict = {}
-
-                def handle_response(response):
-                    if "graphql/query" in response.url or "/api/v1/media/" in response.url:
-                        try:
-                            data = response.json()
-                            media = data.get("data", {}).get("shortcode_media", {})
-                            if media:
-                                api_stats["likes"] = media.get("edge_media_preview_like", {}).get("count", 0)
-                                api_stats["comments"] = media.get("edge_media_to_comment", {}).get("count", 0)
-                                api_stats["views"] = media.get("video_view_count", 0)
-                        except Exception:
-                            pass
-
-                page.on("response", handle_response)
+        """Upload one Reel and require an explicit confirmed shortcode."""
+        cookie = self._cookie()
+        browser = None
+        context = None
+        submitted = False
+        confirmed = False
+        try:
+            with self._playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 900}, user_agent=_USER_AGENT
+                )
+                context.add_cookies([cookie])
+                page = context.new_page()
                 page.goto(
-                    f"https://www.instagram.com/p/{post_id}/",
+                    "https://www.instagram.com/reels/create/",
+                    wait_until="networkidle",
+                )
+                file_input = page.query_selector('input[type="file"]')
+                if file_input is None:
+                    trigger = page.query_selector('[aria-label="New post"]')
+                    if trigger is not None:
+                        trigger.click()
+                        page.wait_for_selector('input[type="file"]', timeout=10_000)
+                        file_input = page.query_selector('input[type="file"]')
+                if file_input is None:
+                    raise PlatformConfirmationError(
+                        "Instagram did not expose a video upload control."
+                    )
+                file_input.set_input_files(str(video_path))
+                page.wait_for_selector('[aria-label="Next"]', timeout=120_000)
+                page.click('[aria-label="Next"]')
+                caption_selector = 'textarea[aria-label="Write a caption..."]'
+                page.wait_for_selector(caption_selector, timeout=30_000)
+                caption = f"{title}\n\n{description}".strip()
+                page.fill(caption_selector, caption)
+                share = page.query_selector('[aria-label="Share"]') or page.get_by_role(
+                    "button", name="Share"
+                )
+                if share is None:
+                    raise PlatformConfirmationError(
+                        "Instagram did not expose a Share control."
+                    )
+                share.click()
+                submitted = True
+                page.wait_for_url("**/p/**", timeout=30_000)
+                remote_id = _remote_id(page.url, "p")
+                if remote_id is None:
+                    raise AmbiguousPublishOutcome(
+                        "Instagram did not return a post ID; reconcile before retrying."
+                    )
+                confirmed = True
+                return remote_id
+        except PlatformConfirmationError:
+            raise
+        except Exception as exc:
+            if submitted:
+                raise AmbiguousPublishOutcome(
+                    "Instagram may have accepted the upload; reconcile it before retrying.",
+                    technical_detail=type(exc).__name__,
+                ) from None
+            raise PlatformTransientError(technical_detail=type(exc).__name__) from None
+        finally:
+            cleanup_failed = _close_browser_resources(context, browser)
+            if cleanup_failed and sys.exc_info()[0] is None and not confirmed:
+                raise PlatformTransientError(
+                    "Instagram browser resources could not be closed."
+                )
+
+    def get_video_stats(self, post_id: str) -> dict[str, int | float]:
+        """Return a complete verified snapshot or raise a typed failure."""
+        normalized = str(post_id or "").strip()
+        if not normalized:
+            raise PlatformConfirmationError(
+                "Instagram statistics require a confirmed post ID."
+            )
+        cookie = self._cookie()
+        browser = None
+        context = None
+        try:
+            with self._playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context(user_agent=_USER_AGENT)
+                context.add_cookies([cookie])
+                page = context.new_page()
+                page.goto(
+                    f"https://www.instagram.com/p/{normalized}/",
                     wait_until="networkidle",
                     timeout=30_000,
                 )
                 page.wait_for_timeout(3_000)
-
-                if api_stats:
-                    base.update(api_stats)
-                else:
-                    like_el = page.query_selector('section[class*="like"]') or \
-                              page.query_selector('[aria-label*="like"]')
-                    if like_el:
-                        text = like_el.inner_text().split()
-                        if text:
-                            base["likes"] = _parse_count(text[0])
-
-                    comment_link = page.query_selector('a[href*="/comments/"]')
-                    if comment_link:
-                        text = comment_link.inner_text().split()
-                        if text:
-                            base["comments"] = _parse_count(text[0])
-
-                    view_el = (
-                        page.query_selector('[aria-label*="views"]')
-                        or page.query_selector('span[class*="view"]')
+                values: dict[str, int | float] = {}
+                for key, selectors in {
+                    "likes": ('section[class*="like"]', '[aria-label*="like"]'),
+                    "comments": ('a[href*="/comments/"]',),
+                    "views": ('[aria-label*="views"]', 'span[class*="view"]'),
+                }.items():
+                    element = None
+                    for selector in selectors:
+                        element = page.query_selector(selector)
+                        if element is not None:
+                            break
+                    if element is None:
+                        raise PlatformStatsError(
+                            "Instagram returned an incomplete statistics snapshot."
+                        )
+                    words = element.inner_text().split()
+                    if not words:
+                        raise PlatformStatsError(
+                            "Instagram returned an invalid statistics snapshot."
+                        )
+                    values[key] = _parse_count(words[0])
+                values.update(
+                    _verified_supplemental_stats(
+                        self._supplemental_stats,
+                        normalized,
+                        ("shares", "revenue_usd"),
                     )
-                    if view_el:
-                        text = view_el.inner_text().split()
-                        if text:
-                            base["views"] = _parse_count(text[0])
+                )
+                return values
+        except (PlatformConfirmationError, PlatformStatsError):
+            raise
+        except Exception as exc:
+            raise PlatformStatsError(technical_detail=type(exc).__name__) from None
+        finally:
+            cleanup_failed = _close_browser_resources(context, browser)
+            if cleanup_failed and sys.exc_info()[0] is None:
+                raise PlatformStatsError(
+                    "Instagram browser resources could not be closed."
+                )
 
-            except Exception:
-                pass
-            finally:
-                browser.close()
-
-        return base
-
-    def get_video_url(self, post_id: str) -> str:
+    @staticmethod
+    def get_video_url(post_id: str) -> str:
         return f"https://www.instagram.com/p/{post_id}/"

@@ -1,157 +1,206 @@
-"""TikTok client via headless Playwright — upload + stats scraping.
+"""TikTok publishing client with explicit typed failures."""
 
-Required env var:
-  TIKTOK_SESSION_ID  — value of the `sessionid` cookie from a logged-in browser session
-
-Usage:
-  from src.publishing.tiktok import TikTokClient
-  tt = TikTokClient()
-  video_id = tt.upload("output/final.mp4", title="My video", description="#shorts")
-  stats = tt.get_video_stats(video_id)
-"""
+from __future__ import annotations
 
 import os
+import sys
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+
+from api.errors import AmbiguousPublishOutcome
+from src.publishing.errors import (
+    PlatformConfirmationError,
+    PlatformCredentialsError,
+    PlatformStatsError,
+    PlatformTransientError,
+)
+from src.publishing.youtube import _verified_supplemental_stats
 
 
 def _parse_count(text: str) -> int:
-    """Parse TikTok-style counts like '1.2K', '3.5M' into an integer."""
-    text = text.strip().upper().replace(",", "")
+    """Parse TikTok-style counts and reject malformed values."""
+    normalized = str(text).strip().upper().replace(",", "")
     try:
-        if text.endswith("K"):
-            return int(float(text[:-1]) * 1_000)
-        if text.endswith("M"):
-            return int(float(text[:-1]) * 1_000_000)
-        return int(text)
-    except (ValueError, IndexError):
-        return 0
-
-
-def _session_cookie() -> dict:
-    return {
-        "name": "sessionid",
-        "value": os.environ["TIKTOK_SESSION_ID"],
-        "domain": ".tiktok.com",
-        "path": "/",
-        "httpOnly": True,
-        "secure": True,
-    }
+        if normalized.endswith("K"):
+            return int(float(normalized[:-1]) * 1_000)
+        if normalized.endswith("M"):
+            return int(float(normalized[:-1]) * 1_000_000)
+        return int(normalized)
+    except (ValueError, IndexError) as exc:
+        raise PlatformStatsError("TikTok returned invalid statistics.") from exc
 
 
 class TikTokClient:
-    """Playwright-based TikTok uploader and stats scraper."""
+    """Playwright-backed TikTok uploader and statistics reader."""
+
+    def __init__(
+        self,
+        *,
+        playwright_factory: Callable[[], Any] | None = None,
+        supplemental_stats: Callable[[str], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self._playwright_factory = playwright_factory
+        self._supplemental_stats = supplemental_stats
+
+    def _playwright(self) -> Any:
+        if self._playwright_factory is not None:
+            return self._playwright_factory()
+        from playwright.sync_api import sync_playwright
+
+        return sync_playwright()
+
+    @staticmethod
+    def _cookie() -> dict[str, Any]:
+        session_id = str(os.getenv("TIKTOK_SESSION_ID") or "").strip()
+        if not session_id:
+            raise PlatformCredentialsError(
+                "TikTok publishing credentials are not configured."
+            )
+        return {
+            "name": "sessionid",
+            "value": session_id,
+            "domain": ".tiktok.com",
+            "path": "/",
+            "httpOnly": True,
+            "secure": True,
+        }
 
     def upload(
         self,
-        video_path,
+        video_path: str | Path,
         title: str,
         description: str = "",
-        **_,
+        **_: Any,
     ) -> str:
-        """Upload video to TikTok. Returns the video ID, or empty string on failure."""
-        from pathlib import Path
-        from playwright.sync_api import sync_playwright
-
-        video_id = ""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context(viewport={"width": 1920, "height": 1080})
-            context.add_cookies([_session_cookie()])
-            page = context.new_page()
-
-            page.goto("https://www.tiktok.com/upload", wait_until="networkidle")
-
-            file_input = page.query_selector('input[type="file"]')
-            if not file_input:
-                raise RuntimeError("Upload input not found on TikTok page")
-            file_input.set_input_files(str(video_path))
-
-            page.wait_for_selector('[data-e2e="upload-button"]', timeout=120_000)
-
-            caption_input = (
-                page.query_selector('[data-e2e="caption-input"]')
-                or page.query_selector('[contenteditable="true"]')
-            )
-            if caption_input:
-                caption_input.fill(f"{title} {description}".strip())
-
-            page.click('[data-e2e="upload-button"]')
-            print("⬆️ Submitted to TikTok!")
-
-            try:
+        """Upload one video and require an explicit confirmed remote ID."""
+        cookie = self._cookie()
+        browser = None
+        context = None
+        submitted = False
+        confirmed = False
+        try:
+            with self._playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context(viewport={"width": 1920, "height": 1080})
+                context.add_cookies([cookie])
+                page = context.new_page()
+                page.goto("https://www.tiktok.com/upload", wait_until="networkidle")
+                file_input = page.query_selector('input[type="file"]')
+                if file_input is None:
+                    raise PlatformConfirmationError(
+                        "TikTok did not expose a video upload control."
+                    )
+                file_input.set_input_files(str(video_path))
+                page.wait_for_selector('[data-e2e="upload-button"]', timeout=120_000)
+                caption = page.query_selector('[data-e2e="caption-input"]') or page.query_selector(
+                    '[contenteditable="true"]'
+                )
+                if caption is not None:
+                    caption.fill(f"{title} {description}".strip())
+                page.click('[data-e2e="upload-button"]')
+                submitted = True
                 page.wait_for_url("**/video/**", timeout=30_000)
-                parts = page.url.rstrip("/").split("/")
-                if "video" in parts:
-                    video_id = parts[parts.index("video") + 1]
-            except Exception:
-                pass
+                remote_id = _remote_id(page.url, "video")
+                if remote_id is None:
+                    raise AmbiguousPublishOutcome(
+                        "TikTok did not return a video ID; reconcile before retrying."
+                    )
+                confirmed = True
+                return remote_id
+        except PlatformConfirmationError:
+            raise
+        except Exception as exc:
+            if submitted:
+                raise AmbiguousPublishOutcome(
+                    "TikTok may have accepted the upload; reconcile it before retrying.",
+                    technical_detail=type(exc).__name__,
+                ) from None
+            raise PlatformTransientError(technical_detail=type(exc).__name__) from None
+        finally:
+            cleanup_failed = _close_browser_resources(context, browser)
+            if cleanup_failed and sys.exc_info()[0] is None and not confirmed:
+                raise PlatformTransientError(
+                    "TikTok browser resources could not be closed."
+                )
 
-            browser.close()
-
-        return video_id
-
-    def get_video_stats(self, video_id: str) -> dict:
-        """Scrape stats from a TikTok video page.
-
-        Intercepts the internal API response where available, falls back to DOM scraping.
-        revenue_usd is always 0.0 — no public monetisation API.
-        """
-        from playwright.sync_api import sync_playwright
-
-        base = {"views": 0, "likes": 0, "comments": 0, "revenue_usd": 0.0, "shares": 0}
-        if not video_id:
-            return base
-
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            context = browser.new_context()
-            context.add_cookies([_session_cookie()])
-            page = context.new_page()
-
-            try:
-                api_stats: dict = {}
-
-                def handle_response(response):
-                    if "api/item/detail" in response.url or "aweme/detail" in response.url:
-                        try:
-                            data = response.json()
-                            item = data.get("item_info", data.get("aweme_detail", {}))
-                            stats = item.get("stats", {})
-                            api_stats.update({
-                                "views": stats.get("play_count", 0),
-                                "likes": stats.get("digg_count", 0),
-                                "comments": stats.get("comment_count", 0),
-                                "shares": stats.get("share_count", 0),
-                            })
-                        except Exception:
-                            pass
-
-                page.on("response", handle_response)
+    def get_video_stats(self, video_id: str) -> dict[str, int | float]:
+        """Return a complete verified snapshot or raise a typed failure."""
+        normalized = str(video_id or "").strip()
+        if not normalized:
+            raise PlatformConfirmationError(
+                "TikTok statistics require a confirmed video ID."
+            )
+        cookie = self._cookie()
+        browser = None
+        context = None
+        try:
+            with self._playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                context = browser.new_context()
+                context.add_cookies([cookie])
+                page = context.new_page()
                 page.goto(
-                    f"https://www.tiktok.com/video/{video_id}",
+                    f"https://www.tiktok.com/video/{normalized}",
                     wait_until="networkidle",
                     timeout=30_000,
                 )
                 page.wait_for_timeout(3_000)
+                values: dict[str, int | float] = {}
+                for key, selector in {
+                    "views": '[data-e2e="video-views"]',
+                    "likes": '[data-e2e="like-count"]',
+                    "comments": '[data-e2e="comment-count"]',
+                    "shares": '[data-e2e="share-count"]',
+                }.items():
+                    element = page.query_selector(selector)
+                    if element is None:
+                        raise PlatformStatsError(
+                            "TikTok returned an incomplete statistics snapshot."
+                        )
+                    values[key] = _parse_count(element.inner_text())
+                values.update(
+                    _verified_supplemental_stats(
+                        self._supplemental_stats,
+                        normalized,
+                        ("revenue_usd",),
+                    )
+                )
+                return values
+        except (PlatformConfirmationError, PlatformStatsError):
+            raise
+        except Exception as exc:
+            raise PlatformStatsError(technical_detail=type(exc).__name__) from None
+        finally:
+            cleanup_failed = _close_browser_resources(context, browser)
+            if cleanup_failed and sys.exc_info()[0] is None:
+                raise PlatformStatsError(
+                    "TikTok browser resources could not be closed."
+                )
 
-                if api_stats:
-                    base.update(api_stats)
-                else:
-                    for key, sel in {
-                        "views":    '[data-e2e="video-views"]',
-                        "likes":    '[data-e2e="like-count"]',
-                        "comments": '[data-e2e="comment-count"]',
-                        "shares":   '[data-e2e="share-count"]',
-                    }.items():
-                        el = page.query_selector(sel)
-                        if el:
-                            base[key] = _parse_count(el.inner_text())
-
-            except Exception:
-                pass
-            finally:
-                browser.close()
-
-        return base
-
-    def get_video_url(self, video_id: str) -> str:
+    @staticmethod
+    def get_video_url(video_id: str) -> str:
         return f"https://www.tiktok.com/video/{video_id}"
+
+
+def _remote_id(url: object, marker: str) -> str | None:
+    parts = str(url).rstrip("/").split("/")
+    if marker not in parts:
+        return None
+    index = parts.index(marker) + 1
+    if index >= len(parts):
+        return None
+    return parts[index].strip() or None
+
+
+def _close_browser_resources(context: Any | None, browser: Any | None) -> bool:
+    """Attempt both closes and report failure without masking a primary error."""
+    failed = False
+    for resource in (context, browser):
+        if resource is None:
+            continue
+        try:
+            resource.close()
+        except Exception:
+            failed = True
+    return failed

@@ -409,6 +409,130 @@ def test_publishing_rejects_empty_remote_id_and_reuses_metadata(store):
         store.upsert_release(job["id"], "youtube", status="uploaded", remote_id="")
 
 
+def test_publication_request_rolls_back_release_when_event_insert_fails(
+    store, monkeypatch
+):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    before = store.get_job_detail(job["id"])
+
+    def fail_event(connection, job_id, **fields):
+        raise RuntimeError("injected event failure")
+
+    monkeypatch.setattr(store, "_insert_event", fail_event)
+
+    with pytest.raises(RuntimeError, match="injected event failure"):
+        store.request_publication(
+            job["id"],
+            "youtube",
+            metadata={"video_title": "Persist me once"},
+        )
+
+    assert store.get_job_detail(job["id"]) == before
+
+
+def test_publication_claim_and_completion_are_atomic_with_release_and_event(
+    store, monkeypatch
+):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(
+        job["id"],
+        "youtube",
+        metadata={"video_title": "Original"},
+    )
+    attempt, claimed, release = store.claim_publishing_attempt(
+        job["id"], "youtube", retry_cycle=1, lease_owner="atomic-worker"
+    )
+    assert claimed is True
+    assert release["status"] == "uploading"
+    before = store.get_job_detail(job["id"])
+
+    def fail_event(connection, job_id, **fields):
+        raise RuntimeError("injected completion event failure")
+
+    monkeypatch.setattr(store, "_insert_event", fail_event)
+
+    with pytest.raises(RuntimeError, match="injected completion event failure"):
+        store.complete_publishing_attempt(
+            attempt["id"],
+            outcome="completed",
+            release_status="uploaded",
+            remote_id="remote-1",
+            lease_owner="atomic-worker",
+        )
+
+    assert store.get_job_detail(job["id"]) == before
+
+
+def test_expired_publishing_owner_cannot_complete_attempt(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    attempt, claimed, _ = store.claim_publishing_attempt(
+        job["id"],
+        "youtube",
+        retry_cycle=1,
+        lease_owner="worker-a",
+        lease_seconds=1,
+    )
+    assert claimed is True
+    store.clock = lambda: datetime(2026, 7, 22, 12, 0, 2, tzinfo=UTC)
+
+    with pytest.raises(PermissionError, match="lease"):
+        store.complete_publishing_attempt(
+            attempt["id"],
+            outcome="completed",
+            release_status="uploaded",
+            remote_id="remote-late",
+            lease_owner="worker-a",
+        )
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["publishing_attempts"][0]["finished_at"] is None
+    assert detail["releases"][0]["remote_id"] is None
+
+
+def test_wrong_publishing_owner_cannot_complete_attempt(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    attempt, claimed, _ = store.claim_publishing_attempt(
+        job["id"],
+        "youtube",
+        retry_cycle=1,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    )
+    assert claimed is True
+
+    with pytest.raises(PermissionError, match="lease"):
+        store.complete_publishing_attempt(
+            attempt["id"],
+            outcome="completed",
+            release_status="uploaded",
+            remote_id="remote-wrong-owner",
+            lease_owner="worker-b",
+        )
+
+
+def test_omitted_publishing_owner_cannot_bypass_completion_fence(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    attempt, claimed, _ = store.claim_publishing_attempt(
+        job["id"],
+        "youtube",
+        retry_cycle=1,
+        lease_owner="worker-a",
+        lease_seconds=60,
+    )
+    assert claimed is True
+
+    with pytest.raises(PermissionError, match="lease"):
+        store.complete_publishing_attempt(
+            attempt["id"],
+            outcome="completed",
+            release_status="uploaded",
+            remote_id="remote-owner-omitted",
+        )
+
+
 def test_repeating_terminal_stage_transition_preserves_timestamp_and_history(store):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     store.ensure_stage(job["id"], "analysis", state=StageState.QUEUED)

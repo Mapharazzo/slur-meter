@@ -1565,6 +1565,480 @@ class OperationStore:
             resolved = self._resolve_job_id(connection, job_id)
             return [] if resolved is None else self._decision_rows(connection, resolved)
 
+    def request_publication(
+        self,
+        job_id: str,
+        platform: str,
+        *,
+        metadata: Mapping[str, Any] | None = None,
+        metadata_factory: Callable[[], Mapping[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """Persist one explicit platform request without replacing its metadata."""
+        now = self._now_text()
+        normalized_platform = str(platform).strip().lower()
+        if not normalized_platform:
+            raise ValueError("A publishing platform is required")
+        if (metadata is None) == (metadata_factory is None):
+            raise ValueError("Provide exactly one publishing metadata source")
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            existing = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if existing is not None:
+                return self._release_dto(existing), False
+            snapshot = metadata if metadata is not None else metadata_factory()
+            connection.execute(
+                """INSERT INTO releases
+                   (job_id, platform, status, metadata_json, updated_at)
+                   VALUES (?, ?, 'pending', ?, ?)""",
+                (
+                    resolved,
+                    normalized_platform,
+                    _safe_json_dump(snapshot),
+                    now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_requested",
+                message=f"Publishing to {normalized_platform} was requested.",
+                data={"platform": normalized_platform},
+                created_at=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            return self._release_dto(row), True
+
+    def recover_expired_publishing_attempt(
+        self, job_id: str, platform: str
+    ) -> tuple[dict[str, Any], bool]:
+        """Mark an expired publishing lease ambiguous without touching live work."""
+        now = self._now_text()
+        normalized_platform = str(platform).strip().lower()
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            release = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if release is None:
+                raise KeyError("Publishing release was not found")
+            if release["status"] != "uploading":
+                return self._release_dto(release), False
+            attempt = connection.execute(
+                """SELECT * FROM publishing_attempts
+                   WHERE job_id = ? AND platform = ? AND finished_at IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if attempt is None:
+                raise ValueError("Uploading release has no active publishing attempt")
+            if not attempt["lease_expires_at"] or attempt["lease_expires_at"] > now:
+                return self._release_dto(release), False
+            code = "ambiguous_publish_outcome"
+            message = "The interrupted publishing result requires reconciliation."
+            connection.execute(
+                """UPDATE publishing_attempts SET finished_at = ?, outcome = 'ambiguous',
+                       retryable = 0, safe_error_code = ?, safe_error_message = ?
+                   WHERE id = ? AND finished_at IS NULL""",
+                (now, code, message, attempt["id"]),
+            )
+            connection.execute(
+                """UPDATE releases SET status = 'needs_attention',
+                       safe_error_code = ?, safe_error_message = ?, updated_at = ?
+                   WHERE id = ?""",
+                (code, message, now, release["id"]),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_ambiguous",
+                severity="warning",
+                message=f"Publishing to {normalized_platform} was interrupted.",
+                data={
+                    "platform": normalized_platform,
+                    "publishing_attempt_id": int(attempt["id"]),
+                    "outcome": "ambiguous",
+                    "retryable": False,
+                },
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM releases WHERE id = ?", (release["id"],)
+            ).fetchone()
+            return self._release_dto(updated), True
+
+    def claim_publishing_attempt(
+        self,
+        job_id: str,
+        platform: str,
+        *,
+        retry_cycle: int,
+        max_attempts: int = 3,
+        trigger: AttemptTrigger | str = AttemptTrigger.AUTOMATIC,
+        lease_owner: str | None = None,
+        lease_seconds: float = 120.0,
+    ) -> tuple[dict[str, Any] | None, bool, dict[str, Any]]:
+        """Atomically claim a publication call and mark its release uploading."""
+        if lease_seconds <= 0:
+            raise ValueError("Publishing lease duration must be positive")
+        now_dt = self._now_datetime()
+        now = now_dt.isoformat()
+        owner = str(lease_owner or f"publishing-{uuid.uuid4().hex}")
+        expires = (now_dt + timedelta(seconds=float(lease_seconds))).isoformat()
+        normalized_platform = str(platform).strip().lower()
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            release = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if release is None:
+                raise KeyError("Publishing was not requested for this platform")
+            if release["status"] in {"uploaded", "uploading", "needs_attention"}:
+                active = connection.execute(
+                    """SELECT * FROM publishing_attempts
+                       WHERE job_id = ? AND platform = ? AND finished_at IS NULL
+                       ORDER BY id DESC LIMIT 1""",
+                    (resolved, normalized_platform),
+                ).fetchone()
+                return (
+                    self._publishing_dto(active) if active is not None else None,
+                    False,
+                    self._release_dto(release),
+                )
+            active = connection.execute(
+                """SELECT * FROM publishing_attempts
+                   WHERE job_id = ? AND platform = ? AND finished_at IS NULL
+                   ORDER BY id DESC LIMIT 1""",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if active is not None:
+                return self._publishing_dto(active), False, self._release_dto(release)
+            number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(attempt_number), 0) + 1
+                       FROM publishing_attempts
+                       WHERE job_id = ? AND platform = ? AND retry_cycle = ?""",
+                    (resolved, normalized_platform, int(retry_cycle)),
+                ).fetchone()[0]
+            )
+            if number > int(max_attempts):
+                return None, False, self._release_dto(release)
+            cursor = connection.execute(
+                """INSERT INTO publishing_attempts
+                   (job_id, platform, retry_cycle, attempt_number, max_attempts,
+                    trigger, started_at, metadata_json, lease_owner, lease_expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resolved,
+                    normalized_platform,
+                    int(retry_cycle),
+                    number,
+                    int(max_attempts),
+                    _enum_value(AttemptTrigger, trigger),
+                    now,
+                    release["metadata_json"],
+                    owner,
+                    expires,
+                ),
+            )
+            connection.execute(
+                """UPDATE releases SET status = 'uploading', safe_error_code = NULL,
+                       safe_error_message = NULL, updated_at = ? WHERE id = ?""",
+                (now, release["id"]),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_attempt_started",
+                message=f"Publishing to {normalized_platform} started.",
+                data={
+                    "platform": normalized_platform,
+                    "retry_cycle": int(retry_cycle),
+                    "attempt_number": number,
+                    "max_attempts": int(max_attempts),
+                },
+                created_at=now,
+            )
+            attempt = connection.execute(
+                "SELECT * FROM publishing_attempts WHERE id = ?",
+                (cursor.lastrowid,),
+            ).fetchone()
+            updated_release = connection.execute(
+                "SELECT * FROM releases WHERE id = ?", (release["id"],)
+            ).fetchone()
+            return (
+                self._publishing_dto(attempt),
+                True,
+                self._release_dto(updated_release),
+            )
+
+    def renew_publishing_attempt_lease(
+        self,
+        attempt_id: int,
+        owner: str,
+        *,
+        lease_seconds: float,
+    ) -> bool:
+        """Renew only the current owner's still-live publication claim."""
+        if lease_seconds <= 0:
+            raise ValueError("Publishing lease duration must be positive")
+        now_dt = self._now_datetime()
+        with self._mutation() as connection:
+            cursor = connection.execute(
+                """UPDATE publishing_attempts SET lease_expires_at = ?
+                   WHERE id = ? AND finished_at IS NULL AND lease_owner = ?
+                     AND lease_expires_at > ?""",
+                (
+                    (now_dt + timedelta(seconds=float(lease_seconds))).isoformat(),
+                    int(attempt_id),
+                    str(owner),
+                    now_dt.isoformat(),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    def complete_publishing_attempt(
+        self,
+        attempt_id: int,
+        *,
+        outcome: str,
+        release_status: str,
+        retryable: bool = False,
+        safe_error_code: str | None = None,
+        safe_error_message: object | None = None,
+        remote_id: str | None = None,
+        lease_owner: str | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Finish an attempt, release summary, and event in one transaction."""
+        now = self._now_text()
+        normalized_remote_id = str(remote_id or "").strip() or None
+        if release_status == "uploaded" and normalized_remote_id is None:
+            raise ValueError("An uploaded release requires a non-empty remote ID")
+        with self._mutation() as connection:
+            attempt = connection.execute(
+                "SELECT * FROM publishing_attempts WHERE id = ?", (int(attempt_id),)
+            ).fetchone()
+            if attempt is None:
+                raise KeyError("Publishing attempt was not found")
+            if (
+                attempt["finished_at"] is None
+                and attempt["lease_owner"] is not None
+                and (
+                    lease_owner is None
+                    or attempt["lease_owner"] != str(lease_owner)
+                    or not attempt["lease_expires_at"]
+                    or attempt["lease_expires_at"] <= now
+                )
+            ):
+                raise PermissionError("Publishing attempt lease is no longer valid")
+            release = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (attempt["job_id"], attempt["platform"]),
+            ).fetchone()
+            if release is None:
+                raise KeyError("Publishing release was not found")
+            if attempt["finished_at"] is not None:
+                return self._publishing_dto(attempt), self._release_dto(release)
+            connection.execute(
+                """UPDATE publishing_attempts SET finished_at = ?, outcome = ?,
+                       retryable = ?, safe_error_code = ?, safe_error_message = ?,
+                       remote_id = ?, lease_owner = NULL, lease_expires_at = NULL
+                   WHERE id = ?""",
+                (
+                    now,
+                    _safe_text(outcome),
+                    int(bool(retryable)),
+                    _safe_text(safe_error_code),
+                    _safe_text(safe_error_message),
+                    _safe_text(normalized_remote_id) if normalized_remote_id else None,
+                    int(attempt_id),
+                ),
+            )
+            connection.execute(
+                """UPDATE releases SET status = ?, remote_id = COALESCE(?, remote_id),
+                       uploaded_at = CASE WHEN ? = 'uploaded' THEN COALESCE(uploaded_at, ?)
+                                          ELSE uploaded_at END,
+                       safe_error_code = ?, safe_error_message = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    _safe_text(release_status),
+                    _safe_text(normalized_remote_id) if normalized_remote_id else None,
+                    release_status,
+                    now,
+                    _safe_text(safe_error_code),
+                    _safe_text(safe_error_message),
+                    now,
+                    release["id"],
+                ),
+            )
+            event_type = {
+                "completed": "publishing_completed",
+                "ambiguous": "publishing_ambiguous",
+            }.get(outcome, "publishing_attempt_failed")
+            self._insert_event(
+                connection,
+                attempt["job_id"],
+                event_type=event_type,
+                severity="info" if outcome == "completed" else "warning",
+                message=(
+                    f"Publishing to {attempt['platform']} completed."
+                    if outcome == "completed"
+                    else f"Publishing to {attempt['platform']} did not complete."
+                ),
+                data={
+                    "platform": attempt["platform"],
+                    "publishing_attempt_id": int(attempt_id),
+                    "outcome": outcome,
+                    "retryable": bool(retryable),
+                },
+                created_at=now,
+            )
+            updated_attempt = connection.execute(
+                "SELECT * FROM publishing_attempts WHERE id = ?", (int(attempt_id),)
+            ).fetchone()
+            updated_release = connection.execute(
+                "SELECT * FROM releases WHERE id = ?", (release["id"],)
+            ).fetchone()
+            return (
+                self._publishing_dto(updated_attempt),
+                self._release_dto(updated_release),
+            )
+
+    def reconcile_publication(
+        self,
+        job_id: str,
+        platform: str,
+        *,
+        outcome: str,
+        remote_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record an operator's explicit resolution of an ambiguous upload."""
+        now = self._now_text()
+        normalized_platform = str(platform).strip().lower()
+        normalized_remote_id = str(remote_id or "").strip() or None
+        if outcome not in {"uploaded", "not_uploaded"}:
+            raise ValueError("Unknown publishing reconciliation outcome")
+        if outcome == "uploaded" and normalized_remote_id is None:
+            raise ValueError("An uploaded reconciliation requires a remote ID")
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            release = connection.execute(
+                "SELECT * FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if release is None:
+                raise KeyError("Publishing release was not found")
+            if not (
+                release["status"] == "needs_attention"
+                and release["safe_error_code"]
+                in {"ambiguous_publish", "ambiguous_publish_outcome"}
+            ):
+                raise ValueError("Only an ambiguous publication can be reconciled")
+            status = "uploaded" if outcome == "uploaded" else "failed"
+            error_code = None if outcome == "uploaded" else "publishing_reconciled_absent"
+            error_message = (
+                None
+                if outcome == "uploaded"
+                else "Reconciliation confirmed that no remote publication exists."
+            )
+            connection.execute(
+                """UPDATE releases SET status = ?, remote_id = COALESCE(?, remote_id),
+                       uploaded_at = CASE WHEN ? = 'uploaded' THEN COALESCE(uploaded_at, ?)
+                                          ELSE uploaded_at END,
+                       safe_error_code = ?, safe_error_message = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    status,
+                    _safe_text(normalized_remote_id) if normalized_remote_id else None,
+                    status,
+                    now,
+                    error_code,
+                    error_message,
+                    now,
+                    release["id"],
+                ),
+            )
+            connection.execute(
+                """INSERT INTO admin_decisions
+                   (job_id, action, platform, accepted, reason, created_at)
+                   VALUES (?, 'reconcile_publishing', ?, 1, ?, ?)""",
+                (resolved, normalized_platform, outcome, now),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_reconciled",
+                message=f"Publishing to {normalized_platform} was reconciled.",
+                data={"platform": normalized_platform, "outcome": outcome},
+                created_at=now,
+            )
+            updated = connection.execute(
+                "SELECT * FROM releases WHERE id = ?", (release["id"],)
+            ).fetchone()
+            return self._release_dto(updated)
+
+    def store_publishing_stats(
+        self,
+        job_id: str,
+        platform: str,
+        date: str,
+        metrics: Mapping[str, int | float],
+    ) -> dict[str, Any]:
+        """Atomically store one verified metrics snapshot and its event."""
+        now = self._now_text()
+        normalized_platform = str(platform).strip().lower()
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            release = connection.execute(
+                "SELECT remote_id, status FROM releases WHERE job_id = ? AND platform = ?",
+                (resolved, normalized_platform),
+            ).fetchone()
+            if release is None or release["status"] != "uploaded" or not str(
+                release["remote_id"] or ""
+            ).strip():
+                raise ValueError("Statistics require a confirmed remote publication")
+            connection.execute(
+                """INSERT INTO revenue
+                   (job_id, platform, date, views, revenue_usd, likes, comments,
+                    shares, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id, platform, date) DO UPDATE SET
+                     views = excluded.views, revenue_usd = excluded.revenue_usd,
+                     likes = excluded.likes, comments = excluded.comments,
+                     shares = excluded.shares, fetched_at = excluded.fetched_at""",
+                (
+                    resolved,
+                    normalized_platform,
+                    str(date),
+                    int(metrics["views"]),
+                    float(metrics["revenue_usd"]),
+                    int(metrics["likes"]),
+                    int(metrics["comments"]),
+                    int(metrics["shares"]),
+                    now,
+                ),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="publishing_stats_refreshed",
+                message=f"Statistics for {normalized_platform} were refreshed.",
+                data={"platform": normalized_platform, "date": str(date)},
+                created_at=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM revenue WHERE job_id = ? AND platform = ? AND date = ?",
+                (resolved, normalized_platform, str(date)),
+            ).fetchone()
+            return self._revenue_dto(row)
+
     def start_publishing_attempt(
         self,
         job_id: str,

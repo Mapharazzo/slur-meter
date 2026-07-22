@@ -202,7 +202,7 @@ def test_legacy_jobs_children_and_orphans_are_preserved(migrated_store):
     )
     assert migrated_store.get_job_detail("orphan_revenue")["revenue"][0]["views"] == 123
     assert migrated_store.foreign_key_violations() == []
-    assert migrated_store.schema_versions() == [1, 2]
+    assert migrated_store.schema_versions() == [1, 2, 3]
 
 
 def test_interrupted_legacy_work_is_queued_with_recovery_history(migrated_store):
@@ -227,7 +227,7 @@ def test_initialize_is_idempotent_and_does_not_duplicate_migrated_history(
     migrated_store.initialize()
 
     after = migrated_store.get_job_detail("tt0110912")
-    assert migrated_store.schema_versions() == [1, 2]
+    assert migrated_store.schema_versions() == [1, 2, 3]
     assert after["stages"] == before["stages"]
     assert after["attempts"] == before["attempts"]
     assert after["events"] == before["events"]
@@ -240,7 +240,7 @@ def test_fresh_database_has_versioned_foreign_key_safe_schema(tmp_path):
 
     store.initialize()
 
-    assert store.schema_versions() == [1, 2]
+    assert store.schema_versions() == [1, 2, 3]
     assert store.foreign_key_violations() == []
     with sqlite3.connect(store.path) as connection:
         tables = {
@@ -261,6 +261,29 @@ def test_fresh_database_has_versioned_foreign_key_safe_schema(tmp_path):
         "releases",
         "revenue",
     } <= tables
+
+
+def test_v3_migration_marks_unfinished_lease_less_publication_ambiguous(tmp_path):
+    path = tmp_path / "v2-active-publication.db"
+    store = OperationStore(path)
+    store.initialize()
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.request_publication(job["id"], "youtube", metadata={"title": "Stable"})
+    store.claim_publishing_attempt(job["id"], "youtube", retry_cycle=1)
+    with store._connection() as connection:
+        connection.execute("DELETE FROM schema_migrations WHERE version = 3")
+        connection.execute(
+            "ALTER TABLE publishing_attempts DROP COLUMN lease_expires_at"
+        )
+        connection.execute("ALTER TABLE publishing_attempts DROP COLUMN lease_owner")
+
+    store.initialize()
+
+    detail = store.get_job_detail(job["id"])
+    assert store.schema_versions() == [1, 2, 3]
+    assert detail["publishing_attempts"][0]["outcome"] == "ambiguous"
+    assert detail["publishing_attempts"][0]["finished_at"] is not None
+    assert detail["releases"][0]["status"] == "needs_attention"
 
 
 def test_failed_migration_rolls_back_schema_and_data_changes(tmp_path):

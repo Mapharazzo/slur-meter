@@ -1,23 +1,28 @@
-"""YouTube Data API v3 client for Shorts — upload + analytics.
+"""YouTube Data API client with explicit publication confirmation failures."""
 
-Required env vars:
-  YOUTUBE_CLIENT_ID      — OAuth2 client ID from Google Cloud Console
-  YOUTUBE_CLIENT_SECRET  — OAuth2 client secret
-  YOUTUBE_REFRESH_TOKEN  — Long-lived refresh token (obtain once via OAuth flow)
+from __future__ import annotations
 
-Usage:
-  from src.publishing.youtube import YouTubeClient
-  yt = YouTubeClient()
-  video_id = yt.upload("output/final.mp4", title="...", description="...")
-  stats = yt.get_video_stats(video_id)
-"""
-
+import math
 import os
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
+
+from google.auth.exceptions import TransportError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import Timeout as RequestsTimeout
+
+from api.errors import AmbiguousPublishOutcome
+from src.publishing.errors import (
+    PlatformConfirmationError,
+    PlatformCredentialsError,
+    PlatformStatsError,
+    PlatformTransientError,
+)
 
 
 class YouTubeClient:
-    """Wraps YouTube Data API v3 for uploading Shorts and fetching stats."""
+    """Wrap YouTube upload and statistics calls behind a testable boundary."""
 
     SCOPES = [
         "https://www.googleapis.com/auth/youtube.upload",
@@ -25,31 +30,67 @@ class YouTubeClient:
     ]
     TOKEN_URI = "https://oauth2.googleapis.com/token"
 
-    def __init__(self):
-        self._youtube = None
+    def __init__(
+        self,
+        *,
+        youtube: Any | None = None,
+        media_upload_factory: Callable[..., Any] | None = None,
+        youtube_builder: Callable[[], Any] | None = None,
+        supplemental_stats: Callable[[str], Mapping[str, Any]] | None = None,
+    ) -> None:
+        self._youtube = youtube
+        self._media_upload_factory = media_upload_factory
+        self._youtube_builder = youtube_builder
+        self._supplemental_stats = supplemental_stats
 
-    def _build(self):
-        from google.auth.transport.requests import Request
-        from google.oauth2.credentials import Credentials
-        from googleapiclient.discovery import build
+    def _build(self) -> None:
+        missing = [
+            name
+            for name in (
+                "YOUTUBE_CLIENT_ID",
+                "YOUTUBE_CLIENT_SECRET",
+                "YOUTUBE_REFRESH_TOKEN",
+            )
+            if not str(os.getenv(name) or "").strip()
+        ]
+        if missing:
+            raise PlatformCredentialsError(
+                "YouTube publishing credentials are not configured."
+            )
 
-        client_id = os.environ["YOUTUBE_CLIENT_ID"]
-        client_secret = os.environ["YOUTUBE_CLIENT_SECRET"]
-        refresh_token = os.environ["YOUTUBE_REFRESH_TOKEN"]
+        try:
+            if self._youtube_builder is not None:
+                self._youtube = self._youtube_builder()
+                if self._youtube is None:
+                    raise ValueError("YouTube builder returned no service")
+                return
+            from google.auth.transport.requests import Request
+            from google.oauth2.credentials import Credentials
+            from googleapiclient.discovery import build
 
-        creds = Credentials(
-            token=None,
-            refresh_token=refresh_token,
-            token_uri=self.TOKEN_URI,
-            client_id=client_id,
-            client_secret=client_secret,
-            scopes=self.SCOPES,
-        )
-        creds.refresh(Request())
-        self._youtube = build("youtube", "v3", credentials=creds)
+            creds = Credentials(
+                token=None,
+                refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+                token_uri=self.TOKEN_URI,
+                client_id=os.environ["YOUTUBE_CLIENT_ID"],
+                client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+                scopes=self.SCOPES,
+            )
+            creds.refresh(Request())
+            self._youtube = build("youtube", "v3", credentials=creds)
+        except (
+            TimeoutError,
+            ConnectionError,
+            TransportError,
+            RequestsConnectionError,
+            RequestsTimeout,
+        ) as exc:
+            raise PlatformTransientError(technical_detail=type(exc).__name__) from None
+        except Exception as exc:
+            raise PlatformCredentialsError(technical_detail=type(exc).__name__) from None
 
     @property
-    def youtube(self):
+    def youtube(self) -> Any:
         if self._youtube is None:
             self._build()
         return self._youtube
@@ -60,13 +101,13 @@ class YouTubeClient:
         title: str,
         description: str,
         tags: list[str] | None = None,
-        category_id: str = "24",  # Entertainment
-        privacy_status: str = "public",
-        **_,
+        category_id: str = "24",
+        privacy_status: str = "private",
+        **_: Any,
     ) -> str:
-        """Upload a 9:16 video as a YouTube Short. Returns the video ID."""
-        from googleapiclient.http import MediaFileUpload
-
+        """Upload a Short and require an explicit non-empty video ID."""
+        if privacy_status not in {"private", "unlisted", "public"}:
+            raise ValueError("YouTube privacy must be private, unlisted, or public")
         body = {
             "snippet": {
                 "title": title,
@@ -79,46 +120,119 @@ class YouTubeClient:
                 "selfDeclaredMadeForKids": False,
             },
         }
+        try:
+            media_factory = self._media_upload_factory
+            if media_factory is None:
+                from googleapiclient.http import MediaFileUpload
 
-        media = MediaFileUpload(
-            str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4"
-        )
-
-        request = self.youtube.videos().insert(
-            part=",".join(body.keys()), body=body, media_body=media
-        )
-
-        response = None
-        while response is None:
-            _, response = request.next_chunk()
-
-        video_id = response["id"]
-        print(f"✅ YouTube upload complete: {self.get_video_url(video_id)}")
+                media_factory = MediaFileUpload
+            media = media_factory(
+                str(video_path), chunksize=-1, resumable=True, mimetype="video/mp4"
+            )
+            request = self.youtube.videos().insert(
+                part=",".join(body), body=body, media_body=media
+            )
+        except Exception as exc:
+            raise PlatformTransientError(technical_detail=type(exc).__name__) from None
+        response: Mapping[str, Any] | None = None
+        try:
+            while response is None:
+                _, response = request.next_chunk()
+        except Exception as exc:
+            raise AmbiguousPublishOutcome(
+                "YouTube may have accepted the upload; reconcile it before retrying.",
+                technical_detail=type(exc).__name__,
+            ) from None
+        if not isinstance(response, Mapping):
+            raise AmbiguousPublishOutcome(
+                "YouTube returned an invalid upload confirmation; reconcile before retrying."
+            )
+        video_id = str(response.get("id") or "").strip()
+        if not video_id:
+            raise AmbiguousPublishOutcome(
+                "YouTube did not return a video ID; reconcile before retrying."
+            )
         return video_id
 
-    def get_video_stats(self, video_id: str) -> dict:
-        """Return views, likes, comments for a video.
-
-        revenue_usd is always 0.0 — requires YouTube Partner Program + Analytics API.
-        shares are not exposed via the public Data API.
-        """
-        result = (
-            self.youtube.videos()
-            .list(part="statistics", id=video_id)
-            .execute()
-        )
-        items = result.get("items", [])
+    def get_video_stats(self, video_id: str) -> dict[str, int | float]:
+        """Return a complete snapshot or raise instead of synthesizing success."""
+        normalized = str(video_id or "").strip()
+        if not normalized:
+            raise PlatformConfirmationError(
+                "YouTube statistics require a confirmed video ID.",
+                actions=("reconcile_publishing",),
+            )
+        try:
+            result = (
+                self.youtube.videos()
+                .list(part="statistics", id=normalized)
+                .execute()
+            )
+        except Exception as exc:
+            raise PlatformStatsError(technical_detail=type(exc).__name__) from None
+        items = result.get("items", []) if isinstance(result, Mapping) else []
         if not items:
-            return {"views": 0, "likes": 0, "comments": 0, "revenue_usd": 0.0, "shares": 0}
-
-        stats = items[0]["statistics"]
+            raise PlatformStatsError(
+                "YouTube did not return statistics for the confirmed video."
+            )
+        try:
+            stats = items[0]["statistics"]
+            views = int(stats["viewCount"])
+            likes = int(stats["likeCount"])
+            comments = int(stats["commentCount"])
+        except (KeyError, TypeError, ValueError, IndexError) as exc:
+            raise PlatformStatsError(
+                "YouTube returned an invalid statistics snapshot.",
+                technical_detail=type(exc).__name__,
+            ) from None
+        if min(views, likes, comments) < 0:
+            raise PlatformStatsError("YouTube returned negative statistics.")
+        supplemental = _verified_supplemental_stats(
+            self._supplemental_stats, normalized, ("shares", "revenue_usd")
+        )
         return {
-            "views": int(stats.get("viewCount", 0)),
-            "likes": int(stats.get("likeCount", 0)),
-            "comments": int(stats.get("commentCount", 0)),
-            "revenue_usd": 0.0,
-            "shares": 0,
+            "views": views,
+            "likes": likes,
+            "comments": comments,
+            "revenue_usd": float(supplemental["revenue_usd"]),
+            "shares": int(supplemental["shares"]),
         }
 
-    def get_video_url(self, video_id: str) -> str:
+    @staticmethod
+    def get_video_url(video_id: str) -> str:
         return f"https://www.youtube.com/shorts/{video_id}"
+
+
+def _verified_supplemental_stats(
+    provider: Callable[[str], Mapping[str, Any]] | None,
+    remote_id: str,
+    fields: tuple[str, ...],
+) -> Mapping[str, int | float]:
+    if provider is None:
+        raise PlatformStatsError(
+            "Complete platform statistics are not configured."
+        )
+    try:
+        values = provider(remote_id)
+    except PlatformStatsError:
+        raise
+    except Exception as exc:
+        raise PlatformStatsError(technical_detail=type(exc).__name__) from None
+    if not isinstance(values, Mapping) or any(field not in values for field in fields):
+        raise PlatformStatsError(
+            "The supplemental statistics snapshot is incomplete."
+        )
+    result: dict[str, int | float] = {}
+    for field in fields:
+        value = values[field]
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise PlatformStatsError(
+                "The supplemental statistics snapshot is invalid."
+            )
+        result[field] = value
+    return result

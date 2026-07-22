@@ -213,6 +213,8 @@ SCHEMA_STATEMENTS = (
         safe_error_message TEXT,
         remote_id TEXT,
         metadata_json TEXT NOT NULL DEFAULT '{}',
+        lease_owner TEXT,
+        lease_expires_at TEXT,
         UNIQUE(job_id, platform, retry_cycle, attempt_number)
     )
     """,
@@ -289,6 +291,7 @@ def apply_migrations(connection: sqlite3.Connection, now: str) -> None:
         migrations: tuple[tuple[int, str, Migration], ...] = (
             (1, "legacy_schema_detected", _mark_legacy_schema),
             (2, "operational_schema", _migrate_operational_schema),
+            (3, "publishing_attempt_leases", _add_publishing_attempt_leases),
         )
         for version, name, migration in migrations:
             if version in applied:
@@ -310,6 +313,45 @@ def apply_migrations(connection: sqlite3.Connection, now: str) -> None:
 def _mark_legacy_schema(connection: sqlite3.Connection, _now: str) -> None:
     """Version one records the explicitly inspected pre-operational baseline."""
     _table_names(connection)
+
+
+def _add_publishing_attempt_leases(
+    connection: sqlite3.Connection, _now: str
+) -> None:
+    """Add only the liveness fields needed to reconcile abandoned uploads safely."""
+    if "publishing_attempts" not in _table_names(connection):
+        return
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(publishing_attempts)")
+    }
+    if "lease_owner" not in columns:
+        connection.execute("ALTER TABLE publishing_attempts ADD COLUMN lease_owner TEXT")
+    if "lease_expires_at" not in columns:
+        connection.execute(
+            "ALTER TABLE publishing_attempts ADD COLUMN lease_expires_at TEXT"
+        )
+    code = "ambiguous_publish_outcome"
+    message = "An unfinished pre-lease publishing attempt requires reconciliation."
+    connection.execute(
+        """UPDATE publishing_attempts SET finished_at = ?, outcome = 'ambiguous',
+               retryable = 0, safe_error_code = ?, safe_error_message = ?
+           WHERE finished_at IS NULL
+             AND (lease_owner IS NULL OR lease_expires_at IS NULL)""",
+        (_now, code, message),
+    )
+    connection.execute(
+        """UPDATE releases SET status = 'needs_attention', safe_error_code = ?,
+               safe_error_message = ?, updated_at = ?
+           WHERE status = 'uploading' AND EXISTS (
+               SELECT 1 FROM publishing_attempts attempt
+               WHERE attempt.job_id = releases.job_id
+                 AND attempt.platform = releases.platform
+                 AND attempt.outcome = 'ambiguous'
+                 AND attempt.safe_error_code = ?
+           )""",
+        (code, message, _now, code),
+    )
 
 
 def _migrate_operational_schema(connection: sqlite3.Connection, now: str) -> None:
