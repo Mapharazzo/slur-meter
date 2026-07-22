@@ -1,60 +1,409 @@
-"""Pipeline runner — extracted from api/main.py and fixed to match CLI.
+"""Injected, durable, resumable pipeline stage orchestration."""
 
-Fixes vs the old inline run_pipeline():
-  1. Captures compositor timing and passes it to AudioPipeline
-  2. Uses AudioPipeline instead of old build_intro_audio_async
-  3. ffmpeg muxes audio (mixed.m4a) into final MP4
-  4. Output dir keyed on IMDB ID, not random UUID
-  5. Records per-step timing and costs to SQLite
-"""
+from __future__ import annotations
 
 import asyncio
-import json
+import inspect
 import os
-import re
-import shutil
-import subprocess
-import time
-from datetime import UTC, datetime
-from pathlib import Path
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Any, Protocol
 
-import yaml
-from dotenv import load_dotenv
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-load_dotenv(BASE_DIR / ".env", override=True)
-
-from api.database import record_cost, record_step, update_job  # noqa: E402
-from src.analysis.engine import ProfanityEngine  # noqa: E402
-from src.audio.pipeline import AudioPipeline  # noqa: E402
-from src.data.opensubtitles import (  # noqa: E402
-    OpenSubtitlesClient,
-    SubtitleCache,
-    safe_imdb_id,
+from api.domain import AttemptTrigger, JobState, StageState
+from api.errors import (
+    AttentionRequired,
+    OperationalError,
+    classify_exception,
+    sanitize_text,
 )
-from src.publishing.metadata import generate_metadata  # noqa: E402
-from src.video.compositor import VideoCompositor  # noqa: E402
-from src.video.plotter import RagePlotter  # noqa: E402
+from api.retry import RetryContext, RetryPolicy, run_with_attempts
+from api.settings import DEFAULT_RETRY_DELAYS, Settings
+
+GENERATION_STAGES = (
+    "input_resolution",
+    "subtitle_discovery",
+    "metadata",
+    "subtitle_selection",
+    "analysis",
+    "graph",
+    "composite",
+    "audio",
+    "encode",
+)
 
 
-def _now() -> str:
-    return datetime.now(UTC).isoformat()
+@dataclass(frozen=True)
+class StageResult:
+    """A validated stage's durable, operator-safe result."""
+
+    output_manifest: Mapping[str, Any] = field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
 
 
-def _step(imdb_id: str, name: str, status: str, message: str = "",
-          started_at: str | None = None, finished_at: str | None = None,
-          duration_ms: int | None = None, warnings: list[str] | None = None):
-    record_step(imdb_id, name, status=status, message=message,
-                started_at=started_at, finished_at=finished_at,
-                duration_ms=duration_ms, warnings=warnings)
+class ProgressReporter(Protocol):
+    def __call__(self, numerator: int, denominator: int, unit: str) -> Awaitable[None]: ...
 
 
-def load_config():
-    with open(BASE_DIR / "config.yaml") as f:
-        return yaml.safe_load(f)
+class PipelineServices(Protocol):
+    """Task-4 boundary implemented by injected fakes now and real stages later."""
+
+    def run_stage(
+        self,
+        stage_name: str,
+        job_id: str,
+        progress: ProgressReporter,
+    ) -> StageResult | Mapping[str, Any] | Awaitable[StageResult | Mapping[str, Any]]: ...
+
+    def validate_stage(
+        self,
+        stage_name: str,
+        output_manifest: Mapping[str, Any],
+    ) -> bool | Awaitable[bool]: ...
+
+    def retry_policy(self, stage_name: str) -> RetryPolicy: ...
+
+
+class PipelineStore(Protocol):
+    def get_job(self, job_id: str) -> dict[str, Any] | None: ...
+
+    def get_job_detail(self, job_id: str) -> dict[str, Any] | None: ...
+
+    def ensure_stage(self, job_id: str, name: str, **fields: Any) -> dict[str, Any]: ...
+
+    def transition_stage(self, job_id: str, stage_name: str, new_state: object, **fields: Any) -> dict[str, Any] | None: ...
+
+    def transition_job(self, job_id: str, new_state: object, **fields: Any) -> dict[str, Any] | None: ...
+
+    def transition_stage_and_job(
+        self,
+        job_id: str,
+        stage_name: str,
+        stage_state: object,
+        job_state: object,
+        **fields: Any,
+    ) -> dict[str, Any] | None: ...
+
+    def renew_lease(self, job_id: str, owner: str, *, lease_seconds: float) -> bool: ...
+
+    def record_event(self, job_id: str, **fields: Any) -> object: ...
+
+
+class PipelineRunner:
+    """Run the first incomplete stage under an existing durable lease."""
+
+    def __init__(
+        self,
+        store: PipelineStore,
+        services: PipelineServices,
+        *,
+        stages: Sequence[str] = GENERATION_STAGES,
+        lease_seconds: float = 30.0,
+        sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
+        settings: Settings | None = None,
+    ) -> None:
+        if lease_seconds <= 0:
+            raise ValueError("Lease duration must be positive")
+        self.store = store
+        self.services = services
+        self.stages = tuple(stages)
+        self.lease_seconds = float(lease_seconds)
+        self.sleep = sleep
+        self.settings = settings
+
+    async def run(self, job_id: str, lease_owner: str) -> None:
+        job = self.store.get_job(job_id)
+        if job is None or job["state"] != JobState.RUNNING.value:
+            return
+        self._ensure_stages(job_id)
+
+        for stage_index, stage_name in enumerate(self.stages):
+            if self._cancel_requested(job_id):
+                self._apply_cancellation(job_id, lease_owner)
+                return
+            if not self._renew(job_id, lease_owner):
+                return
+            stage = self._stage(job_id, stage_name)
+            if stage["state"] == StageState.COMPLETED.value:
+                try:
+                    reusable = await self._validate(
+                        stage_name, stage["output_manifest"]
+                    )
+                except Exception as exc:
+                    error = classify_exception(exc, f"{stage_name} validation", self.settings)
+                    self._invalid_completed_stage(
+                        job_id,
+                        stage_name,
+                        lease_owner,
+                        code=error.code,
+                        message=error.message,
+                    )
+                    return
+                if reusable:
+                    self.store.record_event(
+                        job_id,
+                        event_type="artifact_reused",
+                        message=f"Validated output for stage {stage_name} was reused.",
+                        stage_name=stage_name,
+                    )
+                    continue
+                self._invalid_completed_stage(job_id, stage_name, lease_owner)
+                return
+            if stage["state"] == StageState.PENDING.value:
+                stage = self.store.transition_stage(
+                    job_id,
+                    stage_name,
+                    StageState.QUEUED,
+                    expected_state=StageState.PENDING,
+                    lease_owner=lease_owner,
+                )
+            if stage is None or stage["state"] != StageState.QUEUED.value:
+                return
+            restart_recovery = (
+                stage["retry_cycle"] > 1
+                and (stage.get("safe_error") or {}).get("code") == "restart_recovery"
+            )
+            running = self.store.transition_stage(
+                job_id,
+                stage_name,
+                StageState.RUNNING,
+                expected_state=StageState.QUEUED,
+                lease_owner=lease_owner,
+            )
+            if running is None:
+                return
+
+            policy = self._policy(stage_name)
+            trigger = (
+                AttemptTrigger.RESTART_RECOVERY
+                if restart_recovery
+                else AttemptTrigger.AUTOMATIC
+            )
+            try:
+                result = await run_with_attempts(
+                    partial(self._execute_stage, job_id, stage_name, lease_owner),
+                    RetryContext(
+                        job_id,
+                        stage_name,
+                        lease_owner=lease_owner,
+                        trigger=trigger,
+                        settings=self.settings,
+                        cancel_requested=partial(self._cancel_requested, job_id),
+                    ),
+                    policy,
+                    self.store,
+                    self.sleep,
+                )
+            except asyncio.CancelledError:
+                if self._cancel_requested(job_id):
+                    self._apply_cancellation(job_id, lease_owner)
+                    return
+                raise
+            except OperationalError as error:
+                self._record_failure(job_id, stage_name, lease_owner, error)
+                return
+
+            progress_unit = self._stage(job_id, stage_name)["progress"]["unit"]
+            if stage_index == len(self.stages) - 1:
+                completed = self.store.transition_stage_and_job(
+                    job_id,
+                    stage_name,
+                    StageState.COMPLETED,
+                    JobState.COMPLETED,
+                    warnings=list(result.warnings),
+                    output_manifest=result.output_manifest,
+                    progress_unit=progress_unit,
+                    lease_owner=lease_owner,
+                )
+            else:
+                completed = self.store.transition_stage(
+                    job_id,
+                    stage_name,
+                    StageState.COMPLETED,
+                    expected_state=StageState.RUNNING,
+                    warnings=list(result.warnings),
+                    output_manifest=result.output_manifest,
+                    progress_unit=progress_unit,
+                    lease_owner=lease_owner,
+                )
+            if completed is None:
+                return
+
+        job = self.store.get_job(job_id)
+        if job is None or job["state"] == JobState.COMPLETED.value:
+            return
+        if self._cancel_requested(job_id):
+            self._apply_cancellation(job_id, lease_owner)
+            return
+        if self._renew(job_id, lease_owner):
+            self.store.transition_job(
+                job_id,
+                JobState.COMPLETED,
+                expected_state=JobState.RUNNING,
+                lease_owner=lease_owner,
+            )
+
+    def _ensure_stages(self, job_id: str) -> None:
+        for ordinal, stage_name in enumerate(self.stages, 1):
+            policy = self._policy(stage_name)
+            self.store.ensure_stage(
+                job_id,
+                stage_name,
+                ordinal=ordinal,
+                state=StageState.PENDING,
+                max_auto_attempts=policy.max_attempts,
+            )
+
+    async def _execute_stage(
+        self, job_id: str, stage_name: str, lease_owner: str
+    ) -> StageResult:
+        def progress(numerator: int, denominator: int, unit: str) -> _CompletedAwaitable:
+            if numerator < 0 or denominator < 1 or numerator > denominator:
+                raise ValueError("Stage progress must be bounded by its denominator")
+            if not self._renew(job_id, lease_owner):
+                raise asyncio.CancelledError("The worker no longer owns the job lease")
+            updated = self.store.transition_stage(
+                job_id,
+                stage_name,
+                StageState.RUNNING,
+                expected_state=StageState.RUNNING,
+                progress_numerator=numerator,
+                progress_denominator=denominator,
+                progress_unit=unit,
+                lease_owner=lease_owner,
+            )
+            if updated is None:
+                raise asyncio.CancelledError("The worker no longer owns the job lease")
+            return _CompletedAwaitable()
+
+        value = self.services.run_stage(stage_name, job_id, progress)
+        raw = await value if inspect.isawaitable(value) else value
+        result = _stage_result(raw)
+        if not await self._validate(stage_name, result.output_manifest):
+            raise AttentionRequired(
+                f"Output from stage {stage_name} did not pass artifact validation.",
+                code="invalid_stage_output",
+                actions=("retry",),
+            )
+        if not self._renew(job_id, lease_owner):
+            raise asyncio.CancelledError("The worker no longer owns the job lease")
+        return result
+
+    async def _validate(self, stage_name: str, manifest: Mapping[str, Any]) -> bool:
+        value = self.services.validate_stage(stage_name, manifest)
+        return bool(await value if inspect.isawaitable(value) else value)
+
+    def _policy(self, stage_name: str) -> RetryPolicy:
+        provider = getattr(self.services, "retry_policy", None)
+        if provider is not None:
+            return provider(stage_name)
+        attempts = 3 if stage_name in {"subtitle_discovery", "metadata"} else 1
+        return RetryPolicy(attempts, DEFAULT_RETRY_DELAYS)
+
+    def _record_failure(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_owner: str,
+        error: OperationalError,
+    ) -> None:
+        state = StageState.FAILED if error.retryable else StageState.NEEDS_ATTENTION
+        job_state = JobState.FAILED if error.retryable else JobState.NEEDS_ATTENTION
+        next_action = error.actions[0] if error.actions else ("retry" if error.retryable else None)
+        safe_code = sanitize_text(error.code, self.settings)
+        safe_message = sanitize_text(error.message, self.settings)
+        self.store.transition_stage_and_job(
+            job_id,
+            stage_name,
+            state,
+            job_state,
+            safe_error_code=safe_code,
+            safe_error_message=safe_message,
+            retryable=error.retryable,
+            next_action=next_action,
+            lease_owner=lease_owner,
+        )
+
+    def _invalid_completed_stage(
+        self,
+        job_id: str,
+        stage_name: str,
+        lease_owner: str,
+        *,
+        code: str = "invalid_completed_artifact",
+        message: str | None = None,
+    ) -> None:
+        safe_message = sanitize_text(
+            message or f"Completed output for stage {stage_name} no longer validates.",
+            self.settings,
+        )
+        safe_code = sanitize_text(code, self.settings)
+        self.store.record_event(
+            job_id,
+            event_type="artifact_validation_failed",
+            severity="warning",
+            message=safe_message,
+            stage_name=stage_name,
+        )
+        self.store.transition_job(
+            job_id,
+            JobState.NEEDS_ATTENTION,
+            expected_state=JobState.RUNNING,
+            safe_error_code=safe_code,
+            safe_error_message=safe_message,
+            retryable=False,
+            next_action="retry",
+            lease_owner=lease_owner,
+        )
+
+    def _cancel_requested(self, job_id: str) -> bool:
+        job = self.store.get_job(job_id)
+        return job is None or bool(job["cancel_requested"])
+
+    def _apply_cancellation(self, job_id: str, lease_owner: str) -> None:
+        self.store.transition_job(
+            job_id,
+            JobState.CANCELLED,
+            expected_state=JobState.RUNNING,
+            lease_owner=lease_owner,
+        )
+
+    def _renew(self, job_id: str, lease_owner: str) -> bool:
+        return self.store.renew_lease(
+            job_id, lease_owner, lease_seconds=self.lease_seconds
+        )
+
+    def _stage(self, job_id: str, stage_name: str) -> dict[str, Any]:
+        detail = self.store.get_job_detail(job_id)
+        if detail is None:
+            raise KeyError("Run was not found")
+        return next(stage for stage in detail["stages"] if stage["name"] == stage_name)
+
+
+class _CompletedAwaitable:
+    def __await__(self):
+        if False:
+            yield None
+        return None
+
+
+def _stage_result(value: StageResult | Mapping[str, Any] | None) -> StageResult:
+    if isinstance(value, StageResult):
+        return value
+    if value is None:
+        return StageResult()
+    if "output_manifest" in value:
+        return StageResult(
+            output_manifest=value.get("output_manifest") or {},
+            warnings=tuple(value.get("warnings") or ()),
+        )
+    return StageResult(output_manifest=value)
 
 
 def get_client():
+    """Legacy lazy constructor retained until submission routes adopt the dispatcher."""
+    from src.data.opensubtitles import OpenSubtitlesClient
+
     return OpenSubtitlesClient(
         api_key=os.environ["OPENSUBTITLES_API_KEY"],
         user_agent=os.environ["OPENSUBTITLES_USER_AGENT"],
@@ -64,466 +413,6 @@ def get_client():
     )
 
 
-async def fetch_movie_info(imdb_id: str, output_dir: Path) -> tuple[dict, "Path | None"]:
-    """Fetch movie metadata + poster from TMDB via IMDB ID."""
-    import asyncio
-
-    import requests as req
-
-    token = os.environ.get("TMDB_READ_TOKEN", "")
-    if not token or not imdb_id:
-        return {}, None
-
-    tt_id = safe_imdb_id(imdb_id)
-
-    cache_file = BASE_DIR / "results" / f"tmdb_{tt_id}.json"
-    cached_poster_path = output_dir / "poster.jpg"
-    if cache_file.exists():
-        try:
-            info = json.loads(cache_file.read_text())
-            if cached_poster_path.exists():
-                return info, cached_poster_path
-        except Exception:
-            pass
-
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
-    loop = asyncio.get_event_loop()
-
-    def _get_info():
-        try:
-            url = f"https://api.themoviedb.org/3/find/{tt_id}"
-            r = req.get(url, params={"external_source": "imdb_id"},
-                        headers=headers, timeout=10)
-            if not r.ok:
-                return {}
-            results = r.json().get("movie_results", [])
-            if not results:
-                return {}
-            m = results[0]
-            mid = m["id"]
-
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-                fut_details = pool.submit(
-                    req.get, f"https://api.themoviedb.org/3/movie/{mid}",
-                    headers=headers, timeout=10
-                )
-                fut_credits = pool.submit(
-                    req.get, f"https://api.themoviedb.org/3/movie/{mid}/credits",
-                    headers=headers, timeout=10
-                )
-                details_r = fut_details.result()
-                credits_r = fut_credits.result()
-
-            details = details_r.json() if details_r.ok else {}
-            credits = credits_r.json() if credits_r.ok else {}
-
-            runtime_mins = details.get("runtime")
-            runtime = f"{runtime_mins} min" if runtime_mins else ""
-
-            director = next(
-                (p["name"] for p in credits.get("crew", []) if p["job"] == "Director"), "")
-            cast = [p["name"] for p in credits.get("cast", [])[:3]]
-
-            awards = ""
-            omdb_key = os.environ.get("OMDB_API_KEY", "")
-            if omdb_key and tt_id:
-                try:
-                    omdb_r = req.get("https://www.omdbapi.com/",
-                                     params={"i": tt_id, "apikey": omdb_key}, timeout=8)
-                    if omdb_r.ok:
-                        awards = omdb_r.json().get("Awards", "")
-                        if awards == "N/A":
-                            awards = ""
-                except Exception:
-                    pass
-
-            return {
-                "Title": m.get("title", ""),
-                "Year": (m.get("release_date") or "")[:4],
-                "Director": director,
-                "Actors": ", ".join(cast),
-                "imdbRating": str(round(m.get("vote_average", 0), 1)),
-                "Runtime": runtime,
-                "Awards": awards,
-                "poster_path": m.get("poster_path", ""),
-            }
-        except Exception:
-            return {}
-
-    info = await loop.run_in_executor(None, _get_info)
-    if not info:
-        return {}, None
-
-    cache_file.write_text(json.dumps(info))
-
-    poster_path = None
-    raw_poster = info.get("poster_path", "")
-    if raw_poster:
-        poster_url = f"https://image.tmdb.org/t/p/w780{raw_poster}"
-
-        def _get_poster():
-            try:
-                r = req.get(poster_url, timeout=15)
-                if r.ok:
-                    output_dir.mkdir(parents=True, exist_ok=True)
-                    p = output_dir / "poster.jpg"
-                    p.write_bytes(r.content)
-                    return p
-            except Exception:
-                return None
-
-        poster_path = await loop.run_in_executor(None, _get_poster)
-
-    return info, poster_path
-
-
-async def run_pipeline(imdb_id: str, query: str | None = None, imdb_id_input: str | None = None):
-    """Execute the full pipeline: fetch -> analyse -> render -> audio -> encode.
-
-    Mirrors the CLI flow in main.py:cmd_render() with step tracking and cost recording.
-    """
-    tmp_dir = BASE_DIR / "tmp"
-    output_dir = BASE_DIR / "output" / imdb_id
-    results_dir = BASE_DIR / "results"
-
-    try:
-        cfg = load_config()
-        client = get_client()
-        cache = SubtitleCache(results_dir)
-
-        # ── Step 1: Fetch subtitles ──
-        t0 = time.monotonic()
-        _step(imdb_id, "fetch", "running", "Searching OpenSubtitles…")
-        update_job(imdb_id, status="fetching", progress=10, message="Searching OpenSubtitles…")
-
-        sub_results = []
-        srt_path = None
-        real_imdb_id: str | None = None  # actual tt-id from subtitle results
-
-        if imdb_id_input:
-            real_imdb_id = imdb_id_input
-            cached = cache.has(imdb_id_input)
-            if cached:
-                srt_path = cached
-            else:
-                sub_results = await asyncio.to_thread(client.search, imdb_id=imdb_id_input, language="en", limit=8)
-                if not sub_results:
-                    _step(imdb_id, "fetch", "failed", "No subtitles found")
-                    update_job(imdb_id, status="failed", error="No subtitles found!")
-                    return
-                best = sub_results[0]
-                update_job(imdb_id, label=f"{best.movie_title} ({best.movie_year})")
-                srt_path = await asyncio.to_thread(client.download, best.file_id, dest_dir=str(tmp_dir))
-                srt_path = cache.store(imdb_id_input, srt_path)
-        elif query:
-            sub_results = await asyncio.to_thread(client.search, query=query, language="en", limit=8)
-            if not sub_results:
-                _step(imdb_id, "fetch", "failed", "No subtitles found")
-                update_job(imdb_id, status="failed", error="No subtitles found!")
-                return
-            best = sub_results[0]
-            real_imdb_id = best.imdb_id or None
-            update_job(imdb_id, label=f"{best.movie_title} ({best.movie_year})")
-            cached = cache.has(best.imdb_id) if best.imdb_id else None
-            if cached:
-                srt_path = cached
-            else:
-                srt_path = await asyncio.to_thread(client.download, best.file_id, dest_dir=str(tmp_dir))
-                if best.imdb_id:
-                    srt_path = cache.store(best.imdb_id, srt_path)
-
-        record_cost(imdb_id, "api_opensubtitles", "opensubtitles",
-                    amount_usd=0.0, units=1 + len(sub_results),
-                    detail={"action": "search+download"})
-
-        dt_fetch = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "fetch", "done", "Subtitles acquired",
-              finished_at=_now(), duration_ms=dt_fetch)
-
-        # ── Step 2: Analyse ──
-        t0 = time.monotonic()
-        _step(imdb_id, "analyse", "running", "Scanning for profanity…")
-        update_job(imdb_id, status="analysing", progress=35, message="Scanning for profanity…")
-
-        engine = ProfanityEngine(cfg)
-        analysis = await asyncio.to_thread(engine.analyse_srt, srt_path)
-
-        job = update_job(imdb_id, progress=35)
-        label = job["label"] if job else imdb_id
-
-        metadata = generate_metadata(label, analysis.get("summary", {}))
-        analysis["metadata"] = {
-            "movie_title": label,
-            "imdb_id": imdb_id,
-            "metadata_tags": metadata,
-        }
-
-        # Save analysis JSON
-        results_dir.mkdir(parents=True, exist_ok=True)
-        analysis_file = results_dir / f"{imdb_id}.json"
-        with open(analysis_file, "w") as f:
-            json.dump(analysis, f, indent=2, default=str)
-
-        _step(imdb_id, "analyse", "running", "Fetching movie info…")
-        update_job(imdb_id, progress=55, message="Analysis complete — fetching movie info…")
-
-        # ── Fetch poster + movie info ──
-        movie_info, poster_path = await fetch_movie_info(real_imdb_id or imdb_id, output_dir)
-
-        tmdb_calls = 3 if movie_info else 1  # find + details + credits
-        record_cost(imdb_id, "api_tmdb", "tmdb", amount_usd=0.0, units=tmdb_calls,
-                    detail={"action": "find+details+credits"})
-        if os.environ.get("OMDB_API_KEY"):
-            record_cost(imdb_id, "api_omdb", "omdb", amount_usd=0.0, units=1,
-                        detail={"action": "awards_lookup"})
-
-        # ── Coverage check: retry subtitle if < 70% of runtime ──
-        rt_match = re.search(r"(\d+)", movie_info.get("Runtime", ""))
-        runtime_min = float(rt_match.group(1)) if rt_match else None
-        warnings = []
-        if runtime_min and sub_results:
-            binned = analysis.get("binned", [])
-            sub_dur = max((b["minute"] for b in binned), default=0.0)
-            if sub_dur < runtime_min * 0.70:
-                warnings.append(
-                    f"Subtitle covers {sub_dur:.0f}/{runtime_min:.0f} min "
-                    f"({sub_dur / runtime_min * 100:.0f}%)"
-                )
-                for candidate in sub_results[1:]:
-                    try:
-                        new_srt = await asyncio.to_thread(client.download, candidate.file_id, dest_dir=str(tmp_dir))
-                        new_analysis = await asyncio.to_thread(engine.analyse_srt, new_srt)
-                        new_binned = new_analysis.get("binned", [])
-                        new_dur = max((b["minute"] for b in new_binned), default=0.0)
-                        if new_dur > sub_dur:
-                            analysis = new_analysis
-                            srt_path = new_srt
-                            sub_dur = new_dur
-                            analysis["metadata"] = {
-                                "movie_title": label,
-                                "imdb_id": imdb_id,
-                                "metadata_tags": generate_metadata(
-                                    label, analysis.get("summary", {})),
-                            }
-                            if sub_dur >= runtime_min * 0.70:
-                                break
-                    except Exception:
-                        continue
-
-        # Enrich metadata
-        analysis["metadata"].update({
-            "director": movie_info.get("Director", ""),
-            "imdb_rating": movie_info.get("imdbRating", ""),
-            "runtime": movie_info.get("Runtime", ""),
-            "awards": movie_info.get("Awards", ""),
-            "actors": movie_info.get("Actors", ""),
-        })
-        with open(analysis_file, "w") as f:
-            json.dump(analysis, f, indent=2, default=str)
-
-        update_job(imdb_id, analysis_json=analysis, movie_info=movie_info)
-
-        dt_analyse = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "analyse", "done", "Analysis complete",
-              finished_at=_now(), duration_ms=dt_analyse, warnings=warnings or None)
-
-        # ── Step 3: Generate graph frames ──
-        t0 = time.monotonic()
-        frames_dir = output_dir / "graph_frames"
-        existing_frames = sorted(frames_dir.glob("frame_*.png")) if frames_dir.exists() else []
-        if len(existing_frames) == 450:
-            frames = existing_frames
-            _step(imdb_id, "graph", "done", f"{len(frames)} frames (cached)",
-                  finished_at=_now(), duration_ms=0)
-        else:
-            _step(imdb_id, "graph", "running", "Generating rage graph frames…")
-            update_job(imdb_id, status="rendering", progress=60,
-                       message="Drawing rage graph…")
-
-            plotter = RagePlotter(cfg)
-            runtime_str = movie_info.get("Runtime", "")
-            plot_runtime = None
-            if runtime_str:
-                m = re.search(r"(\d+)", runtime_str)
-                if m:
-                    plot_runtime = float(m.group(1))
-
-            def graph_cb(msg: str, curr: int, total: int):
-                _step(imdb_id, "graph", "running", f"Generating rage graph frames… [{curr}/{total}]")
-
-            frames = await asyncio.to_thread(
-                plotter.generate_frames,
-                analysis.get("binned", []),
-                frames_dir,
-                n_frames=450,
-                runtime_min=plot_runtime,
-                progress_cb=graph_cb,
-            )
-
-            dt_graph = int((time.monotonic() - t0) * 1000)
-            _step(imdb_id, "graph", "done", f"{len(frames)} frames generated",
-                  finished_at=_now(), duration_ms=dt_graph)
-
-        # ── Step 4: Composite video segments ──
-        t0 = time.monotonic()
-        title = label.split("(")[0].strip()
-        year = ""
-        if "(" in label and ")" in label:
-            year = label.split("(")[1].rstrip(")")
-
-        day_number = len(list(results_dir.glob("*.json")))
-
-        render_dir = output_dir / "render"
-        _SEGMENTS = ["intro_hold", "intro_transition", "graph", "verdict"]
-        cached_render = render_dir.exists() and all(
-            any((render_dir / seg).glob("*.png")) for seg in _SEGMENTS
-        )
-        if cached_render:
-            # Reconstruct timing from existing frame counts
-            fps = cfg.get("video", {}).get("fps", 30)
-            segment_timing: dict = {}
-            global_idx = 0
-            for seg in _SEGMENTS:
-                seg_frames = sorted((render_dir / seg).glob("*.png"))
-                n = len(seg_frames)
-                segment_timing[seg] = {
-                    "start_frame": global_idx,
-                    "end_frame": global_idx + n - 1,
-                    "start_time": global_idx / fps,
-                    "end_time": (global_idx + n) / fps,
-                    "num_frames": n,
-                }
-                global_idx += n
-            total_frames = global_idx
-            update_job(imdb_id, segment_timing=segment_timing)
-            _step(imdb_id, "composite", "done",
-                  f"{total_frames} frames (cached)", finished_at=_now(), duration_ms=0)
-        else:
-            _step(imdb_id, "composite", "running", "Compositing video segments…")
-            update_job(imdb_id, progress=75, message="Compositing video…")
-
-            compositor = VideoCompositor(cfg)
-
-            def render_cb(seg_name: str, curr: int = 0, tot: int = 1):
-                prog = f" [{curr}/{tot}]" if tot > 1 else ""
-                msg = f"Compositing {seg_name.replace('_', ' ')}…{prog}"
-                _step(imdb_id, "composite", "running", msg)
-                if tot <= 1 or curr % 15 == 0:
-                    update_job(imdb_id, message=msg)
-
-            render_result = await asyncio.to_thread(
-                compositor.render_all,
-                output_dir=render_dir,
-                title=title,
-                year=year,
-                plotter_frames=frames,
-                summary=analysis.get("summary", {}),
-                poster_path=poster_path,
-                movie_info=movie_info,
-                day_number=day_number,
-                progress_cb=render_cb,
-            )
-            segment_timing = render_result["timing"]
-            total_frames = render_result["total_frames"]
-
-            update_job(imdb_id, segment_timing=segment_timing)
-
-            dt_composite = int((time.monotonic() - t0) * 1000)
-            _step(imdb_id, "composite", "done",
-                  f"{total_frames} frames composited",
-                  finished_at=_now(), duration_ms=dt_composite)
-
-        # ── Step 5: Audio pipeline ──
-        t0 = time.monotonic()
-        _step(imdb_id, "audio", "running", "Building audio layers…")
-        update_job(imdb_id, progress=85, message="Generating audio…")
-
-        audio_dir = output_dir / "audio"
-        summary = analysis.get("summary", {})
-
-        pipeline = AudioPipeline(cfg, audio_dir, segment_timing)
-        mixed_audio = audio_dir / "mixed.m4a"
-        
-        def _do_audio():
-            pipeline.build_layers(title, year, summary)
-            pipeline.generate_all()
-            pipeline.mix(mixed_audio)
-            
-        await asyncio.to_thread(_do_audio)
-
-        # Track TTS cost
-        for layer in pipeline.timeline.layers:
-            if layer.role == "tts" and layer.text:
-                record_cost(imdb_id, f"tts_{layer.provider_name}", layer.provider_name,
-                            amount_usd=0.0, units=len(layer.text),
-                            detail={"layer": layer.name, "chars": len(layer.text)})
-            elif layer.role == "music":
-                record_cost(imdb_id, f"music_{layer.provider_name}", layer.provider_name,
-                            amount_usd=0.0, units=1,
-                            detail={"layer": layer.name})
-
-        dt_audio = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "audio", "done",
-              f"{len(pipeline.timeline.layers)} layer(s) mixed",
-              finished_at=_now(), duration_ms=dt_audio)
-
-        # ── Step 6: ffmpeg encode ──
-        t0 = time.monotonic()
-        _step(imdb_id, "encode", "running", "Encoding final video…")
-        update_job(imdb_id, progress=90, message="Encoding final video…")
-
-        concat_dir = output_dir / "render" / "concat"
-
-        if total_frames == 0:
-            _step(imdb_id, "encode", "failed", "No frames to encode")
-            update_job(imdb_id, status="failed", error="No frames to encode!")
-            return
-
-        fps = cfg.get("video", {}).get("fps", 30)
-        video_path = output_dir / "final.mp4"
-
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-framerate", str(fps),
-            "-i", str(concat_dir / "%05d.png"),
-            "-i", str(mixed_audio),
-            "-c:v", "libx264",
-            "-pix_fmt", "yuv420p",
-            "-preset", "medium",
-            "-c:a", "copy",
-            "-shortest",
-            str(video_path),
-        ]
-
-        if shutil.which("ffmpeg"):
-            await asyncio.to_thread(
-                subprocess.run,
-                ffmpeg_cmd, check=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        else:
-            _step(imdb_id, "encode", "failed", "ffmpeg not found")
-            update_job(imdb_id, status="failed",
-                       error="ffmpeg not installed — cannot encode video")
-            return
-
-        dt_encode = int((time.monotonic() - t0) * 1000)
-        _step(imdb_id, "encode", "done", "Video encoded",
-              finished_at=_now(), duration_ms=dt_encode)
-
-        # ── Done ──
-        update_job(
-            imdb_id,
-            status="done",
-            progress=100,
-            message="Video ready",
-            video_path=str(video_path.relative_to(BASE_DIR)),
-            analysis_json=analysis,
-        )
-
-    except Exception as e:
-        update_job(imdb_id, status="failed", error=str(e), message=f"Pipeline error: {e}")
-        # Try to record which step failed
-        import traceback
-        traceback.print_exc()
+async def run_pipeline(*_args: Any, **_kwargs: Any) -> None:
+    """Reject legacy direct execution; durable jobs must run through JobDispatcher."""
+    raise RuntimeError("Direct pipeline execution is disabled; enqueue the durable job")

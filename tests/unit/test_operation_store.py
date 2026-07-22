@@ -397,6 +397,44 @@ def test_repeating_terminal_stage_transition_preserves_timestamp_and_history(sto
     assert len(store.list_events(job["id"])) == event_count
 
 
+def test_stage_and_job_terminal_transition_is_atomic_and_lease_fenced(store, monkeypatch):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    store.ensure_stage(job["id"], "analysis", state=StageState.QUEUED)
+    store.claim_next_job("worker-a", lease_seconds=30)
+    store.transition_stage(job["id"], "analysis", StageState.RUNNING, lease_owner="worker-a")
+
+    assert (
+        store.transition_stage_and_job(
+            job["id"],
+            "analysis",
+            StageState.FAILED,
+            JobState.FAILED,
+            lease_owner="stale-worker",
+        )
+        is None
+    )
+    original_insert_event = store._insert_event
+
+    def fail_on_job_event(connection, job_id, **fields):
+        if fields.get("event_type") == "job_state_changed":
+            raise RuntimeError("injected event failure")
+        return original_insert_event(connection, job_id, **fields)
+
+    monkeypatch.setattr(store, "_insert_event", fail_on_job_event)
+    with pytest.raises(RuntimeError, match="injected event failure"):
+        store.transition_stage_and_job(
+            job["id"],
+            "analysis",
+            StageState.FAILED,
+            JobState.FAILED,
+            lease_owner="worker-a",
+        )
+
+    detail = store.get_job_detail(job["id"])
+    assert detail["run"]["state"] == "running"
+    assert detail["stages"][0]["state"] == "running"
+
+
 def test_candidate_and_financial_dtos_hide_internal_artifact_paths(store, tmp_path):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     artifact_path = tmp_path / "private" / "candidate.srt"

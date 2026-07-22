@@ -333,6 +333,202 @@ class OperationStore:
             ).fetchone()
             return self._job_dto(claimed)
 
+    def transition_stage_and_job(
+        self,
+        job_id: str,
+        stage_name: str,
+        stage_state: StageState | str,
+        job_state: JobState | str,
+        *,
+        expected_stage_state: StageState | str = StageState.RUNNING,
+        expected_job_state: JobState | str = JobState.RUNNING,
+        warnings: list[str] | None = None,
+        output_manifest: Mapping[str, Any] | None = None,
+        progress_unit: str | None = None,
+        safe_error_code: str | None = None,
+        safe_error_message: object | None = None,
+        retryable: bool = False,
+        next_action: str | None = None,
+        lease_owner: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Commit a stage and its owning run outcome as one fenced transaction."""
+        target_stage = StageState(_enum_value(StageState, stage_state))
+        target_job = JobState(_enum_value(JobState, job_state))
+        expected_stage = StageState(_enum_value(StageState, expected_stage_state))
+        expected_job = JobState(_enum_value(JobState, expected_job_state))
+        now = self._now_text()
+        with self._mutation() as connection:
+            resolved = self._resolve_job_id(connection, job_id)
+            if resolved is None:
+                return None
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            stage = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE job_id = ? AND name = ?",
+                (resolved, stage_name),
+            ).fetchone()
+            if stage is None:
+                raise KeyError("Stage was not found")
+            if not self._lease_allows(job, lease_owner, now):
+                return None
+            old_stage = StageState(stage["state"])
+            old_job = JobState(job["state"])
+            if old_stage is not expected_stage or old_job is not expected_job:
+                return None
+
+            # Validate both moves before either row changes.
+            assert_stage_transition(old_stage, target_stage, stage_name=stage_name)
+            assert_job_transition(old_job, target_job)
+            stage_finished = now if target_stage in {
+                StageState.COMPLETED,
+                StageState.FAILED,
+                StageState.CANCELLED,
+                StageState.SKIPPED,
+                StageState.NEEDS_ATTENTION,
+            } else None
+            job_finished = now if target_job in {
+                JobState.COMPLETED,
+                JobState.FAILED,
+                JobState.CANCELLED,
+            } else None
+            connection.execute(
+                """UPDATE pipeline_stages SET state = ?, updated_at = ?, finished_at = ?,
+                       progress_unit = COALESCE(?, progress_unit), warnings_json = ?,
+                       output_manifest_json = ?, safe_error_code = ?, safe_error_message = ?,
+                       retryable = ?, next_action = ? WHERE id = ? AND state = ?""",
+                (
+                    target_stage.value,
+                    now,
+                    stage_finished,
+                    _safe_text(progress_unit) if progress_unit is not None else None,
+                    _safe_json_dump(warnings) if warnings is not None else stage["warnings_json"],
+                    _safe_json_dump(output_manifest)
+                    if output_manifest is not None
+                    else stage["output_manifest_json"],
+                    _safe_text(safe_error_code),
+                    _safe_text(safe_error_message),
+                    int(bool(retryable)),
+                    _safe_text(next_action),
+                    stage["id"],
+                    old_stage.value,
+                ),
+            )
+            connection.execute(
+                """UPDATE job_runs SET state = ?, current_stage = ?, updated_at = ?,
+                       finished_at = ?, next_action = ?, safe_error_code = ?,
+                       safe_error_message = ?, error_retryable = ?, lease_owner = NULL,
+                       lease_expires_at = NULL WHERE id = ? AND state = ?""",
+                (
+                    target_job.value,
+                    stage_name,
+                    now,
+                    job_finished,
+                    _safe_text(next_action),
+                    _safe_text(safe_error_code),
+                    _safe_text(safe_error_message),
+                    int(bool(retryable)),
+                    resolved,
+                    old_job.value,
+                ),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                stage_id=int(stage["id"]),
+                event_type="stage_state_changed",
+                message=f"Stage {stage_name} moved from {old_stage.value} to {target_stage.value}.",
+                data={"from": old_stage.value, "to": target_stage.value, "trigger": None},
+                created_at=now,
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="job_state_changed",
+                message=f"Run moved from {old_job.value} to {target_job.value}.",
+                data={"from": old_job.value, "to": target_job.value, "trigger": None},
+                created_at=now,
+            )
+            updated_stage = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE id = ?", (stage["id"],)
+            ).fetchone()
+            updated_job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            return {"stage": self._stage_dto(updated_stage), "run": self._job_dto(updated_job)}
+
+    def release_job_lease(self, job_id: str, owner: str) -> bool:
+        """Release owned interrupted work for immediate restart recovery."""
+        now = self._now_text()
+        with self._mutation() as connection:
+            resolved = self._resolve_job_id(connection, job_id)
+            if resolved is None:
+                return False
+            job = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+            ).fetchone()
+            if job["state"] != JobState.RUNNING.value or job["lease_owner"] != str(owner):
+                return False
+            if job["cancel_requested_at"] is not None:
+                self._cancel_job_work(connection, resolved, now)
+                connection.execute(
+                    """UPDATE job_runs SET state = 'cancelled', lease_owner = NULL,
+                           lease_expires_at = NULL, updated_at = ?, finished_at = ?,
+                           next_action = NULL WHERE id = ?""",
+                    (now, now, resolved),
+                )
+                return True
+
+            running_stages = connection.execute(
+                "SELECT * FROM pipeline_stages WHERE job_id = ? AND state = 'running'",
+                (resolved,),
+            ).fetchall()
+            for stage in running_stages:
+                assert_stage_transition(
+                    StageState.RUNNING,
+                    StageState.QUEUED,
+                    AttemptTrigger.RESTART_RECOVERY,
+                )
+                connection.execute(
+                    """UPDATE pipeline_attempts SET finished_at = ?, outcome = 'interrupted',
+                           retryable = 1, diagnostics_json = ?
+                       WHERE stage_id = ? AND finished_at IS NULL""",
+                    (
+                        now,
+                        _safe_json_dump({"reason": "Worker shutdown interrupted the attempt."}),
+                        stage["id"],
+                    ),
+                )
+                connection.execute(
+                    """UPDATE pipeline_stages SET state = 'queued', retry_cycle = retry_cycle + 1,
+                           updated_at = ?, finished_at = NULL, retryable = 1,
+                           safe_error_code = 'restart_recovery',
+                           safe_error_message = 'Interrupted work was safely queued for restart.',
+                           next_action = 'resume' WHERE id = ?""",
+                    (now, stage["id"]),
+                )
+            assert_job_transition(
+                JobState.RUNNING, JobState.QUEUED, AttemptTrigger.RESTART_RECOVERY
+            )
+            connection.execute(
+                """UPDATE job_runs SET state = 'queued', lease_owner = NULL,
+                       lease_expires_at = NULL, updated_at = ?, next_action = 'resume',
+                       safe_error_code = 'restart_recovery',
+                       safe_error_message = 'Interrupted work was safely queued for restart.',
+                       error_retryable = 1 WHERE id = ?""",
+                (now, resolved),
+            )
+            self._insert_event(
+                connection,
+                resolved,
+                event_type="shutdown_recovery",
+                severity="warning",
+                message="Owned work was interrupted during shutdown and queued for restart.",
+                data={"trigger": AttemptTrigger.RESTART_RECOVERY.value},
+                created_at=now,
+            )
+            return True
+
     def renew_lease(self, job_id: str, owner: str, *, lease_seconds: float) -> bool:
         if lease_seconds <= 0:
             raise ValueError("Lease duration must be positive")
