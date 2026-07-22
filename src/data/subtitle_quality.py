@@ -25,6 +25,7 @@ class SubtitleInspection:
     first_cue_seconds: float
     final_cue_seconds: float
     parsed_duration_seconds: float
+    normalized_utf8: bytes
 
 
 @dataclass(frozen=True)
@@ -52,26 +53,35 @@ class RankedCandidate:
 def inspect_subtitle(path: str | Path) -> SubtitleInspection:
     raw = Path(path).read_bytes()
     text, encoding = _decode(raw)
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        raise SubtitleParseError("Malformed SRT: no cues were found")
     starts: list[float] = []
     ends: list[float] = []
-    for line in text.splitlines():
-        match = _TIMING.match(line.strip())
-        if match is None:
-            continue
+    canonical_blocks: list[str] = []
+    for expected_number, block in enumerate(re.split(r"\n{2,}", normalized), start=1):
+        lines = block.split("\n")
+        if len(lines) < 3 or not lines[0].strip().isdigit():
+            raise SubtitleParseError("Malformed SRT: each cue needs a number, timing, and dialogue")
+        if int(lines[0].strip()) != expected_number:
+            raise SubtitleParseError("Malformed SRT: cue numbering must be sequential")
+        match = _TIMING.match(lines[1].strip())
+        if match is None or not any(line.strip() for line in lines[2:]):
+            raise SubtitleParseError("Malformed SRT: each cue needs valid timing and dialogue")
         start = _seconds(match.group("start"))
         end = _seconds(match.group("end"))
-        if end < start:
-            raise SubtitleParseError("Subtitle cue ends before it starts")
+        if end <= start:
+            raise SubtitleParseError("Malformed SRT: cue end must follow its start")
         starts.append(start)
         ends.append(end)
-    if not starts:
-        raise SubtitleParseError("No SRT timing cues were found")
+        canonical_blocks.append("\n".join([str(expected_number), lines[1].strip(), *lines[2:]]))
     return SubtitleInspection(
         detected_encoding=encoding,
         cue_count=len(starts),
         first_cue_seconds=min(starts),
         final_cue_seconds=max(ends),
         parsed_duration_seconds=max(ends) - min(starts),
+        normalized_utf8=("\n\n".join(canonical_blocks) + "\n").encode("utf-8"),
     )
 
 

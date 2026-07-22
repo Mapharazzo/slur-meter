@@ -3,7 +3,7 @@
 import io
 import zipfile
 from contextlib import contextmanager
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -23,7 +23,7 @@ VALID_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"
 
 def zip_response(members):
     body = io.BytesIO()
-    with zipfile.ZipFile(body, "w") as archive:
+    with zipfile.ZipFile(body, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for name, value in members.items():
             archive.writestr(name, value)
     response = type("Response", (), {})()
@@ -201,6 +201,27 @@ class TestOpenSubtitlesClient:
         response = zip_response({"subtitle.srt": VALID_SRT})
         response.headers = {"content-length": "999999999"}
         with stub_download(client, response), pytest.raises(UnsafeArchiveError, match="size"):
+            client.download("42", tmp_path / "candidate.srt")
+
+    def test_custom_cap_rejects_decompressed_member_without_content_length(self, tmp_path):
+        client = OpenSubtitlesClient("test-key", "TestBot v1.0", max_download_bytes=200)
+        response = zip_response({"subtitle.srt": b"x" * 1_000})
+        response.headers = {}
+
+        with stub_download(client, response), pytest.raises(UnsafeArchiveError, match="size"):
+            client.download("42", tmp_path / "candidate.srt")
+
+    def test_encrypted_or_unreadable_archive_member_becomes_safe_error(self, client, tmp_path):
+        response = zip_response({"subtitle.srt": VALID_SRT})
+        archive = MagicMock()
+        archive.__enter__.return_value = archive
+        member = MagicMock(filename="subtitle.srt", file_size=len(VALID_SRT))
+        archive.infolist.return_value = [member]
+        archive.open.side_effect = RuntimeError("encrypted /home/operator/subtitle.srt")
+
+        with stub_download(client, response), patch("src.data.opensubtitles.zipfile.ZipFile", return_value=archive), pytest.raises(
+            UnsafeArchiveError, match="could not be safely read"
+        ):
             client.download("42", tmp_path / "candidate.srt")
 
 

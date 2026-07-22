@@ -142,7 +142,7 @@ class OpenSubtitlesClient:
         if name.endswith(".srt"):
             target.write_bytes(content)
             return target
-        subtitle = _archive_subtitle(content)
+        subtitle = _archive_subtitle(content, self.max_download_bytes)
         target.write_bytes(subtitle)
         return target
 
@@ -205,21 +205,25 @@ class SubtitleCache:
         return dest.resolve()
 
 
-def _archive_subtitle(content: bytes) -> bytes:
+def _archive_subtitle(content: bytes, max_bytes: int) -> bytes:
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            return _read_safe_member(archive, archive.infolist())
-    except zipfile.BadZipFile:
+            return _read_safe_member(archive, archive.infolist(), max_bytes)
+    except UnsafeArchiveError:
+        raise
+    except (zipfile.BadZipFile, OSError, RuntimeError, NotImplementedError):
         pass
     try:
         with rarfile.RarFile(io.BytesIO(content)) as archive:
-            return _read_safe_member(archive, archive.infolist())
-    except (rarfile.BadRarFile, rarfile.NeedFirstVolume):
+            return _read_safe_member(archive, archive.infolist(), max_bytes)
+    except UnsafeArchiveError:
+        raise
+    except (rarfile.Error, OSError, RuntimeError, NotImplementedError):
         pass
-    raise UnsafeArchiveError("Subtitle archive has no safe SRT member")
+    raise UnsafeArchiveError("Subtitle archive could not be safely read")
 
 
-def _read_safe_member(archive, members) -> bytes:
+def _read_safe_member(archive, members, max_bytes: int) -> bytes:
     for member in members:
         name = member.filename
         path = Path(name)
@@ -227,11 +231,11 @@ def _read_safe_member(archive, members) -> bytes:
             raise UnsafeArchiveError("Subtitle archive member escapes its destination")
         if not name.lower().endswith(".srt"):
             continue
-        if getattr(member, "file_size", 0) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES:
+        if getattr(member, "file_size", 0) > max_bytes:
             raise UnsafeArchiveError("Subtitle archive member exceeds the size limit")
         with archive.open(member) as stream:
-            data = stream.read(OpenSubtitlesClient.MAX_DOWNLOAD_BYTES + 1)
-        if len(data) > OpenSubtitlesClient.MAX_DOWNLOAD_BYTES:
+            data = stream.read(max_bytes + 1)
+        if len(data) > max_bytes:
             raise UnsafeArchiveError("Subtitle archive member exceeds the size limit")
         return data
     raise UnsafeArchiveError("Subtitle archive has no SRT member")

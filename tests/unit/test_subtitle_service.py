@@ -1,3 +1,4 @@
+from hashlib import sha256
 from pathlib import Path
 
 import pytest
@@ -6,10 +7,15 @@ from api.database import OperationStore
 from api.errors import AttentionRequired
 from api.settings import Settings
 from api.subtitles import SubtitleService
+from src.analysis.engine import ProfanityEngine
 from src.data.opensubtitles import SubtitleCache, SubtitleResult
 
 VALID_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n\n2\n01:20:00,000 --> 01:25:00,000\nBye\n"
 SHORT_SRT = b"1\n00:00:01,000 --> 00:00:02,000\nHello\n"
+CP1252_SRT = (
+    "1\n00:00:01,000 --> 00:00:02,000\ncaf\u00e9\n\n"
+    "2\n01:20:00,000 --> 01:25:00,000\nBye\n"
+).encode("cp1252")
 
 
 class FakeClient:
@@ -77,6 +83,16 @@ def test_select_stops_after_exactly_three_automatic_candidates_and_records_rejec
     assert detail["run"]["state"] == "needs_attention"
 
 
+def test_exhaustion_message_reports_actual_attempted_candidate_count(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912")
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": SHORT_SRT})
+    service.discover(job["id"])
+
+    with pytest.raises(AttentionRequired, match="One subtitle candidate was rejected"):
+        service.select(job["id"])
+
+
 def test_manual_selection_records_threshold_override_and_is_idempotent(store, configured):
     result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
     job = make_job(store)
@@ -105,6 +121,62 @@ def test_selected_cache_replaces_stale_content_only_after_validation(store, conf
     assert selected["content_hash"]
 
 
+def test_cp1252_candidate_promotes_normalized_utf8_for_cache_and_analysis(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": CP1252_SRT})
+    service.discover(job["id"])
+
+    selected = service.select(job["id"])
+
+    artifact = Path(store.get_candidate(selected["id"], include_internal=True)["artifact_path"])
+    assert artifact.read_bytes() == service.cache.has("tt0110912").read_bytes()
+    assert b"caf\xc3\xa9" in artifact.read_bytes()
+    assert selected["content_hash"] == sha256(artifact.read_bytes()).hexdigest()
+    assert ProfanityEngine({"categories": {"soft": ["caf\u00e9"]}}).analyse_srt(artifact)["summary"]["total_soft"] == 1
+
+
+def test_upload_hash_describes_the_normalized_utf8_artifact(store, configured):
+    job = make_job(store)
+    uploaded = make_service(store, configured, [], {}).upload(job["id"], "subtitle.srt", CP1252_SRT)
+    artifact = Path(store.get_candidate(uploaded["id"], include_internal=True)["artifact_path"])
+
+    assert uploaded["content_hash"] == sha256(artifact.read_bytes()).hexdigest()
+    assert b"caf\xc3\xa9" in artifact.read_bytes()
+
+
+def test_resume_finishes_interrupted_promotion_before_exposing_selected_candidate(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912", runtime_seconds=100 * 60)
+    job = make_job(store)
+    service = make_service(store, configured, [result], {"1": VALID_SRT})
+    service.discover(job["id"])
+    original_store = service.cache.store
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("promotion interrupted")
+        return original_store(*args, **kwargs)
+
+    service.cache.store = fail_once
+    with pytest.raises(RuntimeError, match="interrupted"):
+        service.select(job["id"])
+
+    candidate = store.list_candidates(job["id"])[0]
+    assert candidate["status"] == "validated"
+    assert store.get_job_detail(job["id"])["stages"][0]["state"] == "running"
+
+    selected = service.select(job["id"])
+    detail = store.get_job_detail(job["id"])
+    assert selected["status"] == "selected"
+    assert detail["stages"][0]["state"] == "completed"
+    assert len([event for event in detail["events"] if event["type"] == "subtitle_selected"]) == 1
+    assert len(store.list_decisions(job["id"])) == 0
+    assert len([attempt for attempt in detail["attempts"] if attempt["candidate_id"]]) == 1
+
+
 def test_upload_is_confined_and_resume_does_not_repeat_selection(store, configured):
     job = make_job(store)
     service = make_service(store, configured, [], {})
@@ -114,3 +186,18 @@ def test_upload_is_confined_and_resume_does_not_repeat_selection(store, configur
     resumed = service.select(job["id"])
     assert resumed["id"] == selected["id"]
     assert not (configured.results_dir.parent / "outside.srt").exists()
+
+
+def test_download_failure_persists_safe_diagnostic_without_workspace_path(store, configured):
+    result = SubtitleResult("1", "one.srt", "Pulp Fiction", "1994", "en", None, "tt0110912")
+    job = make_job(store)
+    service = make_service(store, configured, [result], {})
+    service.client.download = lambda *_: (_ for _ in ()).throw(OSError("/home/operator/secret.srt"))
+    service.discover(job["id"])
+
+    with pytest.raises(AttentionRequired):
+        service.select(job["id"])
+
+    candidate = store.list_candidates(job["id"])[0]
+    assert candidate["parse_error"] == "Subtitle candidate could not be parsed."
+    assert "/home/operator" not in repr(candidate)

@@ -30,6 +30,8 @@ _EXHAUSTION_ACTIONS = (
     "upload_subtitle",
     "cancel",
 )
+_SAFE_PARSE_ERROR = "Subtitle candidate could not be parsed."
+_SAFE_ARCHIVE_ERROR = "Subtitle archive could not be safely read."
 
 
 class SubtitleService:
@@ -104,9 +106,17 @@ class SubtitleService:
             (row for row in self.store.list_candidates(job_id) if row["status"] == "selected"),
             None,
         )
-        if selected is not None:
+        if selected is not None and self._selected_contract_valid(job_id, selected):
             return selected
+        if selected is not None:
+            self.store.update_candidate(selected["id"], status="validated")
         self._start_selection(job_id)
+        validated = next(
+            (row for row in self.store.list_candidates(job_id) if row["status"] == "validated"),
+            None,
+        )
+        if validated is not None:
+            return self._resume_validated(job_id, validated)
         if manual_candidate_id is not None:
             candidate = self.store.get_candidate(manual_candidate_id, include_internal=True)
             if candidate is None or candidate["job_id"] != job_id:
@@ -125,7 +135,7 @@ class SubtitleService:
                 return selected
         self._exhaust(job_id, attempted=len(candidates), limit=limit)
         raise AttentionRequired(
-            "Three subtitle candidates were rejected.",
+            _exhaustion_message(len(candidates)),
             code="subtitle_candidates_exhausted",
             actions=_EXHAUSTION_ACTIONS,
         )
@@ -152,10 +162,14 @@ class SubtitleService:
         destination.write_bytes(content)
         try:
             inspection = inspect_subtitle(destination)
-        except SubtitleParseError as exc:
+        except SubtitleParseError:
             return self.store.update_candidate(
-                row["id"], status="rejected", parse_error=str(exc), rejection_reasons=["invalid_srt"]
+                row["id"],
+                status="rejected",
+                parse_error=_SAFE_PARSE_ERROR,
+                rejection_reasons=["invalid_srt"],
             ) or row
+        _write_normalized(destination, inspection.normalized_utf8)
         return self.store.update_candidate(
             row["id"],
             detected_encoding=inspection.detected_encoding,
@@ -163,6 +177,7 @@ class SubtitleService:
             first_cue_seconds=inspection.first_cue_seconds,
             final_cue_seconds=inspection.final_cue_seconds,
             parsed_duration_seconds=inspection.parsed_duration_seconds,
+            content_hash=_hash(destination),
             artifact_path=str(destination),
         ) or row
 
@@ -177,6 +192,7 @@ class SubtitleService:
         try:
             path = self._candidate_path(job_id, candidate)
             inspection = inspect_subtitle(path)
+            _write_normalized(path, inspection.normalized_utf8)
             quality = evaluate_quality(
                 inspection,
                 candidate["expected_runtime_seconds"],
@@ -188,7 +204,7 @@ class SubtitleService:
                 accepted = True
                 reasons.append("manual_threshold_override")
             if accepted:
-                updated = self.store.update_candidate(
+                validated = self.store.update_candidate(
                     candidate["id"],
                     detected_encoding=inspection.detected_encoding,
                     cue_count=inspection.cue_count,
@@ -198,17 +214,12 @@ class SubtitleService:
                     coverage_percent=quality.coverage_percent,
                     quality_reasons=reasons,
                     rejection_reasons=[],
-                    status="selected",
+                    status="validated",
                     content_hash=_hash(path),
                     artifact_path=str(path),
-                    selected_at=datetime.now(UTC).isoformat(),
                     selection_method="manual" if manual else "automatic",
                 )
-                self.store.finish_attempt(
-                    attempt["id"], "completed", output={"candidate_id": candidate["id"]}
-                )
-                self._promote(job_id, updated, path, manual)
-                return updated
+                return self._complete_validated(job_id, validated, path, attempt)
             updated = self.store.update_candidate(
                 candidate["id"],
                 detected_encoding=inspection.detected_encoding,
@@ -225,18 +236,21 @@ class SubtitleService:
             )
             self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reasons": reasons})
             return updated
-        except UnsafeArchiveError as exc:
+        except UnsafeArchiveError:
             updated = self.store.update_candidate(
                 candidate["id"],
                 status="rejected",
-                download_error=str(exc),
+                download_error=_SAFE_ARCHIVE_ERROR,
                 rejection_reasons=["unsafe_download"],
             )
             self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "unsafe_download"})
             return updated or candidate
-        except (OSError, ValueError, SubtitleParseError) as exc:
+        except (OSError, ValueError, SubtitleParseError):
             updated = self.store.update_candidate(
-                candidate["id"], status="rejected", parse_error=str(exc), rejection_reasons=["invalid_srt"]
+                candidate["id"],
+                status="rejected",
+                parse_error=_SAFE_PARSE_ERROR,
+                rejection_reasons=["invalid_srt"],
             )
             self.store.finish_attempt(attempt["id"], "rejected", diagnostics={"reason": "invalid_srt"})
             return updated or candidate
@@ -256,26 +270,89 @@ class SubtitleService:
             raise UnsafeArchiveError("Provider download escaped its generated destination") from exc
         return downloaded
 
-    def _promote(self, job_id: str, candidate: dict[str, Any], path: Path, manual: bool) -> None:
+    def _resume_validated(self, job_id: str, candidate: dict[str, Any]) -> dict[str, Any]:
+        stored = self.store.get_candidate(candidate["id"], include_internal=True)
+        if stored is None or not stored.get("artifact_path"):
+            raise SubtitleParseError("Candidate file is unavailable")
+        path = Path(stored["artifact_path"])
+        inspection = inspect_subtitle(path)
+        _write_normalized(path, inspection.normalized_utf8)
+        if _hash(path) != candidate["content_hash"]:
+            candidate = self.store.update_candidate(candidate["id"], content_hash=_hash(path)) or candidate
+        stage = self._selection_stage(job_id)
+        attempt = (
+            self.store.start_attempt(
+                job_id, "subtitle_selection", max_attempts=3, candidate_id=candidate["id"]
+            )
+            if StageState(stage["state"]) is StageState.RUNNING
+            else None
+        )
+        return self._complete_validated(job_id, candidate, path, attempt)
+
+    def _complete_validated(
+        self,
+        job_id: str,
+        candidate: dict[str, Any],
+        path: Path,
+        attempt: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Complete durable promotion before marking a candidate selected."""
         job = self._job(job_id)
         if job["source_imdb_id"]:
             self.cache.store(job["source_imdb_id"], path, replace=True)
-        self.store.record_event(
-            job_id,
-            event_type="subtitle_selected",
-            message="A subtitle candidate was selected.",
-            data={"candidate_id": candidate["id"], "selection_method": candidate["selection_method"]},
-        )
-        if manual:
+        if not any(
+            event["type"] == "subtitle_selected" and event["data"].get("candidate_id") == candidate["id"]
+            for event in self.store.list_events(job_id)
+        ):
+            self.store.record_event(
+                job_id,
+                event_type="subtitle_selected",
+                message="A subtitle candidate was selected.",
+                data={"candidate_id": candidate["id"], "selection_method": candidate["selection_method"]},
+            )
+        if candidate["selection_method"] == "manual":
             self.store.record_decision(
                 job_id,
                 "select_subtitle",
                 candidate_id=candidate["id"],
                 accepted=True,
                 reason="Manual subtitle selection accepted a parsed threshold override.",
+                idempotency_key=f"subtitle-selected:{candidate['id']}",
             )
-        self.store.transition_stage(
-            job_id, "subtitle_selection", StageState.COMPLETED, expected_state=StageState.RUNNING
+        stage = self._selection_stage(job_id)
+        if StageState(stage["state"]) is StageState.RUNNING:
+            self.store.transition_stage(
+                job_id, "subtitle_selection", StageState.COMPLETED, expected_state=StageState.RUNNING
+            )
+        elif StageState(stage["state"]) is not StageState.COMPLETED:
+            raise RuntimeError("Subtitle selection stage cannot be completed")
+        if attempt is not None:
+            self.store.finish_attempt(
+                attempt["id"], "completed", output={"candidate_id": candidate["id"]}
+            )
+        return self.store.update_candidate(
+            candidate["id"], status="selected", selected_at=datetime.now(UTC).isoformat()
+        ) or candidate
+
+    def _selected_contract_valid(self, job_id: str, candidate: dict[str, Any]) -> bool:
+        stored = self.store.get_candidate(candidate["id"], include_internal=True)
+        if stored is None or not stored.get("artifact_path"):
+            return False
+        path = Path(stored["artifact_path"])
+        cache_path = self.cache.has(self._job(job_id)["source_imdb_id"] or "")
+        return (
+            path.exists()
+            and candidate["content_hash"] == _hash(path)
+            and cache_path is not None
+            and cache_path.read_bytes() == path.read_bytes()
+            and StageState(self._selection_stage(job_id)["state"]) is StageState.COMPLETED
+        )
+
+    def _selection_stage(self, job_id: str) -> dict[str, Any]:
+        return next(
+            stage
+            for stage in self.store.get_job_detail(job_id)["stages"]
+            if stage["name"] == "subtitle_selection"
         )
 
     def _start_selection(self, job_id: str) -> None:
@@ -321,7 +398,7 @@ class SubtitleService:
             JobState.NEEDS_ATTENTION,
             expected_state=JobState.RUNNING,
             safe_error_code="subtitle_candidates_exhausted",
-            safe_error_message="Three subtitle candidates were rejected.",
+            safe_error_message=_exhaustion_message(attempted),
             next_action="select_subtitle",
         )
 
@@ -341,3 +418,15 @@ def _year(value: str | None) -> int | None:
 
 def _hash(path: Path) -> str:
     return sha256(path.read_bytes()).hexdigest()
+
+
+def _write_normalized(path: Path, content: bytes) -> None:
+    partial = path.with_suffix(".normalized")
+    partial.write_bytes(content)
+    partial.replace(path)
+
+
+def _exhaustion_message(attempted: int) -> str:
+    noun = "candidate was" if attempted == 1 else "candidates were"
+    word = {0: "No", 1: "One", 2: "Two", 3: "Three"}.get(attempted, str(attempted))
+    return f"{word} subtitle {noun} rejected."

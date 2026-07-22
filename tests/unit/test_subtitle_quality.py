@@ -5,6 +5,7 @@ import pytest
 from src.analysis.engine import ProfanityEngine
 from src.data.opensubtitles import SubtitleResult
 from src.data.subtitle_quality import (
+    SubtitleParseError,
     SubtitleRequest,
     evaluate_quality,
     inspect_subtitle,
@@ -36,6 +37,14 @@ def test_inspection_falls_back_to_cp1252_and_normalizes_text(tmp_path):
     assert inspection.detected_encoding == "cp1252"
     assert inspection.cue_count == 2
     assert inspection.final_cue_seconds == pytest.approx(60.0)
+
+
+def test_inspection_rejects_timing_line_without_a_numbered_dialogue_cue(tmp_path):
+    path = tmp_path / "malformed.srt"
+    path.write_text("not an SRT\n00:00:01,000 --> 00:00:02,000\n", encoding="utf-8")
+
+    with pytest.raises(SubtitleParseError, match="Malformed SRT"):
+        inspect_subtitle(path)
 
 
 def test_quality_warns_for_extended_edition_without_rejecting(tmp_path):
