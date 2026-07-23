@@ -86,12 +86,13 @@ export default function VideoPreview({
     <section aria-labelledby="video-preview-heading" className="glass rounded-2xl p-6 space-y-4">
       <h2 id="video-preview-heading">Media preview</h2>
       <div role="group" aria-label="Media preview choices" className="flex gap-2 flex-wrap">
-        {previewAvailable && <button type="button" aria-pressed={activeTab === 'preview'} onClick={() => setActiveTab('preview')}>Graph preview</button>}
-        {videoAvailable && <button type="button" aria-pressed={activeTab === 'video'} onClick={() => setActiveTab('video')}>Final video</button>}
+        {previewAvailable && <button type="button" className={`button ${activeTab === 'preview' ? 'button--primary' : ''}`} aria-pressed={activeTab === 'preview'} onClick={() => setActiveTab('preview')}>Graph preview</button>}
+        {videoAvailable && <button type="button" className={`button ${activeTab === 'video' ? 'button--primary' : ''}`} aria-pressed={activeTab === 'video'} onClick={() => setActiveTab('video')}>Final video</button>}
         {compositeAvailable && availableSegments.map((name) => (
           <button
             type="button"
             key={name}
+            className={`button ${activeTab === 'segment' && activeSegment === name ? 'button--primary' : ''}`}
             aria-pressed={activeTab === 'segment' && activeSegment === name}
             onClick={() => { setActiveTab('segment'); setActiveSegment(name) }}
           >
@@ -102,16 +103,18 @@ export default function VideoPreview({
 
       {activeTab === 'preview' && (
         preview.status === 'loading' ? <div role="status">Loading graph preview…</div>
-          : preview.status === 'error' ? <div role="alert">{preview.error}</div>
-            : <img src={preview.url} alt="Latest graph preview" className="max-w-xs" />
+          : preview.status === 'error' ? <div role="alert" className="inline-error">{preview.error}</div>
+            : <div className="flex justify-center rounded-xl bg-black/30 p-3"><img src={preview.url} alt="Latest graph preview" className="max-h-[70vh] w-auto rounded-lg shadow-lg" /></div>
       )}
       {activeTab === 'video' && (
         video.status === 'loading' ? <div role="status">Loading final video…</div>
-          : video.status === 'error' ? <div role="alert">{video.error}</div>
-            : <>
-              <video src={video.url} controls aria-label={`Final video for ${jobId}`} className="max-w-xs" />
-              <button type="button" onClick={downloadVideo} disabled={!video.url}>Download final MP4</button>
-            </>
+          : video.status === 'error' ? <div role="alert" className="inline-error">{video.error}</div>
+            : <div className="flex flex-col items-center gap-3">
+              <div className="flex justify-center rounded-xl bg-black/30 p-3">
+                <video src={video.url} controls playsInline aria-label={`Final video for ${jobId}`} className="max-h-[70vh] w-auto rounded-lg shadow-lg" />
+              </div>
+              <button type="button" className="button" onClick={downloadVideo} disabled={!video.url}>Download final MP4</button>
+            </div>
       )}
       {activeTab === 'segment' && activeSegment && (
         <div className="space-y-4">

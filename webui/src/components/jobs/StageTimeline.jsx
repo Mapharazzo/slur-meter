@@ -116,7 +116,7 @@ function StageItem({ stage, attempts, children, canRetry, busy, onRetry }) {
   )
 }
 
-export default function StageTimeline({ stages = [], attempts = [], availableActions = [], pendingAction, onRetry }) {
+export default function StageTimeline({ stages = [], attempts = [], availableActions = [], pendingAction, onRetry, embedded = false }) {
   const sorted = [...stages].sort((left, right) => left.ordinal - right.ordinal || left.id - right.id)
   const childrenByParent = new Map()
   sorted.filter((stage) => stage.parent_stage_id != null).forEach((stage) => {
@@ -141,10 +141,15 @@ export default function StageTimeline({ stages = [], attempts = [], availableAct
     </StageItem>
   )
 
+  const Wrapper = embedded ? 'div' : 'section'
+  const wrapperProps = embedded
+    ? {}
+    : { 'aria-labelledby': 'pipeline-timeline-heading', className: 'glass rounded-2xl p-5' }
+
   return (
-    <section aria-labelledby="pipeline-timeline-heading" className="glass rounded-2xl p-5">
-      <h2 id="pipeline-timeline-heading">Pipeline timeline</h2>
+    <Wrapper {...wrapperProps}>
+      {!embedded && <h2 id="pipeline-timeline-heading">Pipeline timeline</h2>}
       {sorted.length ? <ol className="mt-4 space-y-3">{sorted.filter((stage) => stage.parent_stage_id == null).map(renderStage)}</ol> : <p>No stages have been persisted.</p>}
-    </section>
+    </Wrapper>
   )
 }

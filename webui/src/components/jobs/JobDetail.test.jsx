@@ -241,6 +241,14 @@ describe('JobDetail operator workspace', () => {
     expect(screen.getAllByText(/publishing failed safely/i)).toHaveLength(1)
   })
 
+  it('collapses the pipeline timeline once the run is completed', async () => {
+    renderDetail(client({ getJob: vi.fn().mockResolvedValue({ ...detail, run: { ...run, state: 'completed' } }) }))
+
+    const summary = await screen.findByText(/all stages complete/i)
+    expect(summary.closest('details')).not.toHaveAttribute('open')
+    expect(screen.queryByRole('region', { name: /pipeline timeline/i })).toBeNull()
+  })
+
   it('collapses the subtitle section into an expander once selection is resolved', async () => {
     const resolvedDetail = {
       ...detail,

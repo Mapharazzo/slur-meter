@@ -11,6 +11,7 @@ import SubtitleCandidates from '../subtitles/SubtitleCandidates'
 import VideoPreview from '../video/VideoPreview'
 import AttentionBanner from './AttentionBanner'
 import DiagnosticsPanel from './DiagnosticsPanel'
+import EventLog from './EventLog'
 import PipelineSteps from './PipelineSteps'
 
 const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled', 'needs_attention'])
@@ -156,7 +157,19 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
 
             <AttentionBanner run={snapshot.run} availableActions={snapshot.available_actions} pendingAction={pendingAction} onAction={bannerAction} />
             {mutationError && <p role="alert" className="inline-error">{mutationError}</p>}
-            <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} />
+            {snapshot.run.state === 'completed' ? (
+              <details className="glass rounded-2xl p-5">
+                <summary className="flex cursor-pointer flex-wrap items-center gap-2 font-semibold">
+                  <span>Pipeline timeline</span>
+                  <span className="text-sm font-normal opacity-70">· all stages complete · expand</span>
+                </summary>
+                <div className="mt-2">
+                  <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} embedded />
+                </div>
+              </details>
+            ) : (
+              <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} />
+            )}
             {(() => {
               const graph = snapshot.stages.find((stage) => stage.name === 'graph')
               const composite = snapshot.stages.find((stage) => stage.name === 'composite')
@@ -219,11 +232,7 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
             })()}
             <PublishingPanel jobId={jobId} token={operatorToken} releases={snapshot.releases} publishingAttempts={snapshot.publishing_attempts} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
             <CostSummary costs={snapshot.costs} />
-            <section aria-labelledby="event-stream-heading" className="glass rounded-xl p-4">
-              <h2 id="event-stream-heading">Operational events</h2>
-              {eventWarning && <p role="alert">{eventWarning} Showing persisted events.</p>}
-              {events.length ? <ol>{events.map((event) => <li key={event.id}><time dateTime={event.created_at}>{event.created_at}</time> · {event.message}</li>)}</ol> : <p>No events have been persisted.</p>}
-            </section>
+            <EventLog events={events} warning={eventWarning} />
             <DiagnosticsPanel detail={{ ...snapshot, events }} operatorToken={operatorToken} />
           </>
         )}
