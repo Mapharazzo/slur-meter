@@ -67,7 +67,7 @@ audio:
 
   # Intro voiceover (plays during intro_hold / intro_transition)
   intro_tts:
-    enabled: false              # paid provider: explicitly opt in
+    enabled: true               # ElevenLabs voiceover (paid) — opted in
     provider: "elevenlabs"     # "edge" | "file" | "silence" | "elevenlabs"
     provider_config:
       voice_id: "pNInz6obpgDQGcFmaJgB"
@@ -79,7 +79,7 @@ audio:
 
   # Outro voiceover (plays during verdict segment)
   outro_tts:
-    enabled: false              # paid provider: explicitly opt in
+    enabled: true               # ElevenLabs voiceover (paid) — opted in
     provider: "elevenlabs"
     provider_config:
       voice_id: "pNInz6obpgDQGcFmaJgB"
@@ -93,7 +93,7 @@ audio:
   # Background music (loops for full video duration)
   # provider: "file" for a local mp3, "lyria" for AI-generated per-movie
   background_music:
-    enabled: false              # paid provider: explicitly opt in
+    enabled: true               # Lyria via OpenRouter (paid) — opted in
     provider: "lyria"
     provider_config:
       api_key_env: "OPENROUTER_API_KEY"

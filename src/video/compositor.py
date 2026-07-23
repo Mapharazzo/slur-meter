@@ -124,7 +124,9 @@ class VideoCompositor:
         if runtime and runtime != "N/A":
             meta_parts.append(runtime)
         if imdb_r and imdb_r != "N/A":
-            meta_parts.append(f"★ {imdb_r}")
+            # The rendering fonts (Liberation/Montserrat) lack the U+2605 star
+            # glyph, which renders as a tofu square. Use a text label instead.
+            meta_parts.append(f"IMDb {imdb_r}")
         if meta_parts:
             draw.text(
                 (cx, y),
