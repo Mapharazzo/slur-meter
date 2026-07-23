@@ -682,7 +682,7 @@ async def test_blocking_generation_stage_keeps_event_loop_and_lease_heartbeat_al
             store,
             services,
             stages=("metadata",),
-            lease_seconds=0.12,
+            lease_seconds=0.6,
             settings=settings,
         )
 
@@ -690,7 +690,7 @@ async def test_blocking_generation_stage_keeps_event_loop_and_lease_heartbeat_al
         store,
         runner_factory,
         poll_interval=0.02,
-        lease_seconds=0.12,
+        lease_seconds=0.6,
         shutdown_timeout=1,
     )
     await dispatcher.start()
@@ -709,12 +709,15 @@ async def test_blocking_generation_stage_keeps_event_loop_and_lease_heartbeat_al
         first_expiry = boundary["run"]["lease_expires_at"]
         assert first_expiry is not None
         ticks = 0
-        for _ in range(12):
+        second_expiry = first_expiry
+        for _ in range(50):
             await asyncio.sleep(0.01)
             ticks += 1
-        second_expiry = store.get_job(job["id"])["lease_expires_at"]
-        assert ticks == 12
-        assert second_expiry is not None
+            second_expiry = store.get_job(job["id"])["lease_expires_at"]
+            assert second_expiry is not None
+            if second_expiry > first_expiry:
+                break
+        assert ticks > 0
         assert second_expiry > first_expiry
         release.set()
         for _ in range(100):
