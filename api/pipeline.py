@@ -369,12 +369,7 @@ class GenerationPipelineServices:
         if job["source_imdb_id"]:
             result = self.metadata_client.fetch(job["source_imdb_id"])
         else:
-            result = MovieMetadataResult(
-                configured=False,
-                warnings=(
-                    "Movie metadata enrichment requires an IMDb ID; continuing without it.",
-                ),
-            )
+            result = self._resolve_metadata_by_title(job)
         if isinstance(result, Mapping):
             result = MovieMetadataResult(
                 configured=True,
@@ -385,6 +380,13 @@ class GenerationPipelineServices:
         metadata.setdefault("Title", job["label"].split("(", 1)[0].strip())
         metadata.setdefault("Year", _label_year(job["label"]))
         metadata["configured"] = bool(result.configured)
+        # Backfill the expected runtime onto any candidate the provider left
+        # without one, so subtitle coverage can be judged for title-only jobs.
+        self._backfill_expected_runtime(
+            job_id,
+            _runtime_minutes(metadata),
+            getattr(progress, "lease_owner", None),
+        )
         staging = self.artifacts.new_staging_directory(job_id, "metadata")
         try:
             _atomic_json_file(staging / "metadata.json", metadata)
@@ -411,6 +413,36 @@ class GenerationPipelineServices:
                 shutil.rmtree(staging)
         self._legacy_update(job_id, movie_info=metadata)
         return manifest
+
+    def _resolve_metadata_by_title(self, job: Mapping[str, Any]):
+        """Resolve metadata for a title-only job (no IMDb ID) via title search."""
+        from src.data.movie_metadata import MovieMetadataResult
+
+        resolver = getattr(self.metadata_client, "resolve_title", None)
+        query = (job.get("query") or "").strip() or job["label"].split("(", 1)[0].strip()
+        if resolver is None or not query:
+            return MovieMetadataResult(
+                configured=False,
+                warnings=(
+                    "Movie metadata enrichment requires an IMDb ID; continuing without it.",
+                ),
+            )
+        return resolver(query, _label_year(job["label"]))
+
+    def _backfill_expected_runtime(
+        self, job_id: str, runtime_minutes: float | None, lease_owner: str | None
+    ) -> None:
+        if not runtime_minutes or runtime_minutes <= 0:
+            return
+        runtime_seconds = float(runtime_minutes) * 60.0
+        for candidate in self.store.list_candidates(job_id):
+            if candidate.get("expected_runtime_seconds"):
+                continue
+            self.store.update_candidate(
+                candidate["id"],
+                lease_owner=lease_owner,
+                expected_runtime_seconds=runtime_seconds,
+            )
 
     def _analysis(self, job_id: str, progress: ProgressReporter) -> Mapping[str, Any]:
         from src.analysis.engine import ProfanityEngine

@@ -525,6 +525,138 @@ def test_metadata_client_rejects_omdb_error_flags_and_invalid_poster_bytes():
     assert result.warnings == ("Movie poster response was not a valid image.",)
 
 
+class _Response:
+    status_code = 200
+
+    def __init__(self, payload=None, content=b""):
+        self.payload = payload or {}
+        self.content = content
+
+    def json(self):
+        return self.payload
+
+
+class _SequencedSession:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.urls = []
+
+    def get(self, url, *_args, **_kwargs):
+        self.urls.append(url)
+        return self.responses.pop(0)
+
+
+def test_metadata_client_resolves_runtime_from_title_without_imdb_id():
+    # search -> details(imdb_id) -> fetch(find -> details -> credits)
+    session = _SequencedSession(
+        [
+            _Response({"results": [{"id": 42, "title": "The Departed"}]}),
+            _Response({"imdb_id": "tt0407887", "title": "The Departed"}),
+            _Response({"movie_results": [{"id": 42, "title": "The Departed"}]}),
+            _Response(
+                {
+                    "title": "The Departed",
+                    "runtime": 151,
+                    "release_date": "2006-10-06",
+                }
+            ),
+            _Response({"crew": [], "cast": []}),
+        ]
+    )
+    result = MovieMetadataClient(
+        tmdb_token="configured", session=session
+    ).resolve_title("the departed")
+    assert result.configured is True
+    assert result.metadata["Runtime"] == "151 min"
+    assert result.metadata["imdb_id"] == "tt0407887"
+    assert any("/search/movie" in url for url in session.urls)
+
+
+def test_metadata_client_title_resolution_falls_back_to_details_runtime():
+    # A match without an IMDb id still yields a runtime from the TMDB details.
+    session = _SequencedSession(
+        [
+            _Response({"results": [{"id": 7, "title": "Indie Film"}]}),
+            _Response(
+                {"title": "Indie Film", "runtime": 95, "release_date": "2010-01-01"}
+            ),
+        ]
+    )
+    result = MovieMetadataClient(
+        tmdb_token="configured", session=session
+    ).resolve_title("indie film")
+    assert result.metadata["Runtime"] == "95 min"
+    assert "imdb_id" not in result.metadata
+
+
+def test_metadata_client_title_resolution_reports_no_match():
+    session = _SequencedSession([_Response({"results": []})])
+    result = MovieMetadataClient(
+        tmdb_token="configured", session=session
+    ).resolve_title("nonexistent movie")
+    assert result.configured is True
+    assert result.metadata == {}
+    assert result.warnings
+
+
+@pytest.mark.anyio
+async def test_metadata_backfills_expected_runtime_for_title_only_jobs(tmp_path):
+    store = OperationStore(tmp_path / "operations.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("", "the departed", "The Departed")
+    store.record_candidate(
+        job["id"],
+        "opensubtitles",
+        "provider-1",
+        source_type="download",
+        status="discovered",
+        rank=1,
+        expected_runtime_seconds=None,
+    )
+    store.ensure_stage(job["id"], "metadata", ordinal=1)
+    store.claim_next_job("worker", lease_seconds=30)
+
+    class TitleResolvingClient:
+        def fetch(self, _imdb_id):
+            raise AssertionError("title-only job must not fetch by IMDb id")
+
+        def resolve_title(self, _query, _year=None):
+            return MovieMetadataResult(
+                configured=True,
+                metadata={
+                    "Title": "The Departed",
+                    "Runtime": "151 min",
+                    "imdb_id": "tt0407887",
+                },
+            )
+
+    settings = Settings(
+        base_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        results_dir=tmp_path / "results",
+    )
+    services = GenerationPipelineServices(
+        store,
+        settings,
+        config=_config(),
+        metadata_client=TitleResolvingClient(),
+        plotter_factory=FakePlotter,
+        compositor_factory=FakeCompositor,
+        audio_pipeline_factory=FakeAudioPipeline,
+        encoder=FakeEncoder(),
+    )
+
+    await asyncio.wait_for(
+        PipelineRunner(
+            store, services, stages=("metadata",), sleep=asyncio.sleep, settings=settings
+        ).run(job["id"], "worker"),
+        timeout=10,
+    )
+
+    candidate = store.list_candidates(job["id"])[0]
+    assert candidate["expected_runtime_seconds"] == 151 * 60
+
+
 def test_ffprobe_failure_is_emitted_as_warning_instead_of_swallowed(
     tmp_path, monkeypatch
 ):

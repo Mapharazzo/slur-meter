@@ -183,6 +183,101 @@ class MovieMetadataClient:
             warnings=tuple(warnings),
         )
 
+    def resolve_title(
+        self, query: str, year: str | None = None
+    ) -> MovieMetadataResult:
+        """Resolve a movie from a free-text title so title-only jobs get a runtime.
+
+        Searches TMDB, takes the best match, and — when it carries an IMDb ID —
+        delegates to ``fetch`` so the fully validated enrichment path is reused.
+        """
+        text = (query or "").strip()
+        if self.tmdb_token is None:
+            return MovieMetadataResult(
+                configured=False,
+                warnings=(
+                    "Movie metadata provider is not configured; continuing without enrichment.",
+                ),
+            )
+        if not text:
+            return MovieMetadataResult(
+                configured=False,
+                warnings=(
+                    "A movie title is required to resolve metadata without an IMDb ID.",
+                ),
+            )
+        headers = {
+            "Authorization": f"Bearer {self.tmdb_token}",
+            "Accept": "application/json",
+        }
+        params: dict[str, Any] = {"query": text}
+        if year and str(year).strip():
+            params["year"] = str(year).strip()
+        found = self._json(
+            self._get(
+                f"{self.TMDB_API}/search/movie", params=params, headers=headers
+            ),
+            "TMDB search",
+        )
+        results = found.get("results")
+        if not isinstance(results, list):
+            raise AttentionRequired(
+                "Movie metadata response was invalid.",
+                code="invalid_metadata_response",
+                actions=("retry",),
+            )
+        if not results:
+            return MovieMetadataResult(
+                configured=True,
+                warnings=(f"No movie metadata matched the title {text!r}.",),
+            )
+        movie = results[0]
+        movie_id = movie.get("id") if isinstance(movie, dict) else None
+        if not isinstance(movie_id, int | str) or not str(movie_id):
+            raise AttentionRequired(
+                "Movie metadata response was invalid.",
+                code="invalid_metadata_response",
+                actions=("retry",),
+            )
+        details = self._json(
+            self._get(f"{self.TMDB_API}/movie/{movie_id}", headers=headers),
+            "TMDB details",
+        )
+        imdb_id = details.get("imdb_id")
+        if (
+            isinstance(imdb_id, str)
+            and imdb_id.strip().lower().startswith("tt")
+            and imdb_id.strip()[2:].isdigit()
+        ):
+            enriched = self.fetch(imdb_id.strip())
+            if enriched.configured and enriched.metadata:
+                return MovieMetadataResult(
+                    configured=True,
+                    metadata={**enriched.metadata, "imdb_id": imdb_id.strip()},
+                    poster_bytes=enriched.poster_bytes,
+                    warnings=enriched.warnings,
+                )
+            return enriched
+        # No usable IMDb ID, but the TMDB details still carry a runtime we can
+        # use to judge subtitle coverage.
+        runtime = details.get("runtime")
+        title = details.get("title") or movie.get("title") or text
+        metadata: dict[str, Any] = {
+            "Title": str(title).strip(),
+            "Year": str(details.get("release_date") or movie.get("release_date") or "")[
+                :4
+            ],
+            "Runtime": f"{int(runtime)} min"
+            if isinstance(runtime, int | float) and runtime > 0
+            else "",
+            "tmdb_id": str(movie_id),
+        }
+        return MovieMetadataResult(
+            configured=True,
+            metadata=metadata,
+            warnings=("Resolved movie metadata by title without an IMDb ID.",),
+        )
+
     def _get(self, url: str, **kwargs: Any):
         try:
             response = self.session.get(url, timeout=self.timeout, **kwargs)
