@@ -108,6 +108,7 @@ function ShellRoutes({ poll }) {
         <Route path="/" element={<Protected><OperationsOverview poll={poll} /></Protected>} />
         <Route path="/jobs" element={<Protected><OperationsOverview poll={poll} /></Protected>} />
         <Route path="/jobs/:imdbId" element={<Protected><JobDetail /></Protected>} />
+        <Route path="/completed" element={<Protected><Leaderboard /></Protected>} />
         <Route path="/leaderboard" element={<Protected><Leaderboard /></Protected>} />
         <Route path="/costs" element={<Protected><CostDashboard /></Protected>} />
         <Route path="/revenue" element={<Protected><RevenueDashboard /></Protected>} />

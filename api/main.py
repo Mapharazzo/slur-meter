@@ -626,15 +626,12 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
 
     @app.get("/api/leaderboard", response_model=LeaderboardResponse)
     async def leaderboard() -> dict[str, Any]:
-        ranked = []
+        items = []
         for row in store.list_completed_jobs():
-            summary = (
-                row.get("artifact_summary", {}).get("analysis", {}).get("summary", {})
-            )
-            if not summary:
-                continue
+            analysis = store.compatibility_analysis(row["id"]) or {}
+            summary = analysis.get("summary", {}) or {}
             stats = store.platform_stats(row["id"])
-            ranked.append(
+            items.append(
                 {
                     "job_id": row["id"],
                     "source_imdb_id": row["source_imdb_id"],
@@ -642,11 +639,15 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
                     "hard": int(summary.get("total_hard", 0)),
                     "soft": int(summary.get("total_soft", 0)),
                     "f_bombs": int(summary.get("total_f_bombs", 0)),
+                    "rating": str(summary.get("rating", "") or ""),
+                    "peak_minute": int(summary.get("peak_minute", 0) or 0),
                     "total_views": sum(int(item.get("views", 0)) for item in stats),
+                    "finished_at": row.get("finished_at") or row.get("updated_at"),
                 }
             )
-        ranked.sort(key=lambda row: (row["hard"], row["f_bombs"]), reverse=True)
-        return {"items": _public_value(ranked, settings), "total": len(ranked)}
+        # Newest first by default; the client owns further sorting/filtering.
+        items.sort(key=lambda row: str(row["finished_at"] or ""), reverse=True)
+        return {"items": _public_value(items, settings), "total": len(items)}
 
     @app.get("/api/analysis/{identifier}", response_model=AnalysisResponse)
     async def analysis(identifier: str) -> dict[str, Any]:

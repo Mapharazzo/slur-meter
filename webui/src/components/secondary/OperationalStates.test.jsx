@@ -37,26 +37,28 @@ beforeEach(() => {
 })
 
 describe('honest secondary operational routes', () => {
-  it('renders the strict leaderboard shape with canonical links, zero metrics, no fabricated controls, and explicit auth', async () => {
+  it('renders the completed-videos gallery: one card per movie, metrics, verdict, and explicit auth', async () => {
     const apiClient = client({
       getLeaderboard: vi.fn().mockResolvedValue({
-        items: [{
-          job_id: 'job_alpha', source_imdb_id: 'tt0110912', label: 'Pulp Fiction',
-          hard: 0, soft: 2, f_bombs: 3, total_views: 0,
-        }],
-        total: 1,
+        items: [
+          { job_id: 'job_new', source_imdb_id: 'tt0110912', label: 'Pulp Fiction', hard: 0, soft: 2, f_bombs: 3, rating: '😬 EDGY', peak_minute: 12, total_views: 0, finished_at: '2026-07-23T12:00:00Z' },
+          // Duplicate movie (same imdb id) from an earlier render — must collapse to one card.
+          { job_id: 'job_old', source_imdb_id: 'tt0110912', label: 'Pulp Fiction', hard: 9, soft: 9, f_bombs: 9, rating: '💀 HAZMAT', peak_minute: 3, total_views: 5, finished_at: '2026-07-20T12:00:00Z' },
+        ],
+        total: 2,
       }),
     })
     const { container } = renderRoute(<Leaderboard client={apiClient} pollingOptions={{ intervalMs: 60_000 }} />)
 
-    expect(await screen.findByRole('heading', { level: 1, name: /toxicity leaderboard/i })).toBeInTheDocument()
-    expect(screen.getByRole('link', { name: /pulp fiction/i })).toHaveAttribute('href', '/jobs/job_alpha')
+    expect(await screen.findByRole('heading', { level: 1, name: /completed videos/i })).toBeInTheDocument()
+    // Deduped by movie id — one card, linking to the latest render.
+    const links = screen.getAllByRole('link', { name: /pulp fiction/i })
+    expect(links).toHaveLength(1)
+    expect(links[0]).toHaveAttribute('href', '/jobs/job_new')
     expect(screen.getByText('0', { selector: '[data-metric="hard"]' })).toBeInTheDocument()
-    expect(screen.getByText('2', { selector: '[data-metric="soft"]' })).toBeInTheDocument()
     expect(screen.getByText('3', { selector: '[data-metric="f-bombs"]' })).toBeInTheDocument()
-    expect(screen.getByText('0', { selector: '[data-metric="views"]' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /refresh/i })).not.toBeInTheDocument()
-    expect(screen.queryByText(/youtube|tiktok|rating|peak/i)).not.toBeInTheDocument()
+    expect(screen.getByText('😬 EDGY', { selector: '[data-metric="rating"]' })).toBeInTheDocument()
+    expect(screen.getByText(/1 of 1 movie/i)).toBeInTheDocument()
     expect(apiClient.getLeaderboard).toHaveBeenCalledWith({ token: 'secondary-token', signal: expect.any(AbortSignal) })
     expect((await axe.run(container)).violations).toEqual([])
   })
@@ -194,7 +196,7 @@ describe('honest secondary operational routes', () => {
     const pending = new Promise(() => {})
     const pendingClient = client({ getLeaderboard: vi.fn(() => pending) })
     const view = renderRoute(<Leaderboard client={pendingClient} pollingOptions={{ intervalMs: 60_000 }} />)
-    expect(screen.getByRole('status')).toHaveTextContent(/loading leaderboard/i)
+    expect(screen.getByRole('status')).toHaveTextContent(/loading completed videos/i)
 
     const emptyClient = client()
     view.rerender(
@@ -204,7 +206,7 @@ describe('honest secondary operational routes', () => {
         </AppProvider>
       </MemoryRouter>,
     )
-    expect(await screen.findByText(/no completed runs/i)).toBeInTheDocument()
+    expect(await screen.findByText(/no completed videos/i)).toBeInTheDocument()
 
     const disconnectedClient = client({
       getRevenue: vi.fn().mockRejectedValue(new ApiError('The server could not be reached.', { code: 'network_error', retryable: true })),

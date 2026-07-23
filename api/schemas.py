@@ -363,7 +363,10 @@ class LeaderboardItemResponse(APIModel):
     hard: int
     soft: int
     f_bombs: int
+    rating: str = ""
+    peak_minute: int = 0
     total_views: int
+    finished_at: str | None = None
 
 
 class LeaderboardResponse(ItemTotalResponse):

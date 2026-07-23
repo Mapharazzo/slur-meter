@@ -3,7 +3,7 @@ import { Link, useLocation } from 'react-router-dom'
 
 const NAVIGATION = [
   { path: '/', label: 'Operations queue', mark: 'O' },
-  { path: '/leaderboard', label: 'Leaderboard', mark: 'L' },
+  { path: '/completed', label: 'Completed', mark: 'V' },
   { path: '/costs', label: 'Costs', mark: 'C' },
   { path: '/revenue', label: 'Revenue', mark: 'R' },
   { path: '/alerts', label: 'Alerts', mark: 'A' },
