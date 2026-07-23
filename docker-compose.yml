@@ -1,10 +1,31 @@
 services:
-  daily-slur-meter:
-    build: .
+  control-panel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: slur-meter-control-panel
     env_file:
       - .env
+    ports:
+      - "8001:8001"
     volumes:
-      - ./results:/app/results
-      - ./output:/app/output
-      - ./tmp:/app/tmp
-    command: ["--imdb", "tt0110912", "--render"]
+      # Persist the operational database and generated artifacts across restarts.
+      - data:/app/data
+      - results:/app/results
+      - output:/app/output
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/api/health', timeout=4).status==200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  data:
+  results:
+  output:

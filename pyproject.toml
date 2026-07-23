@@ -2,6 +2,7 @@
 name = "daily-slur-meter"
 version = "0.1.0"
 description = "Analyse movie subtitles for profanity and generate 9:16 rage chart Shorts"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     # FastAPI backend

@@ -81,7 +81,7 @@ webui/.env
 # uv.lock  # Decided to include it for reproducibility
 
 # Docker
-.dockerignore
+# .dockerignore is tracked on purpose so image builds are reproducible.
 
 # Runtime data cache
 data/

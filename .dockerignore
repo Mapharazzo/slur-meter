@@ -1,0 +1,62 @@
+# Docker build context exclusions.
+# Keep this lean: only source needed to build the UI and install the app.
+# uv.lock is intentionally NOT ignored — the image installs from it for
+# reproducible dependency resolution.
+
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Secrets and local environment (never copy credentials into an image)
+.env
+.env.*
+!.env.example
+webui/.env
+*.pem
+*.key
+token.json
+client_secret*.json
+
+# Python virtualenvs and caches
+.venv
+venv
+ENV
+env
+__pycache__
+*.py[cod]
+*.so
+.Python
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.cache
+.coverage
+.coverage.*
+htmlcov
+reports
+
+# Node build inputs/outputs (the UI is built inside the image)
+webui/node_modules
+webui/dist
+
+# Runtime data / generated artifacts
+data
+results
+output
+tmp
+*.db
+
+# Editor / OS cruft
+.vscode
+.idea
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local tooling / agent state
+.agents
+.codex
+.claude
+.superpowers

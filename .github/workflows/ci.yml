@@ -6,26 +6,53 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  backend:
+    name: Backend (Python)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg fonts-liberation
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Install dependencies
-        run: |
-          uv venv
-          uv pip install -e ".[test]"
+      - name: Set up Python
+        run: uv venv --python 3.11
+
+      - name: Install dependencies (locked)
+        run: uv pip install -e ".[test]"
 
       - name: Lint with ruff
-        run: uv run ruff check src/ tests/ api/
+        run: uv run ruff check src api tests
 
-      - name: Run unit tests
-        run: uv run pytest tests/ -v --tb=short --ignore=tests/integration -m "not slow"
+      - name: Run full test suite
+        run: uv run pytest tests -v --tb=short
+
+  frontend:
+    name: Frontend (UI)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - name: Install dependencies (locked)
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --run
+
+      - name: Build production bundle
+        run: npm run build
