@@ -1112,6 +1112,7 @@ class OperationStore:
                     stage_id=int(row["id"]),
                     event_type="stage_progress",
                     message=f"Stage {stage_name} progress was updated.",
+                    severity="debug",
                     created_at=now,
                 )
                 updated = connection.execute(
