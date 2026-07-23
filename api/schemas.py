@@ -399,3 +399,17 @@ class AnalysisResponse(APIModel):
     events: list[AnalysisEventResponse] = Field(default_factory=list)
     binned: list[AnalysisBinResponse] = Field(default_factory=list)
     summary: AnalysisSummaryResponse
+
+
+class SegmentTimingResponse(APIModel):
+    start_frame: int | None = Field(default=None, ge=0)
+    end_frame: int | None = Field(default=None, ge=0)
+    start_time: float | None = Field(default=None, ge=0)
+    end_time: float | None = Field(default=None, ge=0)
+    num_frames: int | None = Field(default=None, ge=0)
+
+
+class SegmentInfoResponse(APIModel):
+    segment: str
+    frame_count: int = Field(ge=0)
+    timing: SegmentTimingResponse

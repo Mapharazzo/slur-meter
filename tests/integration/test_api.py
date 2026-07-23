@@ -454,6 +454,7 @@ def test_every_structured_and_compatibility_route_has_a_strict_response_model(tm
         "/api/alerts",
         "/api/leaderboard",
         "/api/analysis/{identifier}",
+        "/api/videos/{identifier}/segments/{segment}",
     }
     models = {
         route.path: route.response_model
@@ -465,6 +466,29 @@ def test_every_structured_and_compatibility_route_has_a_strict_response_model(tm
         record_model = get_args(model)[0] if get_origin(model) is list else model
         assert isinstance(record_model, type) and issubclass(record_model, APIModel)
         assert record_model.model_config["extra"] == "forbid"
+
+
+def test_segment_info_dto_has_only_bounded_timing_fields():
+    from pydantic import ValidationError
+
+    from api.schemas import SegmentInfoResponse
+
+    assert set(SegmentInfoResponse.model_fields) == {"segment", "frame_count", "timing"}
+    assert set(SegmentInfoResponse.model_fields["timing"].annotation.model_fields) == {
+        "start_frame",
+        "end_frame",
+        "start_time",
+        "end_time",
+        "num_frames",
+    }
+    with pytest.raises(ValidationError):
+        SegmentInfoResponse.model_validate(
+            {
+                "segment": "graph",
+                "frame_count": 1,
+                "timing": {"num_frames": 1, "artifact_path": "/private/file"},
+            }
+        )
 
 
 @pytest.mark.anyio

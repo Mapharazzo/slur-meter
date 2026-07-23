@@ -2491,7 +2491,7 @@ class OperationStore:
         outcome: str,
         remote_id: str | None = None,
         idempotency_key: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
         """Atomically reconcile an ambiguous release with idempotent decision replay."""
         now = self._now_text()
         normalized_platform = str(platform).strip().lower()
@@ -2517,12 +2517,29 @@ class OperationStore:
                     (resolved, key),
                 ).fetchone()
                 if existing is not None:
-                    if existing["action"] != "reconcile_publishing":
-                        raise ValueError("Idempotency key belongs to another action")
+                    remote_matches = (
+                        outcome == "not_uploaded"
+                        or release["remote_id"] == normalized_remote_id
+                    )
+                    if not (
+                        existing["action"] == "reconcile_publishing"
+                        and existing["platform"] == normalized_platform
+                        and existing["reason"] == outcome
+                        and remote_matches
+                    ):
+                        rejected = self._insert_idempotency_rejection(
+                            connection,
+                            resolved,
+                            "reconcile_publishing",
+                            platform=normalized_platform,
+                            created_at=now,
+                        )
+                        return self._release_dto(release), rejected, False, False
                     return (
                         self._release_dto(release),
                         self._decision_dto(existing),
                         False,
+                        True,
                     )
             else:
                 existing = connection.execute(
@@ -2534,10 +2551,23 @@ class OperationStore:
                 ).fetchone()
                 expected_status = "uploaded" if outcome == "uploaded" else "failed"
                 if existing is not None and release["status"] == expected_status:
+                    if (
+                        outcome == "uploaded"
+                        and release["remote_id"] != normalized_remote_id
+                    ):
+                        rejected = self._insert_idempotency_rejection(
+                            connection,
+                            resolved,
+                            "reconcile_publishing",
+                            platform=normalized_platform,
+                            created_at=now,
+                        )
+                        return self._release_dto(release), rejected, False, False
                     return (
                         self._release_dto(release),
                         self._decision_dto(existing),
                         False,
+                        True,
                     )
             if not (
                 release["status"] == "needs_attention"
@@ -2591,7 +2621,7 @@ class OperationStore:
             decision = connection.execute(
                 "SELECT * FROM admin_decisions WHERE id = ?", (cursor.lastrowid,)
             ).fetchone()
-            return self._release_dto(updated), self._decision_dto(decision), True
+            return self._release_dto(updated), self._decision_dto(decision), True, True
 
     def reconcile_publication(
         self,

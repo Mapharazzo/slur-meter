@@ -39,6 +39,7 @@ from api.schemas import (
     PublishResponse,
     ReleasePageResponse,
     RevenuePageResponse,
+    SegmentInfoResponse,
     SubmitRequest,
     SummaryResponse,
     UploadResponse,
@@ -97,6 +98,7 @@ def _allow_origin(response: Response, origin: str, settings: Settings) -> Respon
     if origin in settings.allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers["Access-Control-Expose-Headers"] = "X-Request-ID"
         response.headers.add_vary_header("Origin")
     return response
 
@@ -509,7 +511,7 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         if _body and _body.reconciliation:
             job = _require_opaque(store, job_id)
             try:
-                release, decision, changed = store.reconcile_publication_request(
+                release, decision, changed, accepted = store.reconcile_publication_request(
                     job["id"],
                     platform,
                     outcome=_body.reconciliation,
@@ -520,6 +522,10 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
                 raise HTTPException(
                     409, "Publishing reconciliation conflicts with durable state"
                 ) from exc
+            if not accepted:
+                raise HTTPException(
+                    409, "Publishing reconciliation conflicts with durable state"
+                )
             if changed:
                 dispatcher.wake()
             return {
@@ -702,7 +708,10 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.get("/api/videos/{identifier}/segments/{segment}")
+    @app.get(
+        "/api/videos/{identifier}/segments/{segment}",
+        response_model=SegmentInfoResponse,
+    )
     async def segment(identifier: str, segment: str) -> dict[str, Any]:
         if segment not in {"intro_hold", "intro_transition", "graph", "verdict"}:
             raise HTTPException(400, "Invalid segment")
@@ -710,10 +719,22 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         path = directory / segment
         if not path.is_dir():
             raise HTTPException(404, "Segment was not found")
+        raw_timing = manifest.get("details", {}).get("timing", {}).get(segment, {})
+        timing_fields = {
+            key: raw_timing[key]
+            for key in (
+                "start_frame",
+                "end_frame",
+                "start_time",
+                "end_time",
+                "num_frames",
+            )
+            if key in raw_timing
+        }
         return {
             "segment": segment,
             "frame_count": len(list(path.glob("*.png"))),
-            "timing": manifest.get("details", {}).get("timing", {}).get(segment, {}),
+            "timing": timing_fields,
         }
 
     @app.get("/api/videos/{identifier}/frames/{segment}/{frame_num}")

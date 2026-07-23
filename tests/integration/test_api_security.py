@@ -278,6 +278,9 @@ async def test_cors_failures_and_early_auth_use_structured_origin_aware_response
         early_auth = await client.get(
             "/api/jobs", headers={"Origin": "https://allowed.test"}
         )
+        disallowed_auth = await client.get(
+            "/api/jobs", headers={"Origin": "https://denied.test"}
+        )
     for response in (denied_method, denied_header):
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "bad_request"
@@ -288,6 +291,10 @@ async def test_cors_failures_and_early_auth_use_structured_origin_aware_response
     assert early_auth.status_code == 401
     assert early_auth.headers["access-control-allow-origin"] == "https://allowed.test"
     assert early_auth.headers["access-control-allow-credentials"] == "true"
+    assert early_auth.headers["access-control-expose-headers"].lower() == "x-request-id"
+
+    assert "access-control-allow-origin" not in disallowed_auth.headers
+    assert "access-control-expose-headers" not in disallowed_auth.headers
 
 
 @pytest.mark.anyio
