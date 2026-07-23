@@ -40,6 +40,21 @@ function StageProgress({ stage }) {
   )
 }
 
+function isProgressComplete(stage) {
+  const { numerator, denominator } = stage.progress || {}
+  return denominator > 0 && numerator != null && numerator >= denominator
+}
+
+// A composite child stays `running` at full progress until its parent's
+// artifact is durably promoted and every child completes atomically. Show such
+// a fully-rendered child as completed so it doesn't read as a stale spinner.
+function displayState(stage) {
+  if (stage.parent_stage_id != null && stage.state === 'running' && isProgressComplete(stage)) {
+    return 'completed'
+  }
+  return stage.state
+}
+
 function StageItem({ stage, attempts, children, canRetry, busy, onRetry }) {
   const [expanded, setExpanded] = useState(false)
   const headingId = `stage-${stage.id}`
@@ -47,7 +62,7 @@ function StageItem({ stage, attempts, children, canRetry, busy, onRetry }) {
     <li data-parent-stage={stage.parent_stage_id ?? undefined} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
       <div className="flex w-full items-center gap-3">
         <h3 id={headingId} className="flex-1 font-semibold capitalize">{words(stage.name)}</h3>
-        <StatusBadge status={stage.state} />
+        <StatusBadge status={displayState(stage)} />
         <button
           type="button"
           aria-label={`${expanded ? 'Collapse' : 'Expand'} ${words(stage.name)}`}
