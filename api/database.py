@@ -369,27 +369,64 @@ class OperationStore:
             ).fetchone()
             if row is None:
                 return None
-            assert_job_transition(JobState.QUEUED, JobState.RUNNING)
-            cursor = connection.execute(
-                """UPDATE job_runs SET state = 'running', lease_owner = ?,
-                       lease_expires_at = ?, started_at = COALESCE(started_at, ?),
-                       updated_at = ?
-                   WHERE id = ? AND state = 'queued' AND cancel_requested_at IS NULL""",
-                (str(owner), expires, now, now, row["id"]),
+            return self._claim_queued_job(
+                connection, row["id"], str(owner), now, expires
             )
-            if cursor.rowcount != 1:
-                return None
-            self._insert_event(
-                connection,
-                row["id"],
-                event_type="job_claimed",
-                message="Run was claimed by a worker.",
-                created_at=now,
-            )
-            claimed = connection.execute(
-                "SELECT * FROM job_runs WHERE id = ?", (row["id"],)
+
+    def claim_job(
+        self, job_id: str, owner: str, *, lease_seconds: float
+    ) -> dict[str, Any] | None:
+        """Atomically lease one requested queued run without disturbing FIFO work."""
+        if not str(owner).strip():
+            raise ValueError("A lease owner is required")
+        if lease_seconds <= 0:
+            raise ValueError("Lease duration must be positive")
+        now_dt = self._now_datetime()
+        now = now_dt.isoformat()
+        expires = (now_dt + timedelta(seconds=float(lease_seconds))).isoformat()
+        with self._mutation() as connection:
+            row = connection.execute(
+                "SELECT * FROM job_runs WHERE id = ?", (str(job_id),)
             ).fetchone()
-            return self._job_dto(claimed)
+            if (
+                row is None
+                or row["state"] != JobState.QUEUED.value
+                or row["cancel_requested_at"]
+            ):
+                return None
+            return self._claim_queued_job(
+                connection, str(job_id), str(owner), now, expires
+            )
+
+    def _claim_queued_job(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        owner: str,
+        now: str,
+        expires: str,
+    ) -> dict[str, Any] | None:
+        assert_job_transition(JobState.QUEUED, JobState.RUNNING)
+        cursor = connection.execute(
+            """UPDATE job_runs SET state = 'running', lease_owner = ?,
+                   lease_expires_at = ?, started_at = COALESCE(started_at, ?),
+                   updated_at = ?
+               WHERE id = ? AND state = 'queued' AND cancel_requested_at IS NULL""",
+            (owner, expires, now, now, job_id),
+        )
+        if cursor.rowcount != 1:
+            return None
+        self._insert_event(
+            connection,
+            job_id,
+            event_type="job_claimed",
+            message="Run was claimed by a worker.",
+            created_at=now,
+        )
+        claimed = connection.execute(
+            "SELECT * FROM job_runs WHERE id = ?", (job_id,)
+        ).fetchone()
+        return self._job_dto(claimed)
 
     def transition_stage_and_job(
         self,

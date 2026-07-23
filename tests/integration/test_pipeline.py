@@ -23,7 +23,7 @@ class TestAnalysisEngineIntegration:
                 f"{i+1}\n"
                 f"00:{i//60:02d}:{i%60:02d},000 --> "
                 f"00:{i//60:02d}:{i%60+2:02d},000\n"
-                "you fucking nigger bastard"
+                "you fucking nigger shit"
             )
         srt.write_text("\n\n".join(lines))
 
@@ -31,8 +31,9 @@ class TestAnalysisEngineIntegration:
         result = engine.analyse_srt(srt)
         s = result["summary"]
 
-        # Every line has: 1 hard, 1 soft(bastard), and f_bomb(fucking)
+        # Every line has one hard match, one soft match, and one f-bomb match.
         assert s["total_hard"] == 100
+        assert s["total_soft"] == 100
         assert s["total_f_bombs"] == 100
         assert "TOXIC" in s["rating"] or "HAZMAT" in s["rating"]
 

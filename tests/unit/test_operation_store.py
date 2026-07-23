@@ -81,6 +81,32 @@ def test_claim_is_atomic_across_workers(store):
     assert store.claim_next_job("worker-c", lease_seconds=10) is None
 
 
+def test_exact_claim_is_atomic_and_does_not_disturb_older_queued_work(store):
+    older, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    requested, _ = store.create_or_get_active_job("tt0068646", "", "The Godfather")
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(
+            pool.map(
+                lambda owner: store.claim_job(
+                    requested["id"], owner, lease_seconds=10
+                ),
+                ("cli-a", "cli-b"),
+            )
+        )
+
+    claimed = [row for row in claims if row is not None]
+    assert [row["id"] for row in claimed] == [requested["id"]]
+    assert store.get_job(older["id"])["state"] == "queued"
+    assert store.claim_next_job("worker", lease_seconds=10)["id"] == older["id"]
+
+
+def test_exact_claim_does_not_resolve_imdb_alias(store):
+    job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
+    assert store.claim_job("tt0110912", "cli", lease_seconds=10) is None
+    assert store.get_job(job["id"])["state"] == "queued"
+
+
 def test_expired_lease_cannot_be_renewed(store, clock):
     job, _ = store.create_or_get_active_job("tt0110912", "", "Pulp Fiction")
     store.claim_next_job("worker-a-token", lease_seconds=10)

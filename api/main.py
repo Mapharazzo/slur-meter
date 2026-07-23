@@ -932,7 +932,7 @@ def _default_dispatcher(settings: Settings, store: OperationStore) -> JobDispatc
 
 
 runtime_settings = Settings.from_env(BASE_DIR)
-operation_store = OperationStore(DB_PATH)
+operation_store = OperationStore(runtime_settings.data_dir / DB_PATH.name)
 job_dispatcher = _default_dispatcher(runtime_settings, operation_store)
 app = create_app(runtime_settings, operation_store, job_dispatcher)
 
