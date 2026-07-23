@@ -794,10 +794,15 @@ def _available_actions(detail: dict[str, Any]) -> list[str]:
             actions.append(f"retry_stage:{stage['name']}")
     if state in {"queued", "cancelled", "failed", "needs_attention"}:
         actions.append("rediscover_subtitles")
+    # The operator is authoritative: any discovered candidate may be selected,
+    # including one automatically rejected during acceptance ranking. Manual
+    # selection records a threshold override, so a rejected candidate must
+    # still offer the select action.
     actions.extend(
         f"select_subtitle:{candidate['id']}"
         for candidate in detail.get("candidates", [])
-        if candidate.get("status") in {"discovered", "uploaded", "validated"}
+        if candidate.get("status")
+        in {"discovered", "uploaded", "validated", "rejected"}
     )
     releases = {row["platform"]: row for row in detail.get("releases", [])}
     if state == "completed":

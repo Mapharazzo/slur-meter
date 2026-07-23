@@ -298,6 +298,37 @@ async def test_detail_lists_all_actions_derived_from_durable_state(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_operator_can_select_an_automatically_rejected_candidate(tmp_path):
+    """The operator is authoritative: a rejected candidate still offers select."""
+    from api.main import create_app
+
+    store = OperationStore(tmp_path / "db")
+    app = create_app(Settings(tmp_path, admin_api_token="token"), store, Dispatcher())
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        job = (await client.post("/api/jobs", json={"query": "the departed"})).json()
+        rejected, _ = store.record_candidate(
+            job["id"],
+            "opensubtitles",
+            "provider-1",
+            source_type="download",
+            status="rejected",
+            rank=1,
+            rejection_reasons=["expected_runtime_unavailable"],
+        )
+        response = await client.get(f"/api/jobs/{job['id']}")
+
+    actions = response.json()["available_actions"]
+    assert f"select_subtitle:{rejected['id']}" in actions
+
+
+@pytest.mark.anyio
 async def test_compatibility_analytics_are_store_backed_true_aggregates(tmp_path):
     from api.main import create_app
 
