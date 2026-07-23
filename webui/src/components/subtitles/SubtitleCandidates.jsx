@@ -24,6 +24,7 @@ export default function SubtitleCandidates({
   onRefresh = async () => {},
   actionRunner,
   pendingAction: sharedPending = null,
+  embedded = false,
 }) {
   const [pending, setPending] = useState(null)
   const [error, setError] = useState('')
@@ -59,9 +60,14 @@ export default function SubtitleCandidates({
     mutate('upload', (options) => client.uploadSubtitle(jobId, file, options))
   }
 
+  const Wrapper = embedded ? 'div' : 'section'
+  const wrapperProps = embedded
+    ? { className: 'space-y-2' }
+    : { 'aria-labelledby': 'subtitle-candidates-heading', className: 'glass rounded-2xl p-5' }
+
   return (
-    <section aria-labelledby="subtitle-candidates-heading" className="glass rounded-2xl p-5">
-      <h2 id="subtitle-candidates-heading">Subtitle candidates</h2>
+    <Wrapper {...wrapperProps}>
+      {!embedded && <h2 id="subtitle-candidates-heading">Subtitle candidates</h2>}
       <p>Acceptance threshold: 70%. Coverage at or above 70% meets the configured duration threshold; the server remains authoritative.</p>
       {error && <p role="alert" className="inline-error">{error}</p>}
       {candidates.length ? (
@@ -108,6 +114,6 @@ export default function SubtitleCandidates({
         <button type="button" className="button" disabled={Boolean(activePending)} onClick={upload}>Upload subtitle</button>
         {availableActions.includes('resume') && <button type="button" className="button button--primary" disabled={Boolean(activePending)} onClick={() => mutate('resume', (options) => client.resumeJob(jobId, options))}>Resume run</button>}
       </div>
-    </section>
+    </Wrapper>
   )
 }

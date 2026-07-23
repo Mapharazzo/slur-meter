@@ -185,7 +185,38 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
                 />
               )
             })()}
-            <SubtitleCandidates jobId={jobId} token={operatorToken} candidates={snapshot.candidates} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
+            {(() => {
+              const subtitleProps = {
+                jobId, token: operatorToken, candidates: snapshot.candidates,
+                availableActions: snapshot.available_actions, client,
+                onRefresh: resource.refresh, actionRunner: mutate, pendingAction,
+              }
+              const needsOperator = snapshot.stages.some((stage) => (
+                (stage.name === 'subtitle_selection' || stage.name === 'subtitle_discovery')
+                && stage.state === 'needs_attention'
+              ))
+              if (needsOperator) return <SubtitleCandidates {...subtitleProps} />
+              const chosen = snapshot.candidates.find((candidate) => (
+                candidate.status === 'selected' || candidate.status === 'validated'
+              ))
+              const coverage = chosen?.coverage_percent
+              const summary = chosen
+                ? `using #${chosen.rank}${coverage != null ? ` · ${Math.round(coverage)}% coverage` : ''}`
+                : snapshot.candidates.length
+                  ? `${snapshot.candidates.length} discovered`
+                  : 'none yet'
+              return (
+                <details className="glass rounded-2xl p-5">
+                  <summary className="flex cursor-pointer flex-wrap items-center gap-2 font-semibold">
+                    <span>Subtitle candidates</span>
+                    <span className="text-sm font-normal opacity-70">· {summary} · expand to review or override</span>
+                  </summary>
+                  <div className="mt-4">
+                    <SubtitleCandidates {...subtitleProps} embedded />
+                  </div>
+                </details>
+              )
+            })()}
             <PublishingPanel jobId={jobId} token={operatorToken} releases={snapshot.releases} publishingAttempts={snapshot.publishing_attempts} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
             <CostSummary costs={snapshot.costs} />
             <section aria-labelledby="event-stream-heading" className="glass rounded-xl p-4">

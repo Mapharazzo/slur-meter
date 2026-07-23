@@ -218,6 +218,7 @@ describe('JobDetail operator workspace', () => {
     }
     const actionDetail = {
       ...detail,
+      stages: [...detail.stages, { ...parentStage, id: 40, name: 'subtitle_selection', parent_stage_id: null, ordinal: 4, state: 'needs_attention', progress: { numerator: null, denominator: null, unit: null }, warnings: [], next_action: null }],
       candidates: [candidate],
       available_actions: ['select_subtitle:cand_1', 'publish:youtube'],
     }
@@ -238,6 +239,38 @@ describe('JobDetail operator workspace', () => {
     await user.click(within(publishing).getByRole('button', { name: /publish youtube/i }))
     expect(await within(publishing).findByRole('alert')).toHaveTextContent(/publishing failed safely/i)
     expect(screen.getAllByText(/publishing failed safely/i)).toHaveLength(1)
+  })
+
+  it('collapses the subtitle section into an expander once selection is resolved', async () => {
+    const resolvedDetail = {
+      ...detail,
+      stages: [...detail.stages, { ...parentStage, id: 41, name: 'subtitle_selection', parent_stage_id: null, ordinal: 4, state: 'completed', progress: { numerator: null, denominator: null, unit: null }, warnings: [], next_action: null }],
+      candidates: [{ id: 'cand_1', job_id: 'job_alpha', rank: 1, provider: 'opensubtitles', source_type: 'download', provider_filename: 'chosen.srt', status: 'selected', coverage_percent: 95.4, expected_runtime_seconds: 9060, parsed_duration_seconds: 8900, rank_reasons: [], quality_reasons: [], rejection_reasons: [], selection_method: 'automatic' }],
+      available_actions: [],
+    }
+    renderDetail(client({ getJob: vi.fn().mockResolvedValue(resolvedDetail) }))
+
+    await screen.findByRole('region', { name: /pipeline timeline/i })
+    // No prominent subtitle region — it is tucked into a collapsed expander.
+    expect(screen.queryByRole('region', { name: /subtitle candidates/i })).toBeNull()
+    const summary = screen.getByText(/expand to review or override/i)
+    expect(summary.closest('details')).not.toHaveAttribute('open')
+    expect(summary).toHaveTextContent(/using #1/i)
+    expect(summary).toHaveTextContent(/95% coverage/i)
+  })
+
+  it('surfaces the subtitle section prominently when selection needs an operator', async () => {
+    const attentionDetail = {
+      ...detail,
+      run: { ...run, state: 'needs_attention', current_stage: 'subtitle_selection' },
+      stages: [...detail.stages, { ...parentStage, id: 42, name: 'subtitle_selection', parent_stage_id: null, ordinal: 4, state: 'needs_attention', progress: { numerator: null, denominator: null, unit: null }, warnings: [], next_action: null }],
+      candidates: [{ id: 'cand_1', job_id: 'job_alpha', rank: 1, provider: 'opensubtitles', source_type: 'download', provider_filename: 'a.srt', status: 'rejected', coverage_percent: null, expected_runtime_seconds: null, parsed_duration_seconds: null, rank_reasons: [], quality_reasons: [], rejection_reasons: ['expected_runtime_unavailable'], selection_method: null }],
+      available_actions: ['select_subtitle:cand_1', 'rediscover_subtitles'],
+    }
+    renderDetail(client({ getJob: vi.fn().mockResolvedValue(attentionDetail) }))
+
+    expect(await screen.findByRole('region', { name: /subtitle candidates/i })).toBeInTheDocument()
+    expect(screen.queryByText(/expand to review or override/i)).toBeNull()
   })
 
   it('mounts media preview with canonical identity and durable manifest availability', async () => {
