@@ -49,6 +49,129 @@ async def test_cancel_is_idempotent_and_wakes_only_for_a_change(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_idempotency_key_cannot_be_reused_across_actions_targets_or_platforms(
+    tmp_path,
+):
+    app, store, dispatcher = await _client(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        job = (await client.post("/api/jobs", json={"query": "scope keys"})).json()
+        store.ensure_stage(job["id"], "encode", state="failed")
+        store.ensure_stage(job["id"], "graph", state="failed")
+        first = await client.post(
+            f"/api/jobs/{job['id']}/stages/encode/retry",
+            headers={"Idempotency-Key": "same-key"},
+        )
+        wrong_target = await client.post(
+            f"/api/jobs/{job['id']}/stages/graph/retry",
+            headers={"Idempotency-Key": "same-key"},
+        )
+        wrong_action = await client.post(
+            f"/api/jobs/{job['id']}/actions/cancel",
+            headers={"Idempotency-Key": "same-key"},
+        )
+        completed = (
+            await client.post("/api/jobs", json={"query": "platform key"})
+        ).json()
+        store.compatibility_update_job(completed["id"], status="completed")
+        youtube = await client.post(
+            f"/api/jobs/{completed['id']}/publish/youtube",
+            headers={"Idempotency-Key": "platform-key"},
+        )
+        instagram = await client.post(
+            f"/api/jobs/{completed['id']}/publish/instagram",
+            headers={"Idempotency-Key": "platform-key"},
+        )
+    assert first.status_code == youtube.status_code == 200
+    assert wrong_target.status_code == wrong_action.status_code == 409
+    assert instagram.status_code == 409
+    decisions = store.list_decisions(job["id"])
+    assert decisions[-1]["accepted"] is False
+    assert dispatcher.wakes == 4  # two submissions + one stage retry + one publish
+
+
+@pytest.mark.anyio
+async def test_upload_idempotency_key_cannot_replay_an_unrelated_action(tmp_path):
+    app, store, _dispatcher = await _client(tmp_path)
+    settings = Settings(tmp_path, admin_api_token="token")
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        app.state.pipeline_services = SimpleNamespace(
+            subtitle_service=SubtitleService(
+                store,
+                OpenSubtitlesClient(api_key="unused", user_agent="tests"),
+                SubtitleCache(tmp_path / "cache"),
+                settings,
+            )
+        )
+        job = (await client.post("/api/jobs", json={"query": "upload scope"})).json()
+        await client.post(
+            f"/api/jobs/{job['id']}/actions/cancel",
+            headers={"Idempotency-Key": "shared-upload-key"},
+        )
+        response = await client.post(
+            f"/api/jobs/{job['id']}/subtitles/upload",
+            files={
+                "file": (
+                    "safe.srt",
+                    b"1\n00:00:00,000 --> 00:00:01,000\nHello\n",
+                )
+            },
+            headers={"Idempotency-Key": "shared-upload-key"},
+        )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "conflict"
+    assert store.list_candidates(job["id"]) == []
+    assert store.list_decisions(job["id"])[-1]["action"] == "upload_subtitle"
+    assert store.list_decisions(job["id"])[-1]["accepted"] is False
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"remote_id": "remote-only"},
+        {"reconciliation": "uploaded"},
+        {"reconciliation": "uploaded", "remote_id": "../bad"},
+        {"reconciliation": "not_uploaded", "remote_id": "remote"},
+        {"reconciliation": "other"},
+    ],
+)
+async def test_publish_action_body_enforces_reconciliation_semantics(tmp_path, body):
+    app, store, dispatcher = await _client(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        job = (await client.post("/api/jobs", json={"query": "body semantics"})).json()
+        store.compatibility_update_job(job["id"], status="completed")
+        before = dispatcher.wakes
+        response = await client.post(
+            f"/api/jobs/{job['id']}/publish/youtube", json=body
+        )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert dispatcher.wakes == before
+    assert store.list_releases(job["id"]) == []
+
+
+@pytest.mark.anyio
 async def test_state_equivalent_duplicate_without_key_is_stable(tmp_path):
     app, store, dispatcher = await _client(tmp_path)
     async with (

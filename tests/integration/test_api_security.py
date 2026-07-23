@@ -234,6 +234,88 @@ async def test_cors_is_exact_and_allows_only_required_headers(tmp_path):
     assert "access-control-allow-origin" not in denied.headers
 
 
+def test_settings_rejects_wildcard_credentialed_cors(tmp_path):
+    with pytest.raises(ValueError, match="Wildcard CORS"):
+        Settings(tmp_path, allowed_origins=("*",))
+
+
+@pytest.mark.anyio
+async def test_cors_failures_and_early_auth_use_structured_origin_aware_responses(
+    tmp_path,
+):
+    from api.main import create_app
+
+    app = create_app(
+        Settings(
+            tmp_path,
+            admin_api_token="token",
+            allowed_origins=("https://allowed.test",),
+        ),
+        OperationStore(tmp_path / "db"),
+        Dispatcher(),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+        denied_method = await client.options(
+            "/api/jobs",
+            headers={
+                "Origin": "https://allowed.test",
+                "Access-Control-Request-Method": "DELETE",
+            },
+        )
+        denied_header = await client.options(
+            "/api/jobs",
+            headers={
+                "Origin": "https://allowed.test",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "x-forbidden",
+            },
+        )
+        early_auth = await client.get(
+            "/api/jobs", headers={"Origin": "https://allowed.test"}
+        )
+    for response in (denied_method, denied_header):
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "bad_request"
+        assert response.json()["error"]["request_id"] == response.headers[
+            "x-request-id"
+        ]
+        assert response.headers["access-control-allow-origin"] == "https://allowed.test"
+    assert early_auth.status_code == 401
+    assert early_auth.headers["access-control-allow-origin"] == "https://allowed.test"
+    assert early_auth.headers["access-control-allow-credentials"] == "true"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("path", ["/api", "/api/"])
+async def test_api_roots_are_authenticated_json_404_not_spa(tmp_path, path):
+    from api.main import create_app
+
+    app = create_app(
+        Settings(tmp_path, admin_api_token="token"),
+        OperationStore(tmp_path / "db"),
+        Dispatcher(),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client,
+    ):
+        unauthenticated = await client.get(path)
+        authenticated = await client.get(
+            path, headers={"Authorization": "Bearer token"}
+        )
+    assert unauthenticated.status_code == 401
+    assert authenticated.status_code == 404
+    assert authenticated.headers["content-type"].startswith("application/json")
+    assert authenticated.json()["error"]["code"] == "not_found"
+
+
 @pytest.mark.anyio
 async def test_only_complete_cors_preflight_bypasses_auth(tmp_path):
     from api.main import create_app

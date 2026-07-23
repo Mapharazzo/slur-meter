@@ -42,6 +42,8 @@ class Settings:
         delays = tuple(float(delay) for delay in self.retry_delays)
         if not origins:
             raise ValueError("At least one allowed origin is required")
+        if "*" in origins:
+            raise ValueError("Wildcard CORS origins are forbidden with credentials")
         if any(not isfinite(delay) or delay < 0 for delay in delays):
             raise ValueError("Retry delays must be finite and non-negative")
         if not 0 < self.subtitle_coverage_threshold <= 1:

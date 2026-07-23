@@ -175,6 +175,43 @@ class OperationStore:
                 "offset": offset,
             }
 
+    def job_state_counts(self) -> dict[str, int]:
+        """Return truthful queue counts without materializing a bounded page."""
+        with self._connection() as connection:
+            return {
+                str(row["state"]): int(row["count"])
+                for row in connection.execute(
+                    "SELECT state, COUNT(*) AS count FROM job_runs GROUP BY state"
+                )
+            }
+
+    def list_completed_jobs(self) -> list[dict[str, Any]]:
+        """Return all completed public job DTOs for compatibility ranking."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """SELECT * FROM job_runs WHERE state = 'completed'
+                   ORDER BY updated_at DESC, id DESC"""
+            ).fetchall()
+            return [self._job_dto(row) for row in rows]
+
+    def list_attention_jobs(self, *, limit: int) -> dict[str, Any]:
+        """Return a bounded attention page with an unbounded truthful total."""
+        bounded = max(1, min(int(limit), 200))
+        with self._connection() as connection:
+            total = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM job_runs
+                       WHERE state IN ('failed', 'needs_attention')"""
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                """SELECT * FROM job_runs
+                   WHERE state IN ('failed', 'needs_attention')
+                   ORDER BY updated_at DESC, id DESC LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+            return {"items": [self._job_dto(row) for row in rows], "total": total}
+
     def get_job_detail(self, job_id: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             resolved = self._resolve_job_id(connection, job_id)
@@ -1638,6 +1675,23 @@ class OperationStore:
                     (resolved, key),
                 ).fetchone()
                 if existing is not None:
+                    if not self._decision_scope_matches(
+                        existing,
+                        action,
+                        target_stage=target_stage,
+                        candidate_id=candidate_id,
+                        platform=platform,
+                    ):
+                        rejected = self._insert_idempotency_rejection(
+                            connection,
+                            resolved,
+                            action,
+                            target_stage=target_stage,
+                            candidate_id=candidate_id,
+                            platform=platform,
+                            created_at=now,
+                        )
+                        return rejected, self._job_dto(job), False, False
                     return (
                         self._decision_dto(existing),
                         self._job_dto(job),
@@ -1789,6 +1843,53 @@ class OperationStore:
             return self._decision_dto(decision), self._job_dto(updated), True, True
 
     @staticmethod
+    def _decision_scope_matches(
+        decision: sqlite3.Row,
+        action: str,
+        *,
+        target_stage: str | None,
+        candidate_id: str | None,
+        platform: str | None,
+    ) -> bool:
+        return (
+            decision["action"] == action
+            and decision["target_stage"] == target_stage
+            and decision["candidate_id"] == candidate_id
+            and decision["platform"] == platform
+        )
+
+    def _insert_idempotency_rejection(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        action: str,
+        *,
+        target_stage: str | None = None,
+        candidate_id: str | None = None,
+        platform: str | None = None,
+        created_at: str,
+    ) -> dict[str, Any]:
+        cursor = connection.execute(
+            """INSERT INTO admin_decisions
+               (job_id, action, target_stage, candidate_id, platform,
+                idempotency_key, accepted, reason, created_at)
+               VALUES (?, ?, ?, ?, ?, NULL, 0, ?, ?)""",
+            (
+                job_id,
+                action,
+                target_stage,
+                candidate_id,
+                platform,
+                "Idempotency key belongs to another operation.",
+                created_at,
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM admin_decisions WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        return self._decision_dto(row)
+
+    @staticmethod
     def _admin_action_allowed(
         connection: sqlite3.Connection,
         job: sqlite3.Row,
@@ -1894,13 +1995,35 @@ class OperationStore:
             resolved = self._resolve_job_id(connection, job_id)
             return [] if resolved is None else self._decision_rows(connection, resolved)
 
+    def reject_idempotency_reuse(
+        self,
+        job_id: str,
+        action: str,
+        *,
+        target_stage: str | None = None,
+        candidate_id: str | None = None,
+        platform: str | None = None,
+    ) -> dict[str, Any]:
+        """Durably reject an idempotency key reused for another operation."""
+        with self._mutation() as connection:
+            resolved = self._require_job_id(connection, job_id)
+            return self._insert_idempotency_rejection(
+                connection,
+                resolved,
+                action,
+                target_stage=target_stage,
+                candidate_id=candidate_id,
+                platform=platform,
+                created_at=self._now_text(),
+            )
+
     def finalize_uploaded_candidate(
         self,
         job_id: str,
         candidate_id: str,
         *,
         idempotency_key: str | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    ) -> tuple[dict[str, Any], dict[str, Any], bool, bool]:
         """Atomically record an accepted upload, resumable state, and event."""
         now = self._now_text()
         key = str(idempotency_key).strip() if idempotency_key else None
@@ -1924,10 +2047,28 @@ class OperationStore:
                     (resolved, key),
                 ).fetchone()
                 if existing is not None:
+                    if not self._decision_scope_matches(
+                        existing,
+                        "upload_subtitle",
+                        target_stage=None,
+                        candidate_id=candidate_id,
+                        platform=None,
+                    ):
+                        rejected = self._insert_idempotency_rejection(
+                            connection,
+                            resolved,
+                            "upload_subtitle",
+                            candidate_id=candidate_id,
+                            created_at=now,
+                        )
+                        run = connection.execute(
+                            "SELECT * FROM job_runs WHERE id = ?", (resolved,)
+                        ).fetchone()
+                        return rejected, self._job_dto(run), False, False
                     run = connection.execute(
                         "SELECT * FROM job_runs WHERE id = ?", (resolved,)
                     ).fetchone()
-                    return self._decision_dto(existing), self._job_dto(run), False
+                    return self._decision_dto(existing), self._job_dto(run), False, True
             elif candidate["status"] == "uploaded":
                 existing = connection.execute(
                     """SELECT * FROM admin_decisions
@@ -1940,7 +2081,7 @@ class OperationStore:
                     run = connection.execute(
                         "SELECT * FROM job_runs WHERE id = ?", (resolved,)
                     ).fetchone()
-                    return self._decision_dto(existing), self._job_dto(run), False
+                    return self._decision_dto(existing), self._job_dto(run), False, True
             cursor = connection.execute(
                 """INSERT INTO admin_decisions
                    (job_id, action, candidate_id, idempotency_key, accepted, reason, created_at)
@@ -1977,7 +2118,7 @@ class OperationStore:
             run = connection.execute(
                 "SELECT * FROM job_runs WHERE id = ?", (resolved,)
             ).fetchone()
-            return self._decision_dto(decision), self._job_dto(run), True
+            return self._decision_dto(decision), self._job_dto(run), True, True
 
     def compatibility_analysis(self, job_id: str) -> dict[str, Any] | None:
         """Return only the sanitized legacy analysis payload for a resolved run."""
@@ -2787,7 +2928,7 @@ class OperationStore:
         with self._connection() as connection:
             if job_id is None:
                 rows = connection.execute(
-                    "SELECT * FROM revenue ORDER BY date DESC, id DESC LIMIT 100"
+                    "SELECT * FROM revenue ORDER BY date DESC, id DESC"
                 ).fetchall()
                 return [self._revenue_dto(row) for row in rows]
             resolved = self._resolve_job_id(connection, job_id)

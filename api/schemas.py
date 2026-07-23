@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
+
+from api.settings import canonical_imdb_id
+from src.publishing.errors import normalized_remote_id
 
 
 class APIModel(BaseModel):
@@ -14,6 +24,11 @@ class APIModel(BaseModel):
 class SubmitRequest(APIModel):
     imdb_id: str | None = None
     query: str | None = None
+
+    @field_validator("imdb_id")
+    @classmethod
+    def valid_imdb_id(cls, value: str | None) -> str | None:
+        return canonical_imdb_id(value) if value is not None else None
 
     @model_validator(mode="after")
     def exactly_one_source(self) -> SubmitRequest:
@@ -25,8 +40,26 @@ class SubmitRequest(APIModel):
 
 
 class ActionRequest(APIModel):
-    reconciliation: str | None = None
+    reconciliation: Literal["uploaded", "not_uploaded"] | None = None
     remote_id: str | None = None
+
+    @model_validator(mode="after")
+    def valid_reconciliation(self) -> ActionRequest:
+        if self.reconciliation is None:
+            if self.remote_id is not None:
+                raise ValueError("remote_id requires a reconciliation outcome")
+            return self
+        if self.reconciliation == "not_uploaded":
+            if self.remote_id is not None:
+                raise ValueError("not_uploaded reconciliation forbids remote_id")
+            return self
+        if self.remote_id is None:
+            raise ValueError("uploaded reconciliation requires remote_id")
+        normalized = normalized_remote_id(self.remote_id)
+        if not normalized.replace("-", "").replace("_", "").replace(":", "").replace(".", "").isalnum():
+            raise ValueError("remote_id contains unsupported characters")
+        self.remote_id = normalized
+        return self
 
 
 class ErrorBody(APIModel):
@@ -271,3 +304,98 @@ class ActionResponse(APIModel):
 class UploadResponse(APIModel):
     candidate: CandidateResponse
     decision: DecisionResponse
+
+
+class PublishResponse(ActionResponse):
+    release: ReleaseResponse | None = None
+
+
+class ItemTotalResponse(APIModel):
+    total: int
+
+
+class CostPageResponse(ItemTotalResponse):
+    items: list[CostResponse]
+
+
+class CostAggregateResponse(APIModel):
+    period: str
+    category: str
+    provider: str
+    total_usd: float
+    total_units: int
+    count: int
+
+
+class ReleasePageResponse(ItemTotalResponse):
+    items: list[ReleaseResponse]
+
+
+class PlatformStatResponse(RevenueResponse):
+    remote_id: str | None
+    release_status: str | None
+    uploaded_at: str | None
+
+
+class PlatformStatPageResponse(ItemTotalResponse):
+    items: list[PlatformStatResponse]
+
+
+class RevenuePageResponse(ItemTotalResponse):
+    items: list[RevenueResponse]
+
+
+class AlertResponse(APIModel):
+    job_id: str
+    state: str
+    message: str
+    created_at: str
+
+
+class AlertPageResponse(ItemTotalResponse):
+    items: list[AlertResponse]
+
+
+class LeaderboardItemResponse(APIModel):
+    job_id: str
+    source_imdb_id: str | None
+    label: str
+    hard: int
+    soft: int
+    f_bombs: int
+    total_views: int
+
+
+class LeaderboardResponse(ItemTotalResponse):
+    items: list[LeaderboardItemResponse]
+
+
+class AnalysisEventResponse(APIModel):
+    time: float
+    word: str
+    tier: str
+
+
+class AnalysisBinResponse(APIModel):
+    minute: int
+    hard: int = 0
+    soft: int = 0
+    f_bombs: int = 0
+    score: int = 0
+
+
+class AnalysisSummaryResponse(APIModel):
+    total_hard: int = 0
+    total_soft: int = 0
+    total_f_bombs: int = 0
+    peak_minute: int = 0
+    peak_score: int = 0
+    runtime_minutes: int = 0
+    total_words_counted: int = 0
+    rating: str | None = None
+
+
+class AnalysisResponse(APIModel):
+    events: list[AnalysisEventResponse] = Field(default_factory=list)
+    binned: list[AnalysisBinResponse] = Field(default_factory=list)
+    summary: AnalysisSummaryResponse

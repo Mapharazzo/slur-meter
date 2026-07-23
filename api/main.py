@@ -25,11 +25,20 @@ from api.pipeline import GenerationPipelineServices, PipelineRunner, PipelineSer
 from api.schemas import (
     ActionRequest,
     ActionResponse,
+    AlertPageResponse,
+    AnalysisResponse,
+    CostAggregateResponse,
+    CostPageResponse,
     DetailResponse,
     EventPageResponse,
     HealthResponse,
     JobPageResponse,
     JobResponse,
+    LeaderboardResponse,
+    PlatformStatPageResponse,
+    PublishResponse,
+    ReleasePageResponse,
+    RevenuePageResponse,
     SubmitRequest,
     SummaryResponse,
     UploadResponse,
@@ -46,6 +55,10 @@ from src.publishing.metadata import generate_metadata
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 _PLATFORMS = frozenset({"youtube", "tiktok", "instagram"})
+_CORS_METHODS = frozenset({"GET", "POST", "OPTIONS"})
+_CORS_HEADERS = frozenset(
+    {"authorization", "content-type", "idempotency-key", "x-request-id"}
+)
 
 
 async def _file_chunks(path: Path, chunk_size: int = 1024 * 1024):
@@ -78,6 +91,14 @@ def _error(
             }
         },
     )
+
+
+def _allow_origin(response: Response, origin: str, settings: Settings) -> Response:
+    if origin in settings.allowed_origins:
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+        response.headers.add_vary_header("Origin")
+    return response
 
 
 def _public_job(
@@ -157,7 +178,7 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         CORSMiddleware,
         allow_origins=list(settings.allowed_origins),
         allow_credentials=True,
-        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_methods=sorted(_CORS_METHODS),
         allow_headers=[
             "Authorization",
             "Content-Type",
@@ -181,17 +202,35 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
                 request.headers.get("access-control-request-method", "").strip()
             )
         )
-        if cors_preflight and origin not in settings.allowed_origins:
-            response = _error(
-                request,
-                400,
-                "bad_request",
-                "CORS preflight request is not allowed.",
-            )
-            response.headers["X-Request-ID"] = request.state.request_id
-            return response
+        if cors_preflight:
+            requested_method = request.headers[
+                "access-control-request-method"
+            ].strip().upper()
+            requested_headers = {
+                item.strip().lower()
+                for item in request.headers.get(
+                    "access-control-request-headers", ""
+                ).split(",")
+                if item.strip()
+            }
+            if (
+                origin not in settings.allowed_origins
+                or requested_method not in _CORS_METHODS
+                or not requested_headers.issubset(_CORS_HEADERS)
+            ):
+                response = _error(
+                    request,
+                    400,
+                    "bad_request",
+                    "CORS preflight request is not allowed.",
+                )
+                response.headers["X-Request-ID"] = request.state.request_id
+                return _allow_origin(response, origin, settings)
+        api_path = request.url.path in {"/api", "/api/"} or request.url.path.startswith(
+            "/api/"
+        )
         if (
-            request.url.path.startswith("/api/")
+            api_path
             and not public_health
             and not cors_preflight
         ):
@@ -205,7 +244,11 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
                     "Valid operator authentication is required.",
                 )
                 response.headers["X-Request-ID"] = request.state.request_id
-                return response
+                return _allow_origin(response, origin, settings)
+        if request.url.path in {"/api", "/api/"}:
+            response = _error(request, 404, "not_found", "API route was not found")
+            response.headers["X-Request-ID"] = request.state.request_id
+            return _allow_origin(response, origin, settings)
         try:
             response = await call_next(request)
         except Exception:
@@ -247,14 +290,10 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
 
     @app.get("/api/operations/summary", response_model=SummaryResponse)
     async def summary() -> dict[str, Any]:
-        jobs = store.list_jobs(limit=500)
-        items = jobs["items"]
+        states = store.job_state_counts()
         return {
-            "total": jobs["total"],
-            "states": {
-                state: sum(item["state"] == state for item in items)
-                for state in {item["state"] for item in items}
-            },
+            "total": sum(states.values()),
+            "states": states,
         }
 
     @app.post("/api/jobs", status_code=201, response_model=JobResponse)
@@ -388,20 +427,22 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         job = _require_opaque(store, job_id)
         key = request.headers.get("Idempotency-Key")
         if key:
-            replay = next(
+            existing = next(
                 (
                     row
                     for row in store.list_decisions(job["id"])
                     if row.get("idempotency_key") == key
-                    and row.get("action") == "upload_subtitle"
                 ),
                 None,
             )
-            if replay is not None:
-                candidate = store.get_candidate(replay["candidate_id"])
+            if existing is not None and existing.get("action") != "upload_subtitle":
+                store.reject_idempotency_reuse(job["id"], "upload_subtitle")
+                raise HTTPException(409, "Idempotency key conflicts with another action")
+            if existing is not None:
+                candidate = store.get_candidate(existing["candidate_id"])
                 return {
                     "candidate": _public_job(candidate or {}, settings),
-                    "decision": _public_job(replay, settings),
+                    "decision": _public_job(existing, settings),
                 }
         limit = OpenSubtitlesClient.MAX_DOWNLOAD_BYTES
         parts: list[bytes] = []
@@ -434,6 +475,9 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
                 candidate["id"],
                 idempotency_key=key,
             )
+            if not decision[3]:
+                _discard_upload(store, settings, candidate)
+                raise HTTPException(409, "Idempotency key conflicts with another action")
         except HTTPException:
             raise
         except ValueError as exc:
@@ -451,8 +495,12 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             "decision": _public_job(decision[0], settings),
         }
 
-    @app.post("/api/jobs/{job_id}/publish/{platform}")
-    @app.post("/api/jobs/{job_id}/publish/{platform}/retry")
+    @app.post(
+        "/api/jobs/{job_id}/publish/{platform}", response_model=PublishResponse
+    )
+    @app.post(
+        "/api/jobs/{job_id}/publish/{platform}/retry", response_model=PublishResponse
+    )
     async def publish(
         job_id: str, platform: str, request: Request, _body: ActionRequest | None = None
     ) -> dict[str, Any]:
@@ -508,13 +556,13 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             request.headers.get("Idempotency-Key"),
         )
 
-    @app.get("/api/jobs/{job_id}/costs")
+    @app.get("/api/jobs/{job_id}/costs", response_model=CostPageResponse)
     async def job_costs(job_id: str) -> dict[str, Any]:
         job = _require_opaque(store, job_id)
         items = _public_value(store.list_costs(job["id"]), settings)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/costs")
+    @app.get("/api/costs", response_model=list[CostAggregateResponse])
     async def costs(
         start: str | None = None,
         end: str | None = None,
@@ -526,34 +574,37 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             store.aggregate_costs(start=start, end=end, group_by=group_by), settings
         )
 
-    @app.get("/api/releases")
+    @app.get("/api/releases", response_model=ReleasePageResponse)
     async def releases() -> dict[str, Any]:
         items = _public_value(store.list_releases(), settings)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/releases/{identifier}")
+    @app.get("/api/releases/{identifier}", response_model=ReleasePageResponse)
     async def job_releases(identifier: str) -> dict[str, Any]:
         job = _require_alias(store, identifier)
         items = _public_value(store.list_releases(job["id"]), settings)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/jobs/{identifier}/platform-stats")
+    @app.get(
+        "/api/jobs/{identifier}/platform-stats",
+        response_model=PlatformStatPageResponse,
+    )
     async def platform_stats(identifier: str) -> dict[str, Any]:
         job = _require_alias(store, identifier)
         items = _public_value(store.platform_stats(job["id"]), settings)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/revenue")
+    @app.get("/api/revenue", response_model=RevenuePageResponse)
     async def revenue(identifier: str | None = None) -> dict[str, Any]:
         job = _require_alias(store, identifier) if identifier else None
         items = _public_value(store.list_revenue(job["id"] if job else None), settings)
         return {"items": items, "total": len(items)}
 
-    @app.get("/api/alerts")
+    @app.get("/api/alerts", response_model=AlertPageResponse)
     async def alerts(limit: int = 50) -> dict[str, Any]:
         if not 1 <= limit <= 200:
             raise HTTPException(422, "Invalid alert limit")
-        page = store.list_jobs(limit=500)
+        page = store.list_attention_jobs(limit=limit)
         items = [
             {
                 "job_id": row["id"],
@@ -564,13 +615,13 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             }
             for row in page["items"]
             if row["state"] in {"failed", "needs_attention"}
-        ][:limit]
-        return {"items": _public_value(items, settings), "total": len(items)}
+        ]
+        return {"items": _public_value(items, settings), "total": page["total"]}
 
-    @app.get("/api/leaderboard")
+    @app.get("/api/leaderboard", response_model=LeaderboardResponse)
     async def leaderboard() -> dict[str, Any]:
         ranked = []
-        for row in store.list_jobs(state="completed", limit=500)["items"]:
+        for row in store.list_completed_jobs():
             summary = (
                 row.get("artifact_summary", {}).get("analysis", {}).get("summary", {})
             )
@@ -591,13 +642,20 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         ranked.sort(key=lambda row: (row["hard"], row["f_bombs"]), reverse=True)
         return {"items": _public_value(ranked, settings), "total": len(ranked)}
 
-    @app.get("/api/analysis/{identifier}")
+    @app.get("/api/analysis/{identifier}", response_model=AnalysisResponse)
     async def analysis(identifier: str) -> dict[str, Any]:
         job = _require_alias(store, identifier)
         payload = store.compatibility_analysis(job["id"])
         if payload is None:
             raise HTTPException(404, "Analysis was not found")
-        return _public_value(payload, settings)
+        return _public_value(
+            {
+                "events": payload.get("events", []),
+                "binned": payload.get("binned", []),
+                "summary": payload.get("summary", {}),
+            },
+            settings,
+        )
 
     def current_artifact(identifier: str, stage_name: str):
         job = _require_alias(store, identifier)

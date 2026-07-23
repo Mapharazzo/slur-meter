@@ -91,6 +91,32 @@ async def test_submission_rejects_blank_extra_and_operational_ids_are_opaque(tmp
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("imdb_id", ["abc", "tt", "tt12345678901"])
+async def test_submission_rejects_invalid_imdb_ids_with_structured_validation(
+    tmp_path, imdb_id
+):
+    from api.main import create_app
+
+    app = create_app(
+        Settings(tmp_path, admin_api_token="token"),
+        OperationStore(tmp_path / "db"),
+        Dispatcher(),
+    )
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        response = await client.post("/api/jobs", json={"imdb_id": imdb_id})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+    assert response.json()["error"]["request_id"] == response.headers["x-request-id"]
+
+
+@pytest.mark.anyio
 async def test_submission_is_unique_for_normalized_queries_and_active_imdb(tmp_path):
     from api.main import create_app
 
@@ -409,3 +435,83 @@ def test_aggregate_record_schemas_are_explicit_and_forbid_extra_fields():
         assert record_type.model_config["extra"] == "forbid"
     event_type = get_args(EventPageResponse.model_fields["items"].annotation)[0]
     assert isinstance(event_type, type) and issubclass(event_type, APIModel)
+
+
+def test_every_structured_and_compatibility_route_has_a_strict_response_model(tmp_path):
+    from api.main import create_app
+    from api.schemas import APIModel
+
+    app = create_app(Settings(tmp_path), OperationStore(tmp_path / "db"), Dispatcher())
+    required_paths = {
+        "/api/jobs/{job_id}/publish/{platform}",
+        "/api/jobs/{job_id}/publish/{platform}/retry",
+        "/api/jobs/{job_id}/costs",
+        "/api/costs",
+        "/api/releases",
+        "/api/releases/{identifier}",
+        "/api/jobs/{identifier}/platform-stats",
+        "/api/revenue",
+        "/api/alerts",
+        "/api/leaderboard",
+        "/api/analysis/{identifier}",
+    }
+    models = {
+        route.path: route.response_model
+        for route in app.routes
+        if getattr(route, "path", None) in required_paths
+    }
+    assert set(models) == required_paths
+    for model in models.values():
+        record_model = get_args(model)[0] if get_origin(model) is list else model
+        assert isinstance(record_model, type) and issubclass(record_model, APIModel)
+        assert record_model.model_config["extra"] == "forbid"
+
+
+@pytest.mark.anyio
+async def test_summary_leaderboard_and_revenue_are_true_beyond_legacy_limits(tmp_path):
+    from api.main import create_app
+
+    store = OperationStore(tmp_path / "db")
+    app = create_app(Settings(tmp_path, admin_api_token="token"), store, Dispatcher())
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        jobs = [
+            store.create_or_get_active_job("", f"bulk {index}", f"Bulk {index}")[0]
+            for index in range(501)
+        ]
+        with store._mutation() as connection:
+            connection.executemany(
+                """UPDATE job_runs SET state = 'completed',
+                           artifact_summary_json = ?, finished_at = updated_at
+                   WHERE id = ?""",
+                [
+                    (
+                        '{"analysis":{"summary":{"total_hard":1,"total_soft":0,"total_f_bombs":0}}}',
+                        job["id"],
+                    )
+                    for job in jobs
+                ],
+            )
+        for index in range(101):
+            store.upsert_revenue(
+                jobs[0]["id"],
+                "youtube",
+                f"2026-{index // 28 + 1:02d}-{index % 28 + 1:02d}",
+                views=1,
+                revenue_usd=0.25,
+            )
+        summary = await client.get("/api/operations/summary")
+        leaderboard = await client.get("/api/leaderboard")
+        revenue = await client.get("/api/revenue")
+    assert summary.json()["total"] == 501
+    assert summary.json()["states"] == {"completed": 501}
+    assert leaderboard.json()["total"] == 501
+    assert len(leaderboard.json()["items"]) == 501
+    assert revenue.json()["total"] == 101
+    assert len(revenue.json()["items"]) == 101
