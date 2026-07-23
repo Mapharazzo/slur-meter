@@ -242,8 +242,10 @@ class RagePlotter:
             )
             y += dash + gap_d
 
-        # Load fonts at 2× size
+        # Load fonts at 2× size — prefer the bundled Montserrat for a look that
+        # matches the compositor, falling back to system sans fonts.
         font_paths = [
+            "assets/fonts/Montserrat-Bold.ttf",
             "/usr/share/fonts/truetype/ubuntu/Ubuntu-B.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",

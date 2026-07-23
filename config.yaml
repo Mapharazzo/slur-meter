@@ -104,7 +104,7 @@ audio:
 
   # Sound effects synced to verdict stat slams
   verdict_sfx:
-    enabled: false             # flip to true once you have SFX files
+    enabled: true              # ElevenLabs-generated SFX bundled in assets/audio
     provider: "file"
     provider_config:
       path: "assets/audio/slam.mp3"

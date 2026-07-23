@@ -15,23 +15,12 @@ RUN npm run build
 # ─── Stage 2: Python runtime that serves the operations control panel ───────
 FROM python:3.11-slim AS runtime
 
-# System deps: FFmpeg for encoding, a base font family for Matplotlib rendering.
+# System deps: FFmpeg for encoding, a base font family as a rendering fallback.
+# Montserrat itself is bundled in assets/fonts (copied below), so no external
+# font download is needed — the build stays fully reproducible and offline.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg fonts-liberation wget \
+        ffmpeg fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
-
-# Montserrat font used by the rage-chart renderer. Best-effort: the build must
-# not fail if the upstream font host is unavailable — the Liberation fonts
-# installed above remain as a rendering fallback.
-RUN set -eux; \
-    mkdir -p /usr/share/fonts/truetype/montserrat; \
-    if wget -q -t 3 -O /usr/share/fonts/truetype/montserrat/Montserrat.ttf \
-        "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf"; then \
-        fc-cache -f; \
-    else \
-        echo "WARNING: Montserrat download failed; falling back to Liberation fonts"; \
-        rm -f /usr/share/fonts/truetype/montserrat/Montserrat.ttf; \
-    fi
 
 # Install uv (used to install locked Python dependencies).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
@@ -50,9 +39,10 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-install-project --no-dev
 
-# Copy application source.
+# Copy application source and bundled assets (Montserrat fonts + SFX audio).
 COPY api ./api
 COPY src ./src
+COPY assets ./assets
 COPY main.py config.yaml ./
 RUN uv sync --frozen --no-dev
 
