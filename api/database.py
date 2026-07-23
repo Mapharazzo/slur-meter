@@ -1682,7 +1682,7 @@ class OperationStore:
                         candidate_id=candidate_id,
                         platform=platform,
                     ):
-                        rejected = self._insert_idempotency_rejection(
+                        rejected = self._insert_scope_rejection(
                             connection,
                             resolved,
                             action,
@@ -1858,7 +1858,7 @@ class OperationStore:
             and decision["platform"] == platform
         )
 
-    def _insert_idempotency_rejection(
+    def _insert_scope_rejection(
         self,
         connection: sqlite3.Connection,
         job_id: str,
@@ -1868,6 +1868,7 @@ class OperationStore:
         candidate_id: str | None = None,
         platform: str | None = None,
         created_at: str,
+        reason: str = "Idempotency key belongs to another operation.",
     ) -> dict[str, Any]:
         cursor = connection.execute(
             """INSERT INTO admin_decisions
@@ -1880,7 +1881,7 @@ class OperationStore:
                 target_stage,
                 candidate_id,
                 platform,
-                "Idempotency key belongs to another operation.",
+                reason,
                 created_at,
             ),
         )
@@ -2007,7 +2008,7 @@ class OperationStore:
         """Durably reject an idempotency key reused for another operation."""
         with self._mutation() as connection:
             resolved = self._require_job_id(connection, job_id)
-            return self._insert_idempotency_rejection(
+            return self._insert_scope_rejection(
                 connection,
                 resolved,
                 action,
@@ -2054,7 +2055,7 @@ class OperationStore:
                         candidate_id=candidate_id,
                         platform=None,
                     ):
-                        rejected = self._insert_idempotency_rejection(
+                        rejected = self._insert_scope_rejection(
                             connection,
                             resolved,
                             "upload_subtitle",
@@ -2527,7 +2528,7 @@ class OperationStore:
                         and existing["reason"] == outcome
                         and remote_matches
                     ):
-                        rejected = self._insert_idempotency_rejection(
+                        rejected = self._insert_scope_rejection(
                             connection,
                             resolved,
                             "reconcile_publishing",
@@ -2542,25 +2543,37 @@ class OperationStore:
                         True,
                     )
             else:
-                existing = connection.execute(
+                prior = connection.execute(
                     """SELECT * FROM admin_decisions
                        WHERE job_id = ? AND action = 'reconcile_publishing'
-                         AND platform = ? AND accepted = 1 AND reason = ?
+                         AND platform = ? AND accepted = 1
                        ORDER BY id DESC LIMIT 1""",
-                    (resolved, normalized_platform, outcome),
+                    (resolved, normalized_platform),
                 ).fetchone()
+                if prior is not None and prior["reason"] != outcome:
+                    rejected = self._insert_scope_rejection(
+                        connection,
+                        resolved,
+                        "reconcile_publishing",
+                        platform=normalized_platform,
+                        created_at=now,
+                        reason="Reconciliation outcome does not match.",
+                    )
+                    return self._release_dto(release), rejected, False, False
+                existing = prior
                 expected_status = "uploaded" if outcome == "uploaded" else "failed"
                 if existing is not None and release["status"] == expected_status:
                     if (
                         outcome == "uploaded"
                         and release["remote_id"] != normalized_remote_id
                     ):
-                        rejected = self._insert_idempotency_rejection(
+                        rejected = self._insert_scope_rejection(
                             connection,
                             resolved,
                             "reconcile_publishing",
                             platform=normalized_platform,
                             created_at=now,
+                            reason="Reconciliation remote identity does not match.",
                         )
                         return self._release_dto(release), rejected, False, False
                     return (

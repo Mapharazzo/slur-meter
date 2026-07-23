@@ -911,5 +911,67 @@ async def test_no_key_reconciliation_replays_only_the_same_remote_identity(tmp_p
     assert replay.json()["decision"]["id"] == first.json()["decision"]["id"]
     assert replay.json()["changed"] is False
     assert mismatch.status_code == 409
-    assert store.list_decisions(job["id"])[-1]["accepted"] is False
+    rejected = store.list_decisions(job["id"])[-1]
+    assert rejected["accepted"] is False
+    assert rejected["reason"] == "Reconciliation remote identity does not match."
+    assert dispatcher.wakes == before + 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("first_body", "opposite_body"),
+    [
+        (
+            {"reconciliation": "uploaded", "remote_id": "remote-one"},
+            {"reconciliation": "not_uploaded"},
+        ),
+        (
+            {"reconciliation": "not_uploaded"},
+            {"reconciliation": "uploaded", "remote_id": "remote-two"},
+        ),
+    ],
+)
+async def test_no_key_opposite_reconciliation_records_a_durable_conflict(
+    tmp_path, first_body, opposite_body
+):
+    app, store, dispatcher = await _client(tmp_path)
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        job = (await client.post("/api/jobs", json={"query": str(first_body)})).json()
+        store.compatibility_update_job(job["id"], status="completed")
+        store.upsert_release(
+            job["id"],
+            "youtube",
+            status="needs_attention",
+            safe_error_code="ambiguous_publish_outcome",
+            safe_error_message="Unknown",
+        )
+        before = dispatcher.wakes
+        first = await client.post(
+            f"/api/jobs/{job['id']}/publish/youtube", json=first_body
+        )
+        replay = await client.post(
+            f"/api/jobs/{job['id']}/publish/youtube", json=first_body
+        )
+        mismatch = await client.post(
+            f"/api/jobs/{job['id']}/publish/youtube", json=opposite_body
+        )
+    assert first.status_code == replay.status_code == 200
+    assert replay.json()["decision"]["id"] == first.json()["decision"]["id"]
+    assert replay.json()["changed"] is False
+    assert mismatch.status_code == 409
+    assert mismatch.json()["error"]["code"] == "conflict"
+    rejected = [
+        row
+        for row in store.list_decisions(job["id"])
+        if row["action"] == "reconcile_publishing" and not row["accepted"]
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["reason"] == "Reconciliation outcome does not match."
     assert dispatcher.wakes == before + 1
