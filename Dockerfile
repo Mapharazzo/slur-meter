@@ -17,16 +17,21 @@ FROM python:3.11-slim AS runtime
 
 # System deps: FFmpeg for encoding, a base font family for Matplotlib rendering.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ffmpeg fonts-liberation unzip wget \
+        ffmpeg fonts-liberation wget \
     && rm -rf /var/lib/apt/lists/*
 
-# Montserrat font used by the rage-chart renderer.
-RUN wget -q -O /tmp/montserrat.zip \
-        https://github.com/JulietaUla/Montserrat/releases/download/v7.222/Montserrat-v7.222.zip \
-    && mkdir -p /usr/share/fonts/truetype/montserrat \
-    && unzip -q /tmp/montserrat.zip -d /usr/share/fonts/truetype/montserrat/ \
-    && fc-cache -f \
-    && rm /tmp/montserrat.zip
+# Montserrat font used by the rage-chart renderer. Best-effort: the build must
+# not fail if the upstream font host is unavailable — the Liberation fonts
+# installed above remain as a rendering fallback.
+RUN set -eux; \
+    mkdir -p /usr/share/fonts/truetype/montserrat; \
+    if wget -q -t 3 -O /usr/share/fonts/truetype/montserrat/Montserrat.ttf \
+        "https://github.com/google/fonts/raw/main/ofl/montserrat/Montserrat%5Bwght%5D.ttf"; then \
+        fc-cache -f; \
+    else \
+        echo "WARNING: Montserrat download failed; falling back to Liberation fonts"; \
+        rm -f /usr/share/fonts/truetype/montserrat/Montserrat.ttf; \
+    fi
 
 # Install uv (used to install locked Python dependencies).
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
