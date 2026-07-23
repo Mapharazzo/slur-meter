@@ -28,7 +28,7 @@ beforeEach(() => {
   api.health.mockResolvedValue({ status: 'ok', dispatcher_ready: true })
   api.operationsSummary.mockResolvedValue({ total: 0, states: {} })
   api.listJobs.mockResolvedValue({ items: [], total: 0, limit: 20, offset: 0 })
-  api.getAlerts.mockResolvedValue([])
+  api.getAlerts.mockResolvedValue({ items: [], total: 0 })
 })
 
 function visit(path) {
@@ -44,6 +44,7 @@ describe('application shell', () => {
     expect(await screen.findByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
     expect(api.operationsSummary).not.toHaveBeenCalled()
     expect(api.listJobs).not.toHaveBeenCalled()
+    expect(api.getAlerts).not.toHaveBeenCalled()
     const token = screen.getByLabelText(/operator token/i)
     await user.type(token, 'session-secret')
     await user.click(screen.getByRole('button', { name: /unlock/i }))
@@ -56,6 +57,26 @@ describe('application shell', () => {
     await user.click(screen.getByRole('button', { name: /lock operations/i }))
     expect(screen.getByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
     expect(sessionStorage.getItem('slur-meter.operator-token')).toBeNull()
+  })
+
+  it('loads the authoritative attention total only after unlock and exposes the alert route affordance', async () => {
+    api.getAlerts.mockResolvedValue({
+      items: [{ job_id: 'job_alpha', state: 'failed', message: 'Stopped.', created_at: '2026-07-23T10:00:00Z' }],
+      total: 7,
+    })
+    const user = userEvent.setup()
+    visit('/')
+    expect(await screen.findByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
+    expect(api.getAlerts).not.toHaveBeenCalled()
+
+    await user.type(screen.getByLabelText(/operator token/i), 'session-secret')
+    await user.click(screen.getByRole('button', { name: /unlock/i }))
+
+    await waitFor(() => expect(api.getAlerts).toHaveBeenCalledWith(
+      1,
+      { token: 'session-secret', signal: expect.any(AbortSignal) },
+    ))
+    expect(screen.getByRole('link', { name: /view 7 runs needing attention/i })).toHaveAttribute('href', '/alerts')
   })
 
   it('provides a skip link, stable main target, landmarks, and current-route semantics', async () => {

@@ -412,4 +412,5 @@ class SegmentTimingResponse(APIModel):
 class SegmentInfoResponse(APIModel):
     segment: str
     frame_count: int = Field(ge=0)
+    fps: float = Field(gt=0, allow_inf_nan=False)
     timing: SegmentTimingResponse

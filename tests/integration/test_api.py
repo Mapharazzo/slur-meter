@@ -473,7 +473,7 @@ def test_segment_info_dto_has_only_bounded_timing_fields():
 
     from api.schemas import SegmentInfoResponse
 
-    assert set(SegmentInfoResponse.model_fields) == {"segment", "frame_count", "timing"}
+    assert set(SegmentInfoResponse.model_fields) == {"segment", "frame_count", "fps", "timing"}
     assert set(SegmentInfoResponse.model_fields["timing"].annotation.model_fields) == {
         "start_frame",
         "end_frame",
@@ -489,6 +489,47 @@ def test_segment_info_dto_has_only_bounded_timing_fields():
                 "timing": {"num_frames": 1, "artifact_path": "/private/file"},
             }
         )
+
+
+@pytest.mark.anyio
+async def test_segment_info_exposes_finite_positive_manifest_fps(tmp_path):
+    from api.main import create_app
+
+    store = OperationStore(tmp_path / "db")
+    app = create_app(Settings(tmp_path, admin_api_token="token"), store, Dispatcher())
+    artifacts = ArtifactManager(tmp_path / "output")
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer token"},
+        ) as client,
+    ):
+        app.state.pipeline_services = SimpleNamespace(artifacts=artifacts)
+        job = (await client.post("/api/jobs", json={"imdb_id": "tt0110912"})).json()
+        staging = artifacts.new_staging_directory(job["id"], "composite")
+        segment = staging / "graph"
+        segment.mkdir()
+        (segment / "00000.png").write_bytes(b"frame")
+        manifest = artifacts.promote_directory(
+            job["id"],
+            "composite",
+            staging,
+            final_name="render",
+            details={"fps": 23.976, "timing": {"graph": {"num_frames": 1}}},
+        )
+        store.ensure_stage(job["id"], "composite", state="queued")
+        store.claim_next_job("worker", lease_seconds=30)
+        store.transition_stage(job["id"], "composite", "running", lease_owner="worker")
+        store.transition_stage(
+            job["id"], "composite", "completed",
+            output_manifest=manifest, lease_owner="worker",
+        )
+        response = await client.get(f"/api/videos/{job['id']}/segments/graph")
+
+    assert response.status_code == 200
+    assert response.json()["fps"] == pytest.approx(23.976)
 
 
 @pytest.mark.anyio

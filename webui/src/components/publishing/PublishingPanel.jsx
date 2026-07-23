@@ -33,7 +33,7 @@ export default function PublishingPanel({
     if (sharedPending || pending) return
     if (actionRunner) {
       setError('')
-      const result = await actionRunner(name, call)
+      const result = await actionRunner(name, call, { announceGlobal: false })
       if (result?.ok === false && result.error) setError(result.error)
       return
     }

@@ -60,4 +60,18 @@ describe('ResourceState', () => {
 
     expect(refresh).toHaveBeenCalledTimes(1)
   })
+
+  it('visibly disables retry while a workspace mutation owns refresh', () => {
+    const refresh = vi.fn()
+    render(
+      <ResourceState
+        resource={{ status: 'stale', data: { id: 1 }, refresh }}
+        retryDisabled
+      >
+        cached content
+      </ResourceState>,
+    )
+
+    expect(screen.getByRole('button', { name: /retry resource/i })).toBeDisabled()
+  })
 })

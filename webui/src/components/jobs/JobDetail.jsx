@@ -8,6 +8,7 @@ import PublishingPanel from '../publishing/PublishingPanel'
 import ResourceState from '../shared/ResourceState'
 import StatusBadge from '../shared/StatusBadge'
 import SubtitleCandidates from '../subtitles/SubtitleCandidates'
+import VideoPreview from '../video/VideoPreview'
 import AttentionBanner from './AttentionBanner'
 import DiagnosticsPanel from './DiagnosticsPanel'
 import PipelineSteps from './PipelineSteps'
@@ -103,7 +104,7 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
     }
   }, [client, detail != null, eventIntervalMs, jobId, operatorToken, terminal])
 
-  const mutate = async (name, call) => {
+  const mutate = async (name, call, { announceGlobal = true } = {}) => {
     if (pendingActionRef.current) return { ok: false, error: 'Another operator action is still in progress.' }
     pendingActionRef.current = name
     setPendingAction(name)
@@ -114,7 +115,7 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
       return { ok: true }
     } catch (failure) {
       const message = failure?.message || 'The operator action failed.'
-      setMutationError(message)
+      if (announceGlobal) setMutationError(message)
       return { ok: false, error: message }
     } finally {
       pendingActionRef.current = null
@@ -138,6 +139,7 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
         loadingMessage="Loading job workspace…"
         emptyMessage="Run detail is missing."
         onRetry={manualRefresh}
+        retryDisabled={Boolean(pendingAction)}
         isEmpty={(value) => !value?.run}
       >
         {(snapshot) => (
@@ -155,6 +157,34 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
             <AttentionBanner run={snapshot.run} availableActions={snapshot.available_actions} pendingAction={pendingAction} onAction={bannerAction} />
             {mutationError && <p role="alert" className="inline-error">{mutationError}</p>}
             <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} />
+            {(() => {
+              const graph = snapshot.stages.find((stage) => stage.name === 'graph')
+              const composite = snapshot.stages.find((stage) => stage.name === 'composite')
+              const encode = snapshot.stages.find((stage) => stage.name === 'encode')
+              const hasManifest = (stage) => (
+                stage?.output_manifest
+                && Object.keys(stage.output_manifest).length > 0
+              )
+              const previewAvailable = graph?.output_manifest?.details?.preview_file === 'preview.png'
+              const videoAvailable = encode?.state === 'completed' && hasManifest(encode)
+              const segmentTiming = composite?.output_manifest?.details?.timing || {}
+              const compositeAvailable = (
+                composite?.state === 'completed'
+                && hasManifest(composite)
+                && Object.keys(segmentTiming).length > 0
+              )
+              if (!previewAvailable && !videoAvailable && !compositeAvailable) return null
+              return (
+                <VideoPreview
+                  jobId={snapshot.run.id}
+                  previewAvailable={previewAvailable}
+                  videoAvailable={videoAvailable}
+                  compositeAvailable={compositeAvailable}
+                  segmentTiming={segmentTiming}
+                  client={client}
+                />
+              )
+            })()}
             <SubtitleCandidates jobId={jobId} token={operatorToken} candidates={snapshot.candidates} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
             <PublishingPanel jobId={jobId} token={operatorToken} releases={snapshot.releases} publishingAttempts={snapshot.publishing_attempts} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
             <CostSummary costs={snapshot.costs} />

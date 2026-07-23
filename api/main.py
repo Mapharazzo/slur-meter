@@ -734,6 +734,7 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
         return {
             "segment": segment,
             "frame_count": len(list(path.glob("*.png"))),
+            "fps": manifest.get("details", {}).get("fps"),
             "timing": timing_fields,
         }
 

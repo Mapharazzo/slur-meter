@@ -6,6 +6,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { AppProvider } from '../../context/AppContext'
 import JobDetail from './JobDetail'
 
+vi.mock('../video/VideoPreview', () => ({
+  default: ({ jobId, previewAvailable, videoAvailable, compositeAvailable }) => (
+    <section aria-label="Media preview">
+      {jobId} · preview {String(previewAvailable)} · video {String(videoAvailable)} · composite {String(compositeAvailable)}
+    </section>
+  ),
+}))
+
 const run = {
   id: 'job_alpha', source_imdb_id: 'tt0110912', query: '', label: 'Pulp Fiction',
   state: 'running', current_stage: 'composite', next_action: 'Wait for rendering.',
@@ -224,10 +232,54 @@ describe('JobDetail operator workspace', () => {
     const subtitles = await screen.findByRole('region', { name: /subtitle candidates/i })
     await user.click(within(subtitles).getByRole('button', { name: /select candidate/i }))
     expect(await within(subtitles).findByRole('alert')).toHaveTextContent(/subtitle selection failed safely/i)
+    expect(screen.getAllByText(/subtitle selection failed safely/i)).toHaveLength(1)
 
     const publishing = screen.getByRole('region', { name: /^publishing$/i })
     await user.click(within(publishing).getByRole('button', { name: /publish youtube/i }))
     expect(await within(publishing).findByRole('alert')).toHaveTextContent(/publishing failed safely/i)
+    expect(screen.getAllByText(/publishing failed safely/i)).toHaveLength(1)
+  })
+
+  it('mounts media preview with canonical identity and durable manifest availability', async () => {
+    const mediaDetail = {
+      ...detail,
+      stages: [
+        ...detail.stages,
+        { ...parentStage, id: 30, name: 'encode', state: 'completed', output_manifest: { details: { final_file: 'final.mp4' } } },
+      ].map((stage) => (
+        stage.name === 'graph'
+          ? { ...stage, state: 'completed', output_manifest: { details: { preview_file: 'preview.png' } } }
+          : stage.name === 'composite'
+            ? { ...stage, state: 'completed', output_manifest: { details: { timing: { graph: { num_frames: 10 } } } } }
+            : stage
+      )),
+    }
+    renderDetail(client({ getJob: vi.fn().mockResolvedValue(mediaDetail) }))
+
+    expect(await screen.findByRole('region', { name: /media preview/i })).toHaveTextContent(
+      /job_alpha.*preview true.*video true.*composite true/i,
+    )
+  })
+
+  it('does not advertise media for completed stages with empty manifests', async () => {
+    const noMediaDetail = {
+      ...detail,
+      stages: detail.stages.map((stage) => (
+        ['graph', 'composite'].includes(stage.name)
+          ? { ...stage, state: 'completed', output_manifest: {} }
+          : stage
+      )).concat({
+        ...parentStage,
+        id: 31,
+        name: 'encode',
+        state: 'completed',
+        output_manifest: {},
+      }),
+    }
+    renderDetail(client({ getJob: vi.fn().mockResolvedValue(noMediaDetail) }))
+
+    await screen.findByRole('heading', { name: /pulp fiction/i })
+    expect(screen.queryByRole('region', { name: /media preview/i })).not.toBeInTheDocument()
   })
 
   it('merges incremental events monotonically without duplicates and stops active polling on a terminal snapshot while retaining manual refresh', async () => {

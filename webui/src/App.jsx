@@ -2,6 +2,7 @@ import { Component, useState } from 'react'
 import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom'
 
 import AlertList from './components/alerts/AlertList'
+import AlertBanner from './components/alerts/AlertBanner'
 import CostDashboard from './components/costs/CostDashboard'
 import OperationsOverview from './components/dashboard/OperationsOverview'
 import JobDetail from './components/jobs/JobDetail'
@@ -126,6 +127,7 @@ function ApplicationShell({ poll }) {
         <Sidebar />
         <div className="app-frame">
           <SystemStatusBar />
+          <AlertBanner />
           <Header />
           <main id="main-content" tabIndex="-1">
             <ShellRoutes poll={poll} />
