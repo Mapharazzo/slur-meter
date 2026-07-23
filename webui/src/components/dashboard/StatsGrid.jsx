@@ -1,19 +1,31 @@
-import StatCard from '../shared/StatCard'
+const PRIMARY_STATES = ['running', 'needs_attention', 'failed', 'queued', 'completed']
 
-export default function StatsGrid({ jobs }) {
-  const total = jobs.length
-  const running = jobs.filter(j =>
-    ['queued', 'fetching', 'analysing', 'rendering', 'encoding'].includes(j.status)
-  ).length
-  const done = jobs.filter(j => j.status === 'done').length
-  const failed = jobs.filter(j => j.status === 'failed').length
+function labelForState(state) {
+  return state.replaceAll('_', ' ')
+}
+
+export default function StatsGrid({ summary }) {
+  const total = Number.isFinite(summary?.total) ? summary.total : 0
+  const states = summary?.states && typeof summary.states === 'object' ? summary.states : {}
+  const orderedStates = [
+    ...PRIMARY_STATES,
+    ...Object.keys(states).filter((state) => !PRIMARY_STATES.includes(state)).sort(),
+  ]
 
   return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-      <StatCard label="Total Jobs" value={total} />
-      <StatCard label="Running" value={running} color="text-blue-400" />
-      <StatCard label="Completed" value={done} color="text-green-400" />
-      <StatCard label="Failed" value={failed} color="text-red-400" />
-    </div>
+    <section aria-label="Operations summary" className="summary-panel">
+      <div className="summary-total">
+        <span className="summary-value">{total}</span>
+        <span className="summary-label">total runs</span>
+      </div>
+      <dl className="summary-states">
+        {orderedStates.map((state) => (
+          <div key={state} className={`summary-state summary-state--${state}`}>
+            <dt>{labelForState(state)}</dt>
+            <dd>{Number.isFinite(states[state]) ? states[state] : 0}</dd>
+          </div>
+        ))}
+      </dl>
+    </section>
   )
 }

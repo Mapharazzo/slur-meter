@@ -17,13 +17,13 @@ export default function ToastRegion({ toasts = [], onDismiss }) {
   )
 
   return (
-    <div aria-label="Notifications" className="fixed right-4 top-4 z-50 w-full max-w-sm space-y-2">
+    <section aria-label="Notifications" className="fixed right-4 top-4 z-50 w-full max-w-sm space-y-2">
       <div role="status" aria-live="polite" aria-atomic="false" className="space-y-2">
         {normal.map(toast)}
       </div>
       {errors.map((item) => (
         <div role="alert" aria-live="assertive" key={item.id}>{toast(item)}</div>
       ))}
-    </div>
+    </section>
   )
 }

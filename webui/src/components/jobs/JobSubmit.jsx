@@ -1,89 +1,98 @@
-import { useState } from 'react'
+import { useId, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { api } from '../../api'
 
-const QUICK_PICKS = [
-  'Django Unchained 2012',
-  'Pulp Fiction 1994',
-  'The Wolf of Wall Street 2013',
-  'Goodfellas 1990',
-  'Casino 1995',
-]
+import { api, createIdempotencyKey } from '../../api'
+import { useApp } from '../../context/AppContext'
 
-export default function JobSubmit() {
+const IMDB_ID = /^tt\d{7,10}$/
+
+export default function JobSubmit({ client = api }) {
   const [mode, setMode] = useState('query')
-  const [input, setInput] = useState('')
+  const [value, setValue] = useState('')
+  const [error, setError] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  const inFlight = useRef(false)
+  const errorId = useId()
   const navigate = useNavigate()
+  const { operatorToken, addToast } = useApp()
 
-  const handleSubmit = async (e) => {
-    e.preventDefault()
-    if (!input.trim() || submitting) return
+  const changeMode = (nextMode) => {
+    setMode(nextMode)
+    setValue('')
+    setError('')
+  }
+
+  const handleSubmit = async (event) => {
+    event.preventDefault()
+    if (inFlight.current) return
+    const normalized = value.trim()
+    if (!normalized) {
+      setError('Enter one movie title or canonical IMDb ID.')
+      return
+    }
+    if (mode === 'imdb' && !IMDB_ID.test(normalized)) {
+      setError('Use a canonical IMDb ID such as tt0110912.')
+      return
+    }
+
+    inFlight.current = true
     setSubmitting(true)
-
+    setError('')
+    const idempotencyKey = createIdempotencyKey()
     try {
-      const body = mode === 'imdb'
-        ? { imdb_id: input.trim() }
-        : { query: input.trim() }
-      const job = await api.submitJob(body)
-      setInput('')
-      navigate(`/jobs/${job.imdb_id}`)
-    } catch (err) {
-      alert(err.message)
+      const body = mode === 'imdb' ? { imdb_id: normalized } : { query: normalized }
+      const created = await client.submitJob(body, { token: operatorToken, idempotencyKey })
+      setValue('')
+      addToast({ type: 'success', message: `Run created for ${created.label || 'movie'}.` })
+      navigate(`/jobs/${encodeURIComponent(created.id)}`)
+    } catch (cause) {
+      setError(cause?.message || 'The run could not be created.')
     } finally {
+      inFlight.current = false
       setSubmitting(false)
     }
   }
 
+  const inputLabel = mode === 'imdb' ? 'Canonical IMDb ID' : 'Movie title or query'
+
   return (
-    <div className="glass rounded-2xl p-8 space-y-4">
-      <h2 className="text-lg font-bold text-center">New Video</h2>
-      <p className="text-gray-500 text-xs text-center">Enter IMDB ID or movie title to start the pipeline</p>
-
-      <div className="max-w-md mx-auto">
-        <div className="flex gap-2 mb-3">
-          {['query', 'imdb'].map(m => (
-            <button
-              key={m}
-              onClick={() => setMode(m)}
-              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all ${
-                mode === m ? 'bg-white/10 text-white' : 'text-gray-500'
-              }`}
-            >
-              {m === 'query' ? 'Search' : 'IMDB ID'}
-            </button>
-          ))}
-        </div>
-
-        <form onSubmit={handleSubmit} className="flex gap-2">
-          <input
-            type="text"
-            value={input}
-            onChange={e => setInput(e.target.value)}
-            placeholder={mode === 'query' ? 'e.g. Django Unchained' : 'e.g. tt1854564'}
-            className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-white/20 transition-colors"
-          />
-          <button
-            type="submit"
-            disabled={submitting || !input.trim()}
-            className="px-6 py-3 bg-gradient-to-r from-red-500 to-purple-600 rounded-xl font-bold text-sm hover:opacity-90 transition-all disabled:opacity-40"
-          >
-            {submitting ? '...' : 'Go'}
-          </button>
-        </form>
-
-        <div className="flex flex-wrap gap-2 mt-3 justify-center">
-          {QUICK_PICKS.map(movie => (
-            <button
-              key={movie}
-              onClick={() => { setMode('query'); setInput(movie) }}
-              className="px-3 py-1 rounded-full bg-white/5 text-xs text-gray-500 hover:text-white hover:bg-white/10 transition-all"
-            >
-              {movie}
-            </button>
-          ))}
-        </div>
+    <section className="create-panel" aria-labelledby="create-run-heading">
+      <div>
+        <p className="eyebrow">New operation</p>
+        <h2 id="create-run-heading">Create a run</h2>
+        <p>Resolve exactly one movie query or canonical IMDb identity.</p>
       </div>
-    </div>
+      <form onSubmit={handleSubmit} noValidate>
+        <fieldset className="mode-switch">
+          <legend>Input mode</legend>
+          <label>
+            <input type="radio" name="input-mode" value="query" checked={mode === 'query'} onChange={() => changeMode('query')} />
+            Movie title or query
+          </label>
+          <label>
+            <input type="radio" name="input-mode" value="imdb" checked={mode === 'imdb'} onChange={() => changeMode('imdb')} />
+            Canonical IMDb ID
+          </label>
+        </fieldset>
+        <div className="create-panel__controls">
+          <label className="field-label">
+            <span>{inputLabel}</span>
+            <input
+              type="text"
+              value={value}
+              onChange={(event) => { setValue(event.target.value); setError('') }}
+              aria-describedby={error ? errorId : undefined}
+              aria-invalid={Boolean(error)}
+              autoComplete="off"
+              placeholder={mode === 'imdb' ? 'tt0110912' : 'Pulp Fiction'}
+            />
+          </label>
+          <button type="submit" className="button button--primary" disabled={submitting}>
+            {submitting ? 'Creating run…' : 'Create run'}
+          </button>
+        </div>
+        {error && <p id={errorId} role="alert" className="inline-error">{error}</p>}
+      </form>
+    </section>
   )
 }

@@ -6,6 +6,13 @@ import { describe, expect, it, vi } from 'vitest'
 import ToastRegion from './ToastRegion'
 
 describe('ToastRegion', () => {
+  it('has a valid labelled notification landmark when the region is empty', async () => {
+    const { container } = render(<ToastRegion toasts={[]} />)
+
+    expect(screen.getByRole('region', { name: 'Notifications' })).toBeInTheDocument()
+    expect((await axe.run(container)).violations).toEqual([])
+  })
+
   it('announces normal and error feedback with labelled dismiss buttons', async () => {
     const dismiss = vi.fn()
     const user = userEvent.setup()
