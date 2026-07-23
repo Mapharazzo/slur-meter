@@ -95,12 +95,39 @@ describe('usePollingResource', () => {
     const { result } = renderHook(() => usePollingResource(load))
     await act(async () => {})
 
-    await act(async () => result.current.refresh())
+    let refreshPromise
+    act(() => { refreshPromise = result.current.refresh() })
     expect(signals[0].aborted).toBe(true)
     expect(load).toHaveBeenCalledTimes(2)
     await act(async () => newRequest.resolve('new'))
+    await expect(refreshPromise).resolves.toBe('new')
     await act(async () => oldRequest.resolve('old'))
     expect(result.current.data).toBe('new')
+  })
+
+  it('returns an awaitable manual refresh that settles with data and after a rejected load commits safe error state', async () => {
+    const success = deferred()
+    const failure = new ApiError('Refresh failed safely.', { code: 'refresh_failed' })
+    const load = vi.fn()
+      .mockResolvedValueOnce('initial')
+      .mockReturnValueOnce(success.promise)
+      .mockRejectedValueOnce(failure)
+    const { result } = renderHook(() => usePollingResource(load, { intervalMs: 10_000 }))
+    await act(async () => {})
+
+    let settled = false
+    const successPromise = result.current.refresh().then((value) => { settled = true; return value })
+    await act(async () => {})
+    expect(settled).toBe(false)
+    let successValue
+    await act(async () => { success.resolve('fresh'); successValue = await successPromise })
+    expect(successValue).toBe('fresh')
+    expect(result.current).toMatchObject({ status: 'success', data: 'fresh' })
+
+    let failureValue
+    await act(async () => { failureValue = await result.current.refresh() })
+    expect(failureValue).toBeUndefined()
+    expect(result.current).toMatchObject({ status: 'error', error: failure, data: 'fresh' })
   })
 
   it('retains last good data while classifying transport and application failures', async () => {
@@ -112,11 +139,11 @@ describe('usePollingResource', () => {
     await act(async () => {})
     expect(result.current.data).toEqual({ id: 1 })
 
-    act(() => result.current.refresh())
+    act(() => { void result.current.refresh() })
     await act(async () => {})
     expect(result.current).toMatchObject({ status: 'disconnected', data: { id: 1 }, isDisconnected: true })
 
-    act(() => result.current.refresh())
+    act(() => { void result.current.refresh() })
     await act(async () => {})
     expect(result.current).toMatchObject({ status: 'error', data: { id: 1 }, isDisconnected: false })
   })
@@ -157,7 +184,7 @@ describe('usePollingResource', () => {
 
     await act(async () => vi.advanceTimersByTimeAsync(200))
     expect(result.current).toMatchObject({ status: 'stale', isStale: true, data: 'cached' })
-    act(() => result.current.refresh())
+    act(() => { void result.current.refresh() })
     await act(async () => second.resolve('fresh'))
     expect(result.current).toMatchObject({ status: 'success', isStale: false, data: 'fresh' })
   })
@@ -199,7 +226,7 @@ describe('usePollingResource', () => {
     await act(async () => vi.advanceTimersByTimeAsync(1_000))
     expect(load).toHaveBeenCalledTimes(1)
     expect(result.current).toMatchObject({ status: 'stale', isStale: true, isStopped: true })
-    act(() => result.current.refresh())
+    act(() => { void result.current.refresh() })
     await act(async () => {})
     expect(load).toHaveBeenCalledTimes(2)
   })
@@ -302,8 +329,10 @@ describe('usePollingResource', () => {
     act(() => document.dispatchEvent(new Event('visibilitychange')))
     visibility.mockReturnValue('visible')
     act(() => document.dispatchEvent(new Event('visibilitychange')))
-    await act(async () => result.current.refresh())
+    let refreshPromise
+    act(() => { refreshPromise = result.current.refresh() })
     await act(async () => second.resolve('fresh'))
+    await expect(refreshPromise).resolves.toBe('fresh')
 
     expect(load).toHaveBeenCalledTimes(2)
   })

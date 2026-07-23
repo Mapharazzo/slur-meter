@@ -28,9 +28,10 @@ function safePollingError(error) {
  *
  * Returns `{ data, error, status, isLoading, isSuccess, isDisconnected,
  * isStale, isStopped, hasData, lastAttemptAt, lastSuccessAt, refresh, stop }`.
- * `refresh()` always performs one superseding request, even after terminal or
- * explicit stop; it does not restart automatic polling when the result is
- * terminal or `stop()` remains in force.
+ * Awaitable `refresh()` performs one superseding request and resolves with its
+ * successful data (or `undefined` after a safely handled failure), even after
+ * terminal or explicit stop. It does not restart automatic polling when the
+ * result is terminal or `stop()` remains in force.
  */
 export function usePollingResource(load, options = {}) {
   const {
@@ -158,6 +159,7 @@ export function usePollingResource(load, options = {}) {
         lastSuccessAt: successAt,
       }))
       scheduleStale(successAt)
+      return data
     } catch (error) {
       if (!mountedRef.current || generation !== requestGenerationRef.current) return
       if (controller.signal.aborted) return
@@ -193,7 +195,7 @@ export function usePollingResource(load, options = {}) {
 
   const refresh = useCallback(() => {
     terminalStopRef.current = false
-    runRef.current?.({ supersede: true })
+    return runRef.current?.({ supersede: true }) ?? Promise.resolve(undefined)
   }, [])
 
   const stop = useCallback(() => {

@@ -1,130 +1,172 @@
-import { useState, useEffect } from 'react'
-import { useParams, Link } from 'react-router-dom'
-import { api } from '../../api'
-import StatusBadge from '../shared/StatusBadge'
-import StatCard from '../shared/StatCard'
-import PipelineSteps from './PipelineSteps'
-import VideoPreview from '../video/VideoPreview'
-import CostBreakdown from '../costs/CostBreakdown'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { Link, useParams } from 'react-router-dom'
 
-export default function JobDetail() {
-  const { imdbId } = useParams()
-  const [job, setJob] = useState(null)
-  const [costs, setCosts] = useState([])
-  const [error, setError] = useState(null)
+import { api, createIdempotencyKey } from '../../api'
+import { useApp } from '../../context/AppContext'
+import { usePollingResource } from '../../hooks/usePollingResource'
+import PublishingPanel from '../publishing/PublishingPanel'
+import ResourceState from '../shared/ResourceState'
+import StatusBadge from '../shared/StatusBadge'
+import SubtitleCandidates from '../subtitles/SubtitleCandidates'
+import AttentionBanner from './AttentionBanner'
+import DiagnosticsPanel from './DiagnosticsPanel'
+import PipelineSteps from './PipelineSteps'
+
+const TERMINAL_STATES = new Set(['completed', 'failed', 'cancelled', 'needs_attention'])
+
+function mergeEvents(current, incoming) {
+  const byId = new Map(current.map((event) => [event.id, event]))
+  incoming.forEach((event) => {
+    if (!byId.has(event.id)) byId.set(event.id, event)
+  })
+  return [...byId.values()].sort((left, right) => left.id - right.id)
+}
+
+function CostSummary({ costs = [] }) {
+  if (!costs.length) return null
+  const total = costs.reduce((sum, cost) => sum + (Number(cost.amount_usd) || 0), 0)
+  return (
+    <section className="glass rounded-xl p-4" aria-labelledby="job-cost-heading">
+      <h2 id="job-cost-heading">Job costs</h2>
+      <p>${total.toFixed(2)} across {costs.length} persisted entr{costs.length === 1 ? 'y' : 'ies'}.</p>
+    </section>
+  )
+}
+
+export default function JobDetail({ client = api, pollingOptions = {} }) {
+  const params = useParams()
+  const jobId = params.jobId || params.imdbId
+  const { operatorToken } = useApp()
+  const loadDetail = useCallback(
+    (signal) => client.getJob(jobId, { token: operatorToken, signal }),
+    [client, jobId, operatorToken],
+  )
+  const { eventIntervalMs = 2_000, ...detailPollingOptions } = pollingOptions
+  const resource = usePollingResource(loadDetail, {
+    intervalMs: 2_000,
+    staleAfterMs: 8_000,
+    isTerminal: (snapshot) => TERMINAL_STATES.has(snapshot?.run?.state),
+    dependencies: [jobId, operatorToken],
+    ...detailPollingOptions,
+  })
+  const detail = resource.data
+  const terminal = TERMINAL_STATES.has(detail?.run?.state)
+  const [events, setEvents] = useState([])
+  const eventCursor = useRef(0)
+  const [eventWarning, setEventWarning] = useState('')
+  const [pendingAction, setPendingAction] = useState(null)
+  const pendingActionRef = useRef(null)
+  const [mutationError, setMutationError] = useState('')
 
   useEffect(() => {
-    const poll = async () => {
+    setEvents([])
+    eventCursor.current = 0
+    setEventWarning('')
+  }, [jobId])
+
+  useEffect(() => {
+    if (!detail) return
+    setEvents((current) => mergeEvents(current, detail.events || []))
+    eventCursor.current = Math.max(eventCursor.current, detail.last_event_id || 0)
+  }, [detail])
+
+  useEffect(() => {
+    if (!detail || terminal) return undefined
+    let active = true
+    let timer = null
+    let controller = null
+    const pollEvents = async () => {
+      if (!active || controller) return
+      controller = new AbortController()
       try {
-        const [j, c] = await Promise.all([
-          api.getJob(imdbId),
-          api.getJobCosts(imdbId).catch(() => []),
-        ])
-        setJob(j)
-        setCosts(c)
-        setError(null)
-      } catch (e) {
-        setError(e.message)
+        const page = await client.listJobEvents(
+          jobId,
+          { after: eventCursor.current },
+          { token: operatorToken, signal: controller.signal },
+        )
+        if (!active) return
+        setEvents((current) => mergeEvents(current, page.items || []))
+        eventCursor.current = Math.max(eventCursor.current, page.last_event_id || 0, ...(page.items || []).map((event) => event.id))
+        setEventWarning('')
+      } catch (failure) {
+        if (active && !controller.signal.aborted) setEventWarning(failure?.message || 'Live events are temporarily unavailable.')
+      } finally {
+        controller = null
+        if (active) timer = setTimeout(pollEvents, eventIntervalMs)
       }
     }
-    poll()
+    pollEvents()
+    return () => {
+      active = false
+      if (timer != null) clearTimeout(timer)
+      controller?.abort()
+    }
+  }, [client, detail != null, eventIntervalMs, jobId, operatorToken, terminal])
 
-    // Poll while job is active
-    const id = setInterval(poll, 2000)
-    return () => clearInterval(id)
-  }, [imdbId])
-
-  if (error) {
-    return (
-      <div className="max-w-3xl mx-auto py-12 text-center">
-        <div className="text-red-400 text-lg font-bold">Job not found</div>
-        <p className="text-gray-500 mt-2 text-sm">{error}</p>
-        <Link to="/jobs" className="text-gray-600 hover:text-white text-sm mt-4 inline-block">Back to jobs</Link>
-      </div>
-    )
+  const mutate = async (name, call) => {
+    if (pendingActionRef.current) return { ok: false, error: 'Another operator action is still in progress.' }
+    pendingActionRef.current = name
+    setPendingAction(name)
+    setMutationError('')
+    try {
+      await call({ token: operatorToken, idempotencyKey: createIdempotencyKey() })
+      await resource.refresh()
+      return { ok: true }
+    } catch (failure) {
+      const message = failure?.message || 'The operator action failed.'
+      setMutationError(message)
+      return { ok: false, error: message }
+    } finally {
+      pendingActionRef.current = null
+      setPendingAction(null)
+    }
   }
 
-  if (!job) {
-    return <div className="text-center py-12 text-gray-600 animate-pulse-slow">Loading...</div>
-  }
-
-  const isActive = ['queued', 'fetching', 'analysing', 'rendering', 'encoding'].includes(job.status)
-  const isDone = job.status === 'done'
-  const summary = job.analysis_json?.summary || {}
+  const retryStage = (stage) => mutate(`retry_stage:${stage.name}`, (options) => client.retryStage(jobId, stage.name, options))
+  const bannerAction = (action) => mutate(action, (options) => (
+    action === 'resume' ? client.resumeJob(jobId, options) : client.cancelJob(jobId, options)
+  ))
+  const manualRefresh = () => (
+    pendingActionRef.current ? Promise.resolve(undefined) : resource.refresh()
+  )
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <Link to="/jobs" className="text-gray-600 hover:text-white text-sm transition-colors">
-        &larr; All Jobs
-      </Link>
-
-      {/* Header */}
-      <div className="glass rounded-2xl p-6 space-y-4">
-        <div className="flex items-center gap-3">
-          <StatusBadge status={job.status} />
-          <h2 className="text-xl font-bold flex-1">{job.label}</h2>
-          <span className="text-xs text-gray-600 font-mono">{job.imdb_id}</span>
-        </div>
-
-        {/* Progress bar */}
-        {isActive && (
+    <div className="mx-auto max-w-6xl space-y-6">
+      <Link to="/jobs" className="text-sm">← All jobs</Link>
+      <ResourceState
+        resource={resource}
+        loadingMessage="Loading job workspace…"
+        emptyMessage="Run detail is missing."
+        onRetry={manualRefresh}
+        isEmpty={(value) => !value?.run}
+      >
+        {(snapshot) => (
           <>
-            <div className="w-full bg-white/5 rounded-full h-2">
-              <div
-                className="h-2 rounded-full bg-gradient-to-r from-red-500 to-purple-600 transition-all duration-1000"
-                style={{ width: `${job.progress || 0}%` }}
-              />
-            </div>
-            <p className="text-sm text-gray-400 animate-pulse-slow">{job.message}</p>
+            <header className="glass rounded-2xl p-5">
+              <p className="eyebrow">Canonical run · {snapshot.run.id}</p>
+              <div className="flex flex-wrap items-center gap-3">
+                <h1 className="flex-1">{snapshot.run.label}</h1>
+                <StatusBadge status={snapshot.run.state} />
+                <button type="button" className="button" disabled={Boolean(pendingAction)} onClick={manualRefresh}>Refresh job</button>
+              </div>
+              <p>Current stage: {snapshot.run.current_stage || 'None'} · Updated <time dateTime={snapshot.run.updated_at}>{snapshot.run.updated_at}</time></p>
+            </header>
+
+            <AttentionBanner run={snapshot.run} availableActions={snapshot.available_actions} pendingAction={pendingAction} onAction={bannerAction} />
+            {mutationError && <p role="alert" className="inline-error">{mutationError}</p>}
+            <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} />
+            <SubtitleCandidates jobId={jobId} token={operatorToken} candidates={snapshot.candidates} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
+            <PublishingPanel jobId={jobId} token={operatorToken} releases={snapshot.releases} publishingAttempts={snapshot.publishing_attempts} availableActions={snapshot.available_actions} client={client} onRefresh={resource.refresh} actionRunner={mutate} pendingAction={pendingAction} />
+            <CostSummary costs={snapshot.costs} />
+            <section aria-labelledby="event-stream-heading" className="glass rounded-xl p-4">
+              <h2 id="event-stream-heading">Operational events</h2>
+              {eventWarning && <p role="alert">{eventWarning} Showing persisted events.</p>}
+              {events.length ? <ol>{events.map((event) => <li key={event.id}><time dateTime={event.created_at}>{event.created_at}</time> · {event.message}</li>)}</ol> : <p>No events have been persisted.</p>}
+            </section>
+            <DiagnosticsPanel detail={{ ...snapshot, events }} operatorToken={operatorToken} />
           </>
         )}
-
-        {job.status === 'failed' && (
-          <div className="bg-red-500/10 border border-red-500/20 rounded-lg p-4">
-            <div className="text-red-400 font-bold text-sm">Pipeline Failed</div>
-            <p className="text-red-400/70 text-sm mt-1">{job.error}</p>
-          </div>
-        )}
-      </div>
-
-      {/* Pipeline steps */}
-      <PipelineSteps steps={job.steps || []} imdbId={imdbId} isActive={isActive} />
-
-      {/* Results */}
-      {isDone && (
-        <div className="glass rounded-2xl p-6 space-y-6">
-          <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider">Results</h3>
-
-          <div className="text-center">
-            <div className="text-3xl font-bold bg-gradient-to-r from-red-500 to-purple-600 bg-clip-text text-transparent">
-              {summary.rating || 'Unrated'}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            <StatCard label="Hard Slurs" value={summary.total_hard || 0} color="text-red-400" />
-            <StatCard label="Soft Slurs" value={summary.total_soft || 0} color="text-yellow-400" />
-            <StatCard label="F-Bombs" value={summary.total_f_bombs || 0} color="text-purple-400" />
-            <StatCard label="Peak Score" value={summary.peak_score || 0} color="text-green-400"
-              sub={summary.peak_minute ? `min ${summary.peak_minute}` : null} />
-          </div>
-
-          <div className="flex justify-between text-xs text-gray-600">
-            <span>Runtime: {summary.runtime_minutes || '?'} min</span>
-            <span>Words counted: {summary.total_words_counted || '?'}</span>
-          </div>
-        </div>
-      )}
-
-      {/* Video preview */}
-      {isDone && (
-        <VideoPreview imdbId={imdbId} segmentTiming={job.segment_timing} />
-      )}
-
-      {/* Costs */}
-      {costs.length > 0 && (
-        <CostBreakdown costs={costs} />
-      )}
+      </ResourceState>
     </div>
   )
 }
