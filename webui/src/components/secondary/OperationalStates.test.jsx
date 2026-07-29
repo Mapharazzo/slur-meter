@@ -97,13 +97,14 @@ describe('honest secondary operational routes', () => {
     renderRoute(<RevenueDashboard client={apiClient} pollingOptions={{ intervalMs: 60_000 }} />)
 
     expect(await screen.findByRole('heading', { level: 1, name: /revenue and views/i })).toBeInTheDocument()
+    const table = await screen.findByRole('table', { name: /verified revenue snapshots/i })
     expect(screen.getAllByText('$0.00')).toHaveLength(2)
     expect(screen.getByText('0 total views')).toBeInTheDocument()
     const row = screen.getByRole('row', { name: /job_alpha.*youtube/i })
     expect(row).toHaveAttribute('data-revenue-id', '41')
     expect(within(row).getByRole('link', { name: 'job_alpha' })).toHaveAttribute('href', '/jobs/job_alpha')
     expect(within(row).getByText('2026-07-23T10:00:00Z').closest('time')).toHaveAttribute('datetime', '2026-07-23T10:00:00Z')
-    expect(screen.getByRole('table', { name: /verified revenue snapshots/i }).parentElement).toHaveClass('overflow-x-auto')
+    expect(table.parentElement).toHaveClass('overflow-x-auto')
     expect(apiClient.getRevenue).toHaveBeenCalledWith(undefined, { token: 'secondary-token', signal: expect.any(AbortSignal) })
   })
 
