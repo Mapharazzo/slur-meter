@@ -1,0 +1,15 @@
+The bundled webfonts in this directory are licensed under the
+SIL Open Font License, Version 1.1.
+
+  martian-mono-latin.woff2
+    Martian Mono — Copyright (c) Evil Martians
+    https://github.com/evilmartians/mono
+
+  instrument-sans-latin.woff2
+    Instrument Sans — Copyright (c) Instrument
+    https://github.com/Instrument/instrument-sans
+
+Both files are the `latin` subsets published by Google Fonts, vendored here so
+the control panel renders identically on an offline or tailnet-only host.
+
+Full licence text: https://openfontlicense.org

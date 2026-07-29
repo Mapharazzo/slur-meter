@@ -123,21 +123,21 @@ export default function SegmentPlayer({ jobId: jobIdProp, imdbId, segment, clien
   if (infoStatus === 'loading') {
     return <div role="status">Loading {segment.replaceAll('_', ' ')} segment…</div>
   }
-  if (infoStatus === 'error') return <div role="alert">{error}</div>
-  if (!info?.frame_count) return <p>This segment has no rendered frames.</p>
+  if (infoStatus === 'error') return <div role="alert" className="notice notice--danger">{error}</div>
+  if (!info?.frame_count) return <p className="hint">This segment has no rendered frames.</p>
 
   const label = `${segment.replaceAll('_', ' ')} frame ${currentFrame + 1} of ${info.frame_count}`
   return (
-    <section aria-label={`${segment.replaceAll('_', ' ')} segment player`} className="space-y-3">
-      <div className="aspect-[9/16] max-w-xs mx-auto bg-black rounded-xl overflow-hidden">
+    <section aria-label={`${segment.replaceAll('_', ' ')} segment player`} className="segment-player">
+      <div className="vertical-frame">
         {frameUrl
-          ? <img src={frameUrl} alt={label} className="w-full h-full object-contain" />
+          ? <img src={frameUrl} alt={label} />
           : frameLoading
             ? <div role="status">Loading {label}…</div>
             : null}
       </div>
-      {error && <p role="alert">{error}</p>}
-      <div className="flex items-center justify-center gap-3">
+      {error && <p role="alert" className="inline-error">{error}</p>}
+      <div className="transport">
         <button
           type="button"
           onClick={() => setPlaying((value) => !value)}
@@ -147,7 +147,7 @@ export default function SegmentPlayer({ jobId: jobIdProp, imdbId, segment, clien
         >
           {playing ? 'Pause' : 'Play'}
         </button>
-        <span aria-live="polite" className="text-xs text-gray-500 font-mono">
+        <span aria-live="polite" className="data">
           {currentFrame + 1} / {info.frame_count}
         </span>
       </div>

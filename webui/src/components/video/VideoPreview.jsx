@@ -83,16 +83,15 @@ export default function VideoPreview({
   }
 
   return (
-    <section aria-labelledby="video-preview-heading" className="glass rounded-2xl p-6 space-y-4">
+    <section aria-labelledby="video-preview-heading" className="panel panel__body">
       <h2 id="video-preview-heading">Media preview</h2>
-      <div role="group" aria-label="Media preview choices" className="flex gap-2 flex-wrap">
-        {previewAvailable && <button type="button" className={`button ${activeTab === 'preview' ? 'button--primary' : ''}`} aria-pressed={activeTab === 'preview'} onClick={() => setActiveTab('preview')}>Graph preview</button>}
-        {videoAvailable && <button type="button" className={`button ${activeTab === 'video' ? 'button--primary' : ''}`} aria-pressed={activeTab === 'video'} onClick={() => setActiveTab('video')}>Final video</button>}
+      <div role="group" aria-label="Media preview choices" className="segmented">
+        {previewAvailable && <button type="button" aria-pressed={activeTab === 'preview'} onClick={() => setActiveTab('preview')}>Graph preview</button>}
+        {videoAvailable && <button type="button" aria-pressed={activeTab === 'video'} onClick={() => setActiveTab('video')}>Final video</button>}
         {compositeAvailable && availableSegments.map((name) => (
           <button
             type="button"
             key={name}
-            className={`button ${activeTab === 'segment' && activeSegment === name ? 'button--primary' : ''}`}
             aria-pressed={activeTab === 'segment' && activeSegment === name}
             onClick={() => { setActiveTab('segment'); setActiveSegment(name) }}
           >
@@ -102,27 +101,27 @@ export default function VideoPreview({
       </div>
 
       {activeTab === 'preview' && (
-        preview.status === 'loading' ? <div role="status">Loading graph preview…</div>
+        preview.status === 'loading' ? <div role="status" className="state-block">Loading graph preview…</div>
           : preview.status === 'error' ? <div role="alert" className="inline-error">{preview.error}</div>
-            : <div className="flex justify-center rounded-xl bg-black/30 p-3"><img src={preview.url} alt="Latest graph preview" className="max-h-[70vh] w-auto rounded-lg shadow-lg" /></div>
+            : <div className="media-frame"><img src={preview.url} alt="Latest graph preview" /></div>
       )}
       {activeTab === 'video' && (
-        video.status === 'loading' ? <div role="status">Loading final video…</div>
+        video.status === 'loading' ? <div role="status" className="state-block">Loading final video…</div>
           : video.status === 'error' ? <div role="alert" className="inline-error">{video.error}</div>
-            : <div className="flex flex-col items-center gap-3">
-              <div className="flex justify-center rounded-xl bg-black/30 p-3">
-                <video src={video.url} controls playsInline aria-label={`Final video for ${jobId}`} className="max-h-[70vh] w-auto rounded-lg shadow-lg" />
+            : <div className="media-stack">
+              <div className="media-frame">
+                <video src={video.url} controls playsInline aria-label={`Final video for ${jobId}`} />
               </div>
               <button type="button" className="button" onClick={downloadVideo} disabled={!video.url}>Download final MP4</button>
             </div>
       )}
       {activeTab === 'segment' && activeSegment && (
-        <div className="space-y-4">
+        <div className="media-stack">
           <SegmentPlayer jobId={jobId} segment={activeSegment} client={client} />
           <FrameBrowser jobId={jobId} segment={activeSegment} client={client} />
         </div>
       )}
-      {activeTab === 'unavailable' && <p>No durable media artifact is available yet.</p>}
+      {activeTab === 'unavailable' && <p className="hint">No durable media artifact is available yet.</p>}
     </section>
   )
 }

@@ -20,8 +20,8 @@ export default function RevenueDashboard({ client = api, pollingOptions = {} }) 
   })
 
   return (
-    <section className="max-w-5xl mx-auto space-y-6" aria-labelledby="revenue-heading">
-      <header><h1 id="revenue-heading">Revenue and views</h1></header>
+    <section className="page" aria-labelledby="revenue-heading">
+      <header className="page-heading"><div><p className="eyebrow">Verified platform data</p><h1 id="revenue-heading">Revenue and views</h1></div></header>
       <ResourceState
         resource={resource}
         loadingMessage="Loading revenue snapshots…"
@@ -33,8 +33,10 @@ export default function RevenueDashboard({ client = api, pollingOptions = {} }) 
           const totalViews = page.items.reduce((sum, item) => sum + Number(item.views ?? 0), 0)
           return (
             <>
-              <p><strong>${totalRevenue.toFixed(2)}</strong> verified revenue</p>
-              <p><strong>{totalViews.toLocaleString()} total views</strong> across {page.total} snapshot{page.total === 1 ? '' : 's'}</p>
+              <div className="readout-row">
+                <p className="readout"><strong>${totalRevenue.toFixed(2)}</strong> <span>verified revenue</span></p>
+                <p className="readout"><strong>{totalViews.toLocaleString()} total views</strong> <span>across {page.total} snapshot{page.total === 1 ? '' : 's'}</span></p>
+              </div>
               <div className="overflow-x-auto">
                 <table>
                   <caption>Verified revenue snapshots</caption>

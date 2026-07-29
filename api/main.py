@@ -709,6 +709,20 @@ def create_app(settings: Settings, store: OperationStore, dispatcher: Any) -> Fa
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.get("/api/jobs/{identifier}/poster")
+    async def poster(identifier: str):
+        _job, manifest, directory = current_artifact(identifier, "metadata")
+        if manifest.get("details", {}).get("poster_file") != "poster.jpg":
+            raise HTTPException(404, "Poster was not found")
+        path = directory / "poster.jpg"
+        if not path.is_file():
+            raise HTTPException(404, "Poster was not found")
+        return Response(
+            path.read_bytes(),
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get(
         "/api/videos/{identifier}/segments/{segment}",
         response_model=SegmentInfoResponse,

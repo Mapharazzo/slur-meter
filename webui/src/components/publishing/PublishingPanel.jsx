@@ -71,12 +71,12 @@ export default function PublishingPanel({
   }
 
   return (
-    <section aria-labelledby="publishing-heading" className="glass rounded-2xl p-5">
+    <section aria-labelledby="publishing-heading" className="panel panel__body">
       <h2 id="publishing-heading">Publishing</h2>
-      <p>Publishing occurs only after a deliberate privileged operator action.</p>
+      <p className="hint">Publishing occurs only after a deliberate privileged operator action.</p>
       {error && <p role="alert" className="inline-error">{error}</p>}
       {platforms.length ? (
-        <div className="mt-4 grid gap-4">
+        <div className="platform-grid">
           {platforms.map((platform) => {
             const release = releases.find((item) => item.platform === platform)
             const attempts = publishingAttempts.filter((attempt) => attempt.platform === platform)
@@ -86,18 +86,18 @@ export default function PublishingPanel({
             const canRetry = release?.status === 'failed' && availableActions.includes(`retry_publish:${platform}`)
             const canReconcile = release?.status === 'needs_attention' && availableActions.includes(`reconcile_publish:${platform}`)
             return (
-              <section key={platform} aria-label={`${platform} publishing`} className="rounded-xl border border-white/10 p-4">
-                <h3 className="capitalize">{platform}</h3>
+              <section key={platform} aria-label={`${platform} publishing`} className="platform-card">
+                <h3>{platform}</h3>
                 <p><strong>Status:</strong> {uploaded ? 'Uploaded complete' : ambiguous ? 'Outcome unknown — attention required' : words(release?.status || 'not requested')}</p>
                 {release?.remote_id && <p><strong>Remote ID:</strong> {release.remote_id}</p>}
                 {release?.uploaded_at && <p><strong>Uploaded:</strong> <time dateTime={release.uploaded_at}>{release.uploaded_at}</time></p>}
                 {release?.safe_error?.message && <p>{release.safe_error.message}</p>}
                 {ambiguous && (
-                  <div role="alert" className="mt-3 rounded-lg border border-amber-400/30 p-3">
+                  <div role="alert" className="notice notice--warning">
                     <p>{release.safe_error?.message || 'The uploaded status has no remote ID. The outcome is unknown and needs attention.'}</p>
                     {canReconcile && <>
                       <label className="field-label"><span>{platform} remote ID</span><input value={remoteIds[platform] || ''} onChange={(event) => { setRemoteIds((current) => ({ ...current, [platform]: event.target.value })); setError('') }} /></label>
-                      <div className="mt-2 flex gap-2">
+                      <div className="notice__actions">
                         <button type="button" className="button" disabled={Boolean(activePending)} onClick={() => reconcileUploaded(platform)}>Confirm uploaded</button>
                         <button type="button" className="button" disabled={Boolean(activePending)} onClick={() => mutate(`reconcile:${platform}`, (options) => client.reconcilePublish(jobId, platform, { reconciliation: 'not_uploaded' }, options))}>Confirm not uploaded</button>
                       </div>
@@ -105,10 +105,10 @@ export default function PublishingPanel({
                   </div>
                 )}
                 {attempts.length > 0 && (
-                  <section aria-label={`${platform} publishing attempts`} className="mt-3">
+                  <section aria-label={`${platform} publishing attempts`}>
                     <h4>Publishing attempts</h4>
-                    <ol>{attempts.map((attempt) => (
-                      <li key={attempt.id} className="mt-2 rounded-lg bg-white/[0.03] p-3 text-sm">
+                    <ol className="card-list">{attempts.map((attempt) => (
+                      <li key={attempt.id} className="attempt-card">
                         <p>Cycle {attempt.retry_cycle} · Attempt {attempt.attempt_number} of {attempt.max_attempts} · {words(attempt.trigger)}</p>
                         <p>{words(attempt.outcome)} · {attempt.retryable ? 'Retryable' : 'Not retryable'}{attemptDuration(attempt) ? ` · ${attemptDuration(attempt)}` : ''}</p>
                         <p>
@@ -121,7 +121,7 @@ export default function PublishingPanel({
                     ))}</ol>
                   </section>
                 )}
-                <div className="mt-3">
+                <div className="platform-card__actions">
                   {canPublish && <button type="button" className="button button--primary" disabled={Boolean(activePending)} onClick={() => mutate(`publish:${platform}`, (options) => client.publish(jobId, platform, options))}>Publish {platform}</button>}
                   {canRetry && <button type="button" className="button button--primary" disabled={Boolean(activePending)} onClick={() => mutate(`retry:${platform}`, (options) => client.retryPublish(jobId, platform, options))}>Retry {platform} publishing</button>}
                 </div>
@@ -129,8 +129,8 @@ export default function PublishingPanel({
             )
           })}
         </div>
-      ) : <p>No platforms have been requested.</p>}
-      {availableActions.includes('refresh_stats') && <button type="button" className="button mt-4" disabled={Boolean(activePending)} onClick={() => mutate('refresh_stats', (options) => client.refreshStats(jobId, options))}>Refresh platform stats</button>}
+      ) : <p className="hint">No platforms have been requested.</p>}
+      {availableActions.includes('refresh_stats') && <button type="button" className="button" disabled={Boolean(activePending)} onClick={() => mutate('refresh_stats', (options) => client.refreshStats(jobId, options))}>Refresh platform stats</button>}
     </section>
   )
 }

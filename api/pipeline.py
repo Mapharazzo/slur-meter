@@ -405,6 +405,24 @@ class GenerationPipelineServices:
                 details={
                     "metadata_file": "metadata.json",
                     **({"poster_file": "poster.jpg"} if result.poster_bytes else {}),
+                    # Surface what the query actually resolved to, so an
+                    # operator can confirm the right film was matched before
+                    # the expensive stages run.
+                    **(
+                        {"resolved_title": str(metadata["Title"])}
+                        if metadata.get("Title")
+                        else {}
+                    ),
+                    **(
+                        {"resolved_year": str(metadata["Year"])}
+                        if metadata.get("Year")
+                        else {}
+                    ),
+                    **(
+                        {"resolved_imdb_id": str(metadata["imdb_id"])}
+                        if metadata.get("imdb_id")
+                        else {}
+                    ),
                 },
                 publish_allowed=partial(self._publication_allowed, job_id, progress),
             )

@@ -43,12 +43,12 @@ export default function CostDashboard({ client = api, pollingOptions = {} }) {
     const calls = data.reduce((sum, row) => sum + Number(row.count ?? 0), 0)
     return (
       <>
-        <div className="grid grid-cols-3 gap-4">
-          <p><strong>${grandTotal.toFixed(4)}</strong><br />Total spend</p>
-          <p><strong>{totalUnits.toLocaleString()}</strong><br />Total units</p>
-          <p><strong>{calls.toLocaleString()}</strong><br />Calls</p>
+        <div className="readout-row">
+          <p className="readout"><strong>${grandTotal.toFixed(4)}</strong><span>Total spend</span></p>
+          <p className="readout"><strong>{totalUnits.toLocaleString()}</strong><span>Total units</span></p>
+          <p className="readout"><strong>{calls.toLocaleString()}</strong><span>Calls</span></p>
         </div>
-        <div className="glass overflow-x-auto rounded-xl">
+        <div className="panel table-scroll overflow-x-auto">
           <table className="w-full">
             <caption>Aggregate operational costs</caption>
             <thead><tr>
@@ -74,10 +74,10 @@ export default function CostDashboard({ client = api, pollingOptions = {} }) {
   }
 
   return (
-    <section className="max-w-4xl mx-auto space-y-6" aria-labelledby="cost-dashboard-heading">
-      <header>
-        <h1 id="cost-dashboard-heading">Cost dashboard</h1>
-        <div role="group" aria-label="Group costs">
+    <section className="page page--narrow" aria-labelledby="cost-dashboard-heading">
+      <header className="page-heading">
+        <div><p className="eyebrow">Operational spend</p><h1 id="cost-dashboard-heading">Cost dashboard</h1></div>
+        <div role="group" aria-label="Group costs" className="segmented">
           {GROUP_OPTIONS.map((option) => (
             <button
               type="button"

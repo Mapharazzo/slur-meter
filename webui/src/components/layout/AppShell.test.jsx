@@ -6,7 +6,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import App, { RouteErrorBoundary } from '../../App'
-import { api } from '../../api'
+import { api, ApiError } from '../../api'
 import Sidebar from './Sidebar'
 import SystemStatusBar from './SystemStatusBar'
 
@@ -55,6 +55,43 @@ describe('application shell', () => {
     expect(localStorage.getItem('slur-meter.operator-token')).toBeNull()
 
     await user.click(screen.getByRole('button', { name: /lock operations/i }))
+    expect(screen.getByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
+    expect(sessionStorage.getItem('slur-meter.operator-token')).toBeNull()
+  })
+
+  it('refuses a token the server rejects instead of unlocking onto a dashboard of 401s', async () => {
+    api.operationsSummary.mockRejectedValue(
+      new ApiError('Valid operator authentication is required.', {
+        status: 401,
+        code: 'unauthorized',
+        retryable: false,
+      }),
+    )
+    const user = userEvent.setup()
+    visit('/')
+
+    expect(await screen.findByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
+    await user.type(screen.getByLabelText(/operator token/i), 'wrong-token')
+    await user.click(screen.getByRole('button', { name: /unlock/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/that token was rejected/i)
+    expect(screen.getByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
+    expect(sessionStorage.getItem('slur-meter.operator-token')).toBeNull()
+    expect(api.listJobs).not.toHaveBeenCalled()
+    expect(api.getAlerts).not.toHaveBeenCalled()
+  })
+
+  it('keeps the operator on the unlock screen when the token cannot be checked at all', async () => {
+    api.operationsSummary.mockRejectedValue(
+      new ApiError('Offline', { code: 'network_error', retryable: true }),
+    )
+    const user = userEvent.setup()
+    visit('/')
+
+    await user.type(await screen.findByLabelText(/operator token/i), 'session-secret')
+    await user.click(screen.getByRole('button', { name: /unlock/i }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/could not be checked/i)
     expect(screen.getByRole('heading', { name: /unlock operations/i })).toBeInTheDocument()
     expect(sessionStorage.getItem('slur-meter.operator-token')).toBeNull()
   })

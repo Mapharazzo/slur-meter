@@ -1,14 +1,13 @@
-import { Component, useState } from 'react'
+import { Component, useId, useRef, useState } from 'react'
 import { BrowserRouter, Link, Route, Routes, useLocation } from 'react-router-dom'
 
+import { api } from './api'
 import AlertList from './components/alerts/AlertList'
-import AlertBanner from './components/alerts/AlertBanner'
 import CostDashboard from './components/costs/CostDashboard'
 import OperationsOverview from './components/dashboard/OperationsOverview'
 import JobDetail from './components/jobs/JobDetail'
 import Header from './components/layout/Header'
 import Sidebar from './components/layout/Sidebar'
-import SystemStatusBar from './components/layout/SystemStatusBar'
 import Leaderboard from './components/leaderboard/Leaderboard'
 import RevenueDashboard from './components/revenue/RevenueDashboard'
 import ToastRegion from './components/shared/ToastRegion'
@@ -45,27 +44,51 @@ export class RouteErrorBoundary extends Component {
   }
 }
 
-function UnlockScreen() {
+export function UnlockScreen({ client = api }) {
   const [value, setValue] = useState('')
   const [error, setError] = useState('')
+  const [checking, setChecking] = useState(false)
+  const errorId = useId()
+  const inFlight = useRef(false)
   const { setOperatorToken } = useApp()
 
-  const unlock = (event) => {
+  // The token is proved against a protected endpoint before it unlocks the
+  // shell. Accepting it unchecked let any string through the gate and left the
+  // operator on a dashboard where every panel answered 401.
+  const unlock = async (event) => {
     event.preventDefault()
+    if (inFlight.current) return
     const token = value.trim()
     if (!token) {
       setError('Enter the operator token for this session.')
       return
     }
-    setOperatorToken(token)
-    setValue('')
+
+    inFlight.current = true
+    setChecking(true)
+    setError('')
+    const controller = new AbortController()
+    try {
+      await client.operationsSummary({ token, signal: controller.signal })
+      setOperatorToken(token)
+      setValue('')
+    } catch (failure) {
+      if (failure?.status === 401 || failure?.code === 'unauthorized') {
+        setError('That token was rejected. Check ADMIN_API_TOKEN in the server .env and try again.')
+      } else {
+        setError(`The token could not be checked: ${failure?.message || 'the API did not respond.'}`)
+      }
+    } finally {
+      inFlight.current = false
+      setChecking(false)
+    }
   }
 
   return (
     <section className="unlock-panel" aria-labelledby="unlock-heading">
       <p className="eyebrow">Protected operations</p>
       <h1 id="unlock-heading">Unlock operations</h1>
-      <p>The token stays in session storage and is sent only in authenticated request headers.</p>
+      <p className="lede">The token stays in session storage and is sent only in authenticated request headers.</p>
       <form onSubmit={unlock}>
         <label className="field-label">
           <span>Operator token</span>
@@ -74,11 +97,14 @@ function UnlockScreen() {
             value={value}
             onChange={(event) => { setValue(event.target.value); setError('') }}
             autoComplete="current-password"
+            aria-describedby={error ? errorId : undefined}
             aria-invalid={Boolean(error)}
           />
         </label>
-        {error && <p role="alert" className="inline-error">{error}</p>}
-        <button type="submit" className="button button--primary">Unlock</button>
+        {error && <p id={errorId} role="alert" className="inline-error">{error}</p>}
+        <button type="submit" className="button button--primary" disabled={checking}>
+          {checking ? 'Checking token…' : 'Unlock'}
+        </button>
       </form>
     </section>
   )
@@ -127,8 +153,6 @@ function ApplicationShell({ poll }) {
       <div className="app-shell">
         <Sidebar />
         <div className="app-frame">
-          <SystemStatusBar />
-          <AlertBanner />
           <Header />
           <main id="main-content" tabIndex="-1">
             <ShellRoutes poll={poll} />

@@ -50,13 +50,13 @@ export default function DiagnosticsPanel({ detail, operatorToken = '' }) {
     }
   }
   return (
-    <details className="glass rounded-xl p-4" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <details className="disclosure" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary onClick={(event) => { event.preventDefault(); setOpen((value) => !value) }}>Technical diagnostics</summary>
-      {open && <>
-        <pre className="mt-3 max-h-80 overflow-auto whitespace-pre-wrap text-xs">{json}</pre>
-        <button type="button" className="button mt-3" onClick={copy}>Copy sanitized diagnostics</button>
-        {feedback && <p role="status">{feedback}</p>}
-      </>}
+      {open && <div className="disclosure__body">
+        <pre className="code-dump">{json}</pre>
+        <button type="button" className="button button--sm" onClick={copy}>Copy sanitized diagnostics</button>
+        {feedback && <p role="status" className="micro">{feedback}</p>}
+      </div>}
     </details>
   )
 }

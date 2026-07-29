@@ -24,8 +24,8 @@ export default function AlertList({ client = api, pollingOptions = {} }) {
   })
 
   return (
-    <section className="max-w-4xl mx-auto space-y-6" aria-labelledby="alerts-heading">
-      <header><h1 id="alerts-heading">Alerts</h1></header>
+    <section className="page page--narrow" aria-labelledby="alerts-heading">
+      <header className="page-heading"><div><p className="eyebrow">Waiting on you</p><h1 id="alerts-heading">Alerts</h1></div></header>
       <ResourceState
         resource={resource}
         loadingMessage="Loading alerts…"
@@ -34,18 +34,18 @@ export default function AlertList({ client = api, pollingOptions = {} }) {
       >
         {(page) => (
           <>
-            <p>{page.total} need attention</p>
-            <ul className="space-y-3">{page.items.map((alert) => {
+            <p className="micro data">{page.total} need attention</p>
+            <ul className="card-list">{page.items.map((alert) => {
               const validTimestamp = timestamp(alert.created_at)
               return (
                 <li key={`${alert.job_id}:${alert.state}:${alert.created_at}`}>
                   <Link
                     to={`/jobs/${alert.job_id}`}
                     aria-label={`${alert.job_id} ${alert.state}: ${alert.message}`}
-                    className="block glass rounded-xl p-4"
+                    className="alert-card"
                   >
                     <strong>{alert.job_id}</strong>
-                    <p>{alert.state}</p>
+                    <p className="micro">{alert.state}</p>
                     <p>{alert.message}</p>
                     {validTimestamp
                       ? <time dateTime={validTimestamp}>{validTimestamp}</time>

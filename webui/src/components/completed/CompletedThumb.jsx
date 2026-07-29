@@ -33,10 +33,10 @@ export default function CompletedThumb({ jobId, client = api }) {
   }, [client, jobId, operatorToken])
 
   return (
-    <div className="flex h-40 w-full items-center justify-center overflow-hidden bg-black/40">
+    <div className="gallery__thumb">
       {url
-        ? <img src={url} alt="" className="h-full w-full object-cover" />
-        : <span aria-hidden="true" className="text-3xl opacity-40">🎬</span>}
+        ? <img src={url} alt="" />
+        : <span aria-hidden="true" className="gallery__thumb-placeholder">🎬</span>}
     </div>
   )
 }

@@ -1,5 +1,7 @@
 import { Link } from 'react-router-dom'
 
+import { RunTrack } from '../shared/RuntimeStrip'
+
 const GROUPS = [
   { key: 'active', label: 'Active', states: ['running'], description: 'Work currently owned by the dispatcher.' },
   { key: 'attention', label: 'Needs attention', states: ['needs_attention'], description: 'Runs waiting for an operator decision.' },
@@ -35,7 +37,10 @@ function RunRow({ run }) {
           <span className="state-mark" aria-hidden="true" />
           {stateLabel(run.state)}
         </span>
-        <span className="queue-row__stage">{text(run.current_stage)?.replaceAll('_', ' ') || 'No active stage'}</span>
+        <span className="queue-row__progress">
+          <span className="queue-row__stage">{text(run.current_stage)?.replaceAll('_', ' ') || 'No active stage'}</span>
+          <RunTrack state={run.state} currentStage={run.current_stage} />
+        </span>
         <span className="queue-row__detail">
           {safeError && <span><strong>Stopped:</strong> {safeError}</span>}
           {nextAction && <span><strong>Next:</strong> {nextAction}</span>}

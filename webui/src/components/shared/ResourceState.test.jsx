@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import axe from 'axe-core'
@@ -43,6 +44,39 @@ describe('ResourceState', () => {
     expect(screen.getByText('cached content')).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(status === 'stale' ? /stale/i : /connection/i)
     expect((await axe.run(container)).violations).toEqual([])
+  })
+
+  it('keeps cached children mounted across a status change instead of remounting them', () => {
+    // A remount here drops live child state: the job workspace re-downloaded the
+    // MP4 and reset playback whenever a finished run aged into `stale`.
+    const mounted = vi.fn()
+    const unmounted = vi.fn()
+    function Player() {
+      useEffect(() => {
+        mounted()
+        return unmounted
+      }, [])
+      return <span>player</span>
+    }
+
+    const { rerender } = render(
+      <ResourceState resource={{ status: 'success', data: { id: 1 } }}><Player /></ResourceState>,
+    )
+    expect(mounted).toHaveBeenCalledTimes(1)
+
+    rerender(
+      <ResourceState resource={{ status: 'stale', data: { id: 1 } }}><Player /></ResourceState>,
+    )
+    expect(screen.getByRole('alert')).toHaveTextContent(/stale/i)
+    expect(screen.getByText('player')).toBeInTheDocument()
+    expect(unmounted).not.toHaveBeenCalled()
+    expect(mounted).toHaveBeenCalledTimes(1)
+
+    rerender(
+      <ResourceState resource={{ status: 'success', data: { id: 1 } }}><Player /></ResourceState>,
+    )
+    expect(unmounted).not.toHaveBeenCalled()
+    expect(mounted).toHaveBeenCalledTimes(1)
   })
 
   it('does not hide disconnected failure when there is no cached data', () => {

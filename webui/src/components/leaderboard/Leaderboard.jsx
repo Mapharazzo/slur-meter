@@ -56,11 +56,11 @@ export default function Leaderboard({ client = api, pollingOptions = {} }) {
   })
 
   return (
-    <section className="max-w-6xl mx-auto space-y-6" aria-labelledby="completed-heading">
-      <header className="space-y-1">
+    <section className="page" aria-labelledby="completed-heading">
+      <header className="page-heading"><div>
         <h1 id="completed-heading">Completed videos</h1>
-        <p>Every finished render, one card per movie. Filter and sort, then open one to watch or publish.</p>
-      </header>
+        <p className="lede">Every finished render, one card per movie. Filter and sort, then open one to watch or publish.</p>
+      </div></header>
       <ResourceState
         resource={resource}
         loadingMessage="Loading completed videos…"
@@ -76,50 +76,50 @@ export default function Leaderboard({ client = api, pollingOptions = {} }) {
           const sorted = [...filtered].sort(SORTS[sort].compare)
           return (
             <>
-              <div className="flex flex-wrap items-center gap-3">
-                <label className="min-w-[220px] flex-1">
+              <div className="gallery-filters">
+                <label className="gallery-filters__search">
                   <span className="sr-only">Search completed movies</span>
                   <input
                     type="search"
                     value={query}
                     onChange={(event) => setQuery(event.target.value)}
                     placeholder="Search by title or IMDb id…"
-                    className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2"
+                    className="input"
                   />
                 </label>
-                <label className="flex items-center gap-2 text-sm">
+                <label className="gallery-filters__sort">
                   <span>Sort</span>
                   <select
                     value={sort}
                     onChange={(event) => setSort(event.target.value)}
-                    className="rounded-lg border border-white/10 bg-white/5 px-3 py-2"
+                    className="input"
                   >
                     {Object.entries(SORTS).map(([key, option]) => (
                       <option key={key} value={key}>{option.label}</option>
                     ))}
                   </select>
                 </label>
-                <span className="text-sm opacity-70">{sorted.length} of {movies.length} movie{movies.length === 1 ? '' : 's'}</span>
+                <span className="micro data">{sorted.length} of {movies.length} movie{movies.length === 1 ? '' : 's'}</span>
               </div>
 
               {sorted.length ? (
-                <ul className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <ul className="gallery">
                   {sorted.map((movie) => (
                     <li key={movie.job_id}>
-                      <Link to={`/jobs/${movie.job_id}`} className="glass block overflow-hidden rounded-2xl transition hover:ring-1 hover:ring-white/20" aria-label={`Open ${movie.label}`}>
+                      <Link to={`/jobs/${movie.job_id}`} className="gallery__card" aria-label={`Open ${movie.label}`}>
                         <CompletedThumb jobId={movie.job_id} client={client} />
-                        <div className="space-y-2 p-4">
-                          <div className="flex items-start justify-between gap-2">
+                        <div className="gallery__meta">
+                          <div className="gallery__title">
                             <strong className="capitalize">{movie.label}</strong>
-                            {movie.rating && <span className="shrink-0 rounded-full bg-white/10 px-2 py-0.5 text-xs" data-metric="rating">{movie.rating}</span>}
+                            {movie.rating && <span className="badge" data-metric="rating">{movie.rating}</span>}
                           </div>
-                          {movie.source_imdb_id && <small className="block opacity-60">{movie.source_imdb_id}</small>}
-                          <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                          {movie.source_imdb_id && <small className="micro data">{movie.source_imdb_id}</small>}
+                          <div className="gallery__counts">
                             <span><b data-metric="hard">{num(movie.hard)}</b> hard</span>
                             <span><b data-metric="soft">{num(movie.soft)}</b> soft</span>
                             <span><b data-metric="f-bombs">{num(movie.f_bombs)}</b> f-bombs</span>
                           </div>
-                          <div className="flex flex-wrap justify-between gap-2 text-xs opacity-70">
+                          <div className="gallery__foot">
                             <span><b data-metric="views">{num(movie.total_views)}</b> views</span>
                             <span>{shortDate(movie.finished_at)}</span>
                           </div>
@@ -128,7 +128,7 @@ export default function Leaderboard({ client = api, pollingOptions = {} }) {
                     </li>
                   ))}
                 </ul>
-              ) : <p>No completed videos match your search.</p>}
+              ) : <p className="state-block">No completed videos match your search.</p>}
             </>
           )
         }}

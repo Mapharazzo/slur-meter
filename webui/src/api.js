@@ -328,5 +328,6 @@ export const api = {
   frameUrl: (id, name, frame) => `${API_BASE}/videos/${segment(id)}/frames/${segment(name)}/${segment(frame)}`,
   fetchVideo: (id, options = {}) => request(`/videos/${segment(id)}`, { ...options, responseType: 'blob' }),
   fetchPreview: (id, options = {}) => request(`/jobs/${segment(id)}/preview`, { ...options, responseType: 'blob' }),
+  fetchPoster: (id, options = {}) => request(`/jobs/${segment(id)}/poster`, { ...options, responseType: 'blob' }),
   fetchFrame: (id, name, frame, options = {}) => request(`/videos/${segment(id)}/frames/${segment(name)}/${segment(frame)}`, { ...options, responseType: 'blob' }),
 }

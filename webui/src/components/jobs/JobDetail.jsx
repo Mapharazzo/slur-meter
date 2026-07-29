@@ -11,6 +11,7 @@ import SubtitleCandidates from '../subtitles/SubtitleCandidates'
 import VideoPreview from '../video/VideoPreview'
 import AttentionBanner from './AttentionBanner'
 import DiagnosticsPanel from './DiagnosticsPanel'
+import MovieIdentity from './MovieIdentity'
 import EventLog from './EventLog'
 import PipelineSteps from './PipelineSteps'
 
@@ -28,9 +29,9 @@ function CostSummary({ costs = [] }) {
   if (!costs.length) return null
   const total = costs.reduce((sum, cost) => sum + (Number(cost.amount_usd) || 0), 0)
   return (
-    <section className="glass rounded-xl p-4" aria-labelledby="job-cost-heading">
+    <section className="panel panel__body" aria-labelledby="job-cost-heading">
       <h2 id="job-cost-heading">Job costs</h2>
-      <p>${total.toFixed(2)} across {costs.length} persisted entr{costs.length === 1 ? 'y' : 'ies'}.</p>
+      <p className="hint"><span className="data">${total.toFixed(2)}</span> across {costs.length} persisted entr{costs.length === 1 ? 'y' : 'ies'}.</p>
     </section>
   )
 }
@@ -133,8 +134,8 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
   )
 
   return (
-    <div className="mx-auto max-w-6xl space-y-6">
-      <Link to="/jobs" className="text-sm">← All jobs</Link>
+    <div className="page">
+      <Link to="/jobs" className="button button--quiet button--sm back-link">← All jobs</Link>
       <ResourceState
         resource={resource}
         loadingMessage="Loading job workspace…"
@@ -145,25 +146,35 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
       >
         {(snapshot) => (
           <>
-            <header className="glass rounded-2xl p-5">
+            <header className="panel panel__body run-header">
               <p className="eyebrow">Canonical run · {snapshot.run.id}</p>
-              <div className="flex flex-wrap items-center gap-3">
+              <div className="run-header__title">
                 <h1 className="flex-1">{snapshot.run.label}</h1>
                 <StatusBadge status={snapshot.run.state} />
-                <button type="button" className="button" disabled={Boolean(pendingAction)} onClick={manualRefresh}>Refresh job</button>
+                <button type="button" className="button button--sm" disabled={Boolean(pendingAction)} onClick={manualRefresh}>Refresh job</button>
               </div>
-              <p>Current stage: {snapshot.run.current_stage || 'None'} · Updated <time dateTime={snapshot.run.updated_at}>{snapshot.run.updated_at}</time></p>
+              <p className="hint">Current stage: <span className="data">{snapshot.run.current_stage || 'None'}</span> · Updated <time dateTime={snapshot.run.updated_at}>{snapshot.run.updated_at}</time></p>
             </header>
 
+            <MovieIdentity
+              jobId={snapshot.run.id}
+              stages={snapshot.stages}
+              label={snapshot.run.label}
+              sourceImdbId={snapshot.run.source_imdb_id}
+              canCancel={snapshot.available_actions.includes('cancel')}
+              pendingAction={pendingAction}
+              onCancel={bannerAction}
+              client={client}
+            />
             <AttentionBanner run={snapshot.run} availableActions={snapshot.available_actions} pendingAction={pendingAction} onAction={bannerAction} />
             {mutationError && <p role="alert" className="inline-error">{mutationError}</p>}
             {snapshot.run.state === 'completed' ? (
-              <details className="glass rounded-2xl p-5">
-                <summary className="flex cursor-pointer flex-wrap items-center gap-2 font-semibold">
+              <details className="disclosure">
+                <summary>
                   <span>Pipeline timeline</span>
-                  <span className="text-sm font-normal opacity-70">· all stages complete · expand</span>
+                  <span className="disclosure__note">all stages complete</span>
                 </summary>
-                <div className="mt-2">
+                <div className="disclosure__body">
                   <PipelineSteps stages={snapshot.stages} attempts={snapshot.attempts} availableActions={snapshot.available_actions} pendingAction={pendingAction} onRetry={retryStage} embedded />
                 </div>
               </details>
@@ -219,12 +230,12 @@ export default function JobDetail({ client = api, pollingOptions = {} }) {
                   ? `${snapshot.candidates.length} discovered`
                   : 'none yet'
               return (
-                <details className="glass rounded-2xl p-5">
-                  <summary className="flex cursor-pointer flex-wrap items-center gap-2 font-semibold">
+                <details className="disclosure">
+                  <summary>
                     <span>Subtitle candidates</span>
-                    <span className="text-sm font-normal opacity-70">· {summary} · expand to review or override</span>
+                    <span className="disclosure__note">{summary} · expand to review or override</span>
                   </summary>
-                  <div className="mt-4">
+                  <div className="disclosure__body">
                     <SubtitleCandidates {...subtitleProps} embedded />
                   </div>
                 </details>

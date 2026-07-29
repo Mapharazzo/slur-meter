@@ -1,11 +1,8 @@
 import { useState } from 'react'
 
 import StatusBadge from '../shared/StatusBadge'
+import RuntimeStrip, { displayState, words } from '../shared/RuntimeStrip'
 import StageAttemptList from './StageAttemptList'
-
-function words(value) {
-  return String(value || '').replaceAll('.', ' ').replaceAll('_', ' ')
-}
 
 function duration(startedAt, finishedAt) {
   if (!startedAt) return null
@@ -22,10 +19,10 @@ function duration(startedAt, finishedAt) {
 function StageProgress({ stage }) {
   const { numerator, denominator, unit } = stage.progress || {}
   if (numerator == null || denominator == null || denominator <= 0) {
-    return stage.state === 'running' ? <p role="status">Progress is indeterminate.</p> : null
+    return stage.state === 'running' ? <p role="status" className="hint">Progress is indeterminate.</p> : null
   }
   return (
-    <div>
+    <div className="stage-progress">
       <progress
         aria-label={`${words(stage.name)} progress`}
         value={numerator}
@@ -33,77 +30,66 @@ function StageProgress({ stage }) {
         aria-valuemin="0"
         aria-valuenow={numerator}
         aria-valuemax={denominator}
-        className="w-full"
       />
-      <p>{numerator} of {denominator}{unit ? ` ${unit}` : ''}</p>
+      <p className="micro data">{numerator} of {denominator}{unit ? ` ${unit}` : ''}</p>
     </div>
   )
 }
 
-function isProgressComplete(stage) {
-  const { numerator, denominator } = stage.progress || {}
-  return denominator > 0 && numerator != null && numerator >= denominator
-}
+const UNSAFE_MANIFEST_KEY = /path|secret|token|header|body/i
 
-// A composite child stays `running` at full progress until its parent's
-// artifact is durably promoted and every child completes atomically. Show such
-// a fully-rendered child as completed so it doesn't read as a stale spinner.
-function displayState(stage) {
-  if (stage.parent_stage_id != null && stage.state === 'running' && isProgressComplete(stage)) {
-    return 'completed'
-  }
-  return stage.state
-}
-
-function StageItem({ stage, attempts, children, canRetry, busy, onRetry }) {
-  const [expanded, setExpanded] = useState(false)
+function StageItem({ stage, attempts, children, canRetry, busy, onRetry, expanded, onToggle }) {
   const headingId = `stage-${stage.id}`
+  const manifest = Object.entries(stage.output_manifest || {}).filter(([key]) => !UNSAFE_MANIFEST_KEY.test(key))
+
   return (
-    <li data-parent-stage={stage.parent_stage_id ?? undefined} className="rounded-xl border border-white/10 bg-white/[0.02] p-3">
-      <div className="flex w-full items-center gap-3">
-        <h3 id={headingId} className="flex-1 font-semibold capitalize">{words(stage.name)}</h3>
+    <li data-parent-stage={stage.parent_stage_id ?? undefined} className="stage-item">
+      <div className="stage-item__head">
+        <h3 id={headingId}>{words(stage.name)}</h3>
         <StatusBadge status={displayState(stage)} />
         <button
           type="button"
+          className="button button--quiet button--icon button--sm"
           aria-label={`${expanded ? 'Collapse' : 'Expand'} ${words(stage.name)}`}
           aria-expanded={expanded}
           aria-controls={`${headingId}-panel`}
-          onClick={() => setExpanded((value) => !value)}
+          onClick={onToggle}
         >
           <span aria-hidden="true">{expanded ? '−' : '+'}</span>
         </button>
       </div>
       {children}
-      {canRetry && !expanded && (
-        <button type="button" className="button mt-3" disabled={busy} onClick={() => onRetry(stage)}>
-          {busy ? `Retrying ${words(stage.name)}…` : `Retry ${words(stage.name)}`}
-        </button>
-      )}
       {expanded && (
-        <div id={`${headingId}-panel`} className="mt-3 space-y-3 border-t border-white/10 pt-3">
+        <div id={`${headingId}-panel`} className="stage-item__body">
           <StageProgress stage={stage} />
-          <dl className="grid gap-2 text-sm sm:grid-cols-2">
+          <dl className="stage-facts">
             <div><dt>Retry cycle</dt><dd>Cycle {stage.retry_cycle}</dd></div>
             <div><dt>Automatic limit</dt><dd>{stage.max_auto_attempts}</dd></div>
             <div><dt>Started</dt><dd>{stage.started_at ? <time dateTime={stage.started_at}>{stage.started_at}</time> : 'Not started'}</dd></div>
-            <div><dt>Finished / duration</dt><dd>{stage.finished_at ? <time dateTime={stage.finished_at}>{stage.finished_at}</time> : 'In progress'}{duration(stage.started_at, stage.finished_at) && <> · {duration(stage.started_at, stage.finished_at)}</>}</dd></div>
+            <div>
+              <dt>Finished / duration</dt>
+              <dd>
+                {stage.finished_at ? <time dateTime={stage.finished_at}>{stage.finished_at}</time> : 'In progress'}
+                {duration(stage.started_at, stage.finished_at) && <> · {duration(stage.started_at, stage.finished_at)}</>}
+              </dd>
+            </div>
           </dl>
           {stage.warnings?.length > 0 && (
-            <section aria-label={`${words(stage.name)} warnings`} className="rounded-lg border border-amber-400/30 p-3">
+            <section aria-label={`${words(stage.name)} warnings`} className="notice notice--warning">
               <h4>Warnings</h4>
               <ul>{stage.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
             </section>
           )}
-          {stage.safe_error?.message && <p role="alert">{stage.safe_error.message}</p>}
-          {Object.keys(stage.output_manifest || {}).filter((key) => !/path|secret|token|header|body/i.test(key)).length > 0 && (
-            <dl>
-              <dt>Manifest output summary</dt>
-              {Object.entries(stage.output_manifest).filter(([key]) => !/path|secret|token|header|body/i.test(key)).map(([key, value]) => (
-                <dd key={key}>{words(key)}: {String(value)}</dd>
-              ))}
+          {stage.safe_error?.message && <p role="alert" className="inline-error">{stage.safe_error.message}</p>}
+          {manifest.length > 0 && (
+            <dl className="stage-facts">
+              <div>
+                <dt>Manifest output summary</dt>
+                {manifest.map(([key, value]) => <dd key={key}>{words(key)}: {String(value)}</dd>)}
+              </div>
             </dl>
           )}
-          {stage.next_action && <p><strong>Next action:</strong> {stage.next_action}</p>}
+          {stage.next_action && <p className="hint"><strong>Next action:</strong> {stage.next_action}</p>}
           <StageAttemptList attempts={attempts} />
           {canRetry && (
             <button type="button" className="button button--primary" disabled={busy} onClick={() => onRetry(stage)}>
@@ -112,11 +98,27 @@ function StageItem({ stage, attempts, children, canRetry, busy, onRetry }) {
           )}
         </div>
       )}
+      {canRetry && !expanded && (
+        <div className="stage-item__body">
+          <button type="button" className="button button--sm" disabled={busy} onClick={() => onRetry(stage)}>
+            {busy ? `Retrying ${words(stage.name)}…` : `Retry ${words(stage.name)}`}
+          </button>
+        </div>
+      )}
     </li>
   )
 }
 
 export default function StageTimeline({ stages = [], attempts = [], availableActions = [], pendingAction, onRetry, embedded = false }) {
+  const [expandedIds, setExpandedIds] = useState(() => new Set())
+
+  const toggle = (id) => setExpandedIds((current) => {
+    const next = new Set(current)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
+
   const sorted = [...stages].sort((left, right) => left.ordinal - right.ordinal || left.id - right.id)
   const childrenByParent = new Map()
   sorted.filter((stage) => stage.parent_stage_id != null).forEach((stage) => {
@@ -124,6 +126,7 @@ export default function StageTimeline({ stages = [], attempts = [], availableAct
     current.push(stage)
     childrenByParent.set(stage.parent_stage_id, current)
   })
+
   const renderStage = (stage) => (
     <StageItem
       key={stage.id}
@@ -132,9 +135,11 @@ export default function StageTimeline({ stages = [], attempts = [], availableAct
       canRetry={availableActions.includes(`retry_stage:${stage.name}`)}
       busy={pendingAction === `retry_stage:${stage.name}`}
       onRetry={onRetry}
+      expanded={expandedIds.has(stage.id)}
+      onToggle={() => toggle(stage.id)}
     >
       {(childrenByParent.get(stage.id) || []).length > 0 && (
-        <ol className="ml-4 mt-3 space-y-2 border-l border-white/10 pl-3">
+        <ol className="stage-list stage-item__children">
           {(childrenByParent.get(stage.id) || []).map(renderStage)}
         </ol>
       )}
@@ -143,13 +148,20 @@ export default function StageTimeline({ stages = [], attempts = [], availableAct
 
   const Wrapper = embedded ? 'div' : 'section'
   const wrapperProps = embedded
-    ? {}
-    : { 'aria-labelledby': 'pipeline-timeline-heading', className: 'glass rounded-2xl p-5' }
+    ? { className: 'stage-section' }
+    : { 'aria-labelledby': 'pipeline-timeline-heading', className: 'panel panel__body' }
 
   return (
     <Wrapper {...wrapperProps}>
       {!embedded && <h2 id="pipeline-timeline-heading">Pipeline timeline</h2>}
-      {sorted.length ? <ol className="mt-4 space-y-3">{sorted.filter((stage) => stage.parent_stage_id == null).map(renderStage)}</ol> : <p>No stages have been persisted.</p>}
+      {sorted.length ? (
+        <>
+          {/* Clicking a segment opens that stage, so a long run does not have to
+              be opened one accordion at a time to find where it stalled. */}
+          <RuntimeStrip stages={sorted} onSelect={(stage) => toggle(stage.id)} />
+          <ol className="stage-list">{sorted.filter((stage) => stage.parent_stage_id == null).map(renderStage)}</ol>
+        </>
+      ) : <p className="hint">No stages have been persisted.</p>}
     </Wrapper>
   )
 }

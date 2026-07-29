@@ -76,10 +76,10 @@ export default function FrameBrowser({ jobId: jobIdProp, imdbId, segment, client
   const maxFrame = info.frame_count - 1
   const frameLabel = `${segment.replaceAll('_', ' ')} frame ${frame + 1} of ${info.frame_count}`
   return (
-    <section aria-label={`${segment.replaceAll('_', ' ')} frame browser`} className="glass rounded-xl p-4 space-y-3">
+    <section aria-label={`${segment.replaceAll('_', ' ')} frame browser`} className="panel panel__body">
       <h3>Frame browser</h3>
-      <div className="flex items-center gap-3">
-        <button type="button" aria-label="Previous frame" onClick={() => setFrame((value) => Math.max(0, value - 1))} disabled={frame === 0}>←</button>
+      <div className="transport">
+        <button type="button" className="button button--icon button--sm" aria-label="Previous frame" onClick={() => setFrame((value) => Math.max(0, value - 1))} disabled={frame === 0}>←</button>
         <input
           aria-label={`Select ${segment.replaceAll('_', ' ')} frame`}
           aria-valuetext={`Frame ${frame + 1} of ${info.frame_count}`}
@@ -88,17 +88,17 @@ export default function FrameBrowser({ jobId: jobIdProp, imdbId, segment, client
           max={maxFrame}
           value={frame}
           onChange={(event) => setFrame(Number(event.target.value))}
-          className="flex-1 accent-purple-500"
+          className="scrubber"
         />
-        <button type="button" aria-label="Next frame" onClick={() => setFrame((value) => Math.min(maxFrame, value + 1))} disabled={frame === maxFrame}>→</button>
+        <button type="button" className="button button--icon button--sm" aria-label="Next frame" onClick={() => setFrame((value) => Math.min(maxFrame, value + 1))} disabled={frame === maxFrame}>→</button>
         <span aria-live="polite">{frame + 1} / {info.frame_count}</span>
       </div>
-      <div className="aspect-[9/16] max-w-xs mx-auto bg-black rounded-xl overflow-hidden">
+      <div className="vertical-frame">
         {url
-          ? <img src={url} alt={frameLabel} className="w-full h-full object-contain" />
+          ? <img src={url} alt={frameLabel} />
           : status === 'loading-frame' ? <div role="status">Loading {frameLabel}…</div> : null}
       </div>
-      {status === 'frame-error' && <p role="alert">{error}</p>}
+      {status === 'frame-error' && <p role="alert" className="inline-error">{error}</p>}
     </section>
   )
 }

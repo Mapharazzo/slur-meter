@@ -28,9 +28,9 @@ export default function CostBreakdown({ costs = [] }) {
   const total = rows.reduce((sum, row) => sum + row.total, 0)
 
   return (
-    <section className="glass rounded-xl p-5" aria-labelledby="cost-breakdown-heading">
+    <section className="panel panel__body" aria-labelledby="cost-breakdown-heading">
       <h2 id="cost-breakdown-heading">Cost breakdown</h2>
-      <p>${total.toFixed(4)} total</p>
+      <p className="hint"><span className="data">${total.toFixed(4)}</span> total</p>
       {rows.length ? (
         <div className="overflow-x-auto">
           <table>
@@ -47,7 +47,7 @@ export default function CostBreakdown({ costs = [] }) {
             ))}</tbody>
           </table>
         </div>
-      ) : <p>No job costs have been persisted.</p>}
+      ) : <p className="hint">No job costs have been persisted.</p>}
     </section>
   )
 }

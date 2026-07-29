@@ -62,16 +62,16 @@ export default function SubtitleCandidates({
 
   const Wrapper = embedded ? 'div' : 'section'
   const wrapperProps = embedded
-    ? { className: 'space-y-2' }
-    : { 'aria-labelledby': 'subtitle-candidates-heading', className: 'glass rounded-2xl p-5' }
+    ? { className: 'stage-section' }
+    : { 'aria-labelledby': 'subtitle-candidates-heading', className: 'panel panel__body' }
 
   return (
     <Wrapper {...wrapperProps}>
       {!embedded && <h2 id="subtitle-candidates-heading">Subtitle candidates</h2>}
-      <p>Acceptance threshold: 70%. Coverage at or above 70% meets the configured duration threshold; the server remains authoritative.</p>
+      <p className="hint">Acceptance threshold: 70%. Coverage at or above 70% meets the configured duration threshold; the server remains authoritative.</p>
       {error && <p role="alert" className="inline-error">{error}</p>}
       {candidates.length ? (
-        <div className="mt-4 overflow-x-auto">
+        <div className="overflow-x-auto">
           <table>
             <caption>Durable subtitle candidate comparison</caption>
             <thead><tr><th scope="col">Rank / source</th><th scope="col">Match data</th><th scope="col">Duration and coverage</th><th scope="col">Status and reasons</th><th scope="col">Selection method</th><th scope="col">Action</th></tr></thead>
@@ -99,16 +99,16 @@ export default function SubtitleCandidates({
                       )}
                     </td>
                     <td>{candidate.selection_method || 'Not selected'}</td>
-                    <td>{canSelect && <button type="button" className="button" disabled={Boolean(activePending)} onClick={() => mutate(`select:${candidate.id}`, (options) => client.selectSubtitle(jobId, candidate.id, options))}>Select candidate {candidate.rank ?? candidate.id}</button>}</td>
+                    <td>{canSelect && <button type="button" className="button button--sm" disabled={Boolean(activePending)} onClick={() => mutate(`select:${candidate.id}`, (options) => client.selectSubtitle(jobId, candidate.id, options))}>Select candidate {candidate.rank ?? candidate.id}</button>}</td>
                   </tr>
                 )
               })}
             </tbody>
           </table>
         </div>
-      ) : <p>No subtitle candidates have been returned.</p>}
+      ) : <p className="hint">No subtitle candidates have been returned.</p>}
 
-      <div className="mt-4 flex flex-wrap items-end gap-3">
+      <div className="candidate-actions">
         {availableActions.includes('rediscover_subtitles') && <button type="button" className="button" disabled={Boolean(activePending)} onClick={() => mutate('rediscover', (options) => client.rediscoverSubtitles(jobId, options))}>Rediscover subtitles</button>}
         <label className="field-label"><span>Upload SRT</span><input type="file" accept=".srt,application/x-subrip" onChange={(event) => { setFile(event.target.files?.[0] || null); setError('') }} /></label>
         <button type="button" className="button" disabled={Boolean(activePending)} onClick={upload}>Upload subtitle</button>

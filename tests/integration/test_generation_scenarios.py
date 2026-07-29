@@ -657,6 +657,66 @@ async def test_metadata_backfills_expected_runtime_for_title_only_jobs(tmp_path)
     assert candidate["expected_runtime_seconds"] == 151 * 60
 
 
+@pytest.mark.anyio
+async def test_metadata_records_resolved_identity_and_poster_for_a_title_query(tmp_path):
+    """A title query must publish what it matched, so an operator can verify it."""
+    store = OperationStore(tmp_path / "operations.db")
+    store.initialize()
+    job, _ = store.create_or_get_active_job("", "the departed", "The Departed")
+    store.ensure_stage(job["id"], "metadata", ordinal=1)
+    store.claim_next_job("worker", lease_seconds=30)
+
+    class TitleResolvingClient:
+        def fetch(self, _imdb_id):
+            raise AssertionError("title-only job must not fetch by IMDb id")
+
+        def resolve_title(self, _query, _year=None):
+            return MovieMetadataResult(
+                configured=True,
+                metadata={
+                    "Title": "The Departed",
+                    "Year": "2006",
+                    "Runtime": "151 min",
+                    "imdb_id": "tt0407887",
+                },
+                poster_bytes=b"\xff\xd8\xff\xe0 fake jpeg payload",
+            )
+
+    settings = Settings(
+        base_dir=tmp_path,
+        output_dir=tmp_path / "output",
+        results_dir=tmp_path / "results",
+    )
+    services = GenerationPipelineServices(
+        store,
+        settings,
+        config=_config(),
+        metadata_client=TitleResolvingClient(),
+        plotter_factory=FakePlotter,
+        compositor_factory=FakeCompositor,
+        audio_pipeline_factory=FakeAudioPipeline,
+        encoder=FakeEncoder(),
+    )
+
+    await asyncio.wait_for(
+        PipelineRunner(
+            store, services, stages=("metadata",), sleep=asyncio.sleep, settings=settings
+        ).run(job["id"], "worker"),
+        timeout=10,
+    )
+
+    detail = store.get_job_detail(job["id"])
+    stage = next(row for row in detail["stages"] if row["name"] == "metadata")
+    details = stage["output_manifest"]["details"]
+    assert details["resolved_imdb_id"] == "tt0407887"
+    assert details["resolved_title"] == "The Departed"
+    assert details["resolved_year"] == "2006"
+    assert details["poster_file"] == "poster.jpg"
+
+    poster = services.artifacts.artifact_path(stage["output_manifest"]) / "poster.jpg"
+    assert poster.is_file() and poster.stat().st_size > 0
+
+
 def test_ffprobe_failure_is_emitted_as_warning_instead_of_swallowed(
     tmp_path, monkeypatch
 ):

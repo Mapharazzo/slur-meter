@@ -106,12 +106,12 @@ export default function OperationsOverview({ client = api, poll = true, pollingO
   }
 
   return (
-    <div className="operations-page">
+    <div className="page">
       <div className="page-heading">
         <div>
           <p className="eyebrow">Operational truth</p>
           <h1>Operations queue</h1>
-          <p>Follow every run from durable submission to a completed or actionable outcome.</p>
+          <p className="lede">Follow every run from durable submission to a completed or actionable outcome.</p>
         </div>
         <button type="button" className="button button--quiet" onClick={() => { summary.refresh(); jobs.refresh() }}>
           Refresh queue
@@ -128,8 +128,8 @@ export default function OperationsOverview({ client = api, poll = true, pollingO
 
       <JobSubmit client={client} />
 
-      <section className="queue-panel" aria-labelledby="queue-view-heading">
-        <div className="queue-toolbar">
+      <section className="panel panel--flush" aria-labelledby="queue-view-heading">
+        <div className="panel__head">
           <div>
             <p className="eyebrow">Primary queue</p>
             <h2 id="queue-view-heading" className="sr-only">Queue filters and results</h2>

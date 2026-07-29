@@ -1,4 +1,7 @@
 /** @type {import('tailwindcss').Config} */
+// Tailwind supplies layout utilities only. Every colour, surface and type
+// decision lives in the design system in src/index.css, so the tokens below
+// point back at the same custom properties rather than forking a palette.
 export default {
   content: [
     "./index.html",
@@ -7,25 +10,20 @@ export default {
   theme: {
     extend: {
       colors: {
-        hard: "#ff1744",
-        soft: "#ffea00",
-        fbomb: "#d500f9",
-        line: "#00e5ff",
-        accent: "#76ff03",
+        stock: "var(--stock)",
+        bay: "var(--bay)",
+        rail: "var(--rail)",
+        edge: "var(--edge)",
+        print: "var(--print)",
+        grey: "var(--grey)",
+        tungsten: "var(--tungsten)",
+        daylight: "var(--daylight)",
+        sun: "var(--sun)",
+        tally: "var(--tally)",
       },
-      keyframes: {
-        'fade-in': {
-          '0%': { opacity: '0', transform: 'translateY(10px)' },
-          '100%': { opacity: '1', transform: 'translateY(0)' },
-        },
-        'pulse-slow': {
-          '0%, 100%': { opacity: '0.5' },
-          '50%': { opacity: '1' },
-        },
-      },
-      animation: {
-        'fade-in': 'fade-in 0.3s ease-out',
-        'pulse-slow': 'pulse-slow 2s ease-in-out infinite',
+      fontFamily: {
+        mono: ["Martian Mono", "ui-monospace", "SF Mono", "Menlo", "monospace"],
+        sans: ["Instrument Sans", "ui-sans-serif", "system-ui", "sans-serif"],
       },
     },
   },

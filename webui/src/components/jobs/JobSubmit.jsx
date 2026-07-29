@@ -56,11 +56,11 @@ export default function JobSubmit({ client = api }) {
   const inputLabel = mode === 'imdb' ? 'Canonical IMDb ID' : 'Movie title or query'
 
   return (
-    <section className="create-panel" aria-labelledby="create-run-heading">
-      <div>
+    <section className="panel create-panel" aria-labelledby="create-run-heading">
+      <div className="create-panel__intro">
         <p className="eyebrow">New operation</p>
         <h2 id="create-run-heading">Create a run</h2>
-        <p>Resolve exactly one movie query or canonical IMDb identity.</p>
+        <p className="hint">Resolve exactly one movie query or canonical IMDb identity.</p>
       </div>
       <form onSubmit={handleSubmit} noValidate>
         <fieldset className="mode-switch">
@@ -87,7 +87,7 @@ export default function JobSubmit({ client = api }) {
               placeholder={mode === 'imdb' ? 'tt0110912' : 'Pulp Fiction'}
             />
           </label>
-          <button type="submit" className="button button--primary" disabled={submitting}>
+          <button type="submit" className="button button--primary button--secondary" disabled={submitting}>
             {submitting ? 'Creating run…' : 'Create run'}
           </button>
         </div>

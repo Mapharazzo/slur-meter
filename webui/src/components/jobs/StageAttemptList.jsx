@@ -14,13 +14,13 @@ function label(value) {
 }
 
 export default function StageAttemptList({ attempts = [] }) {
-  if (!attempts.length) return <p>No persisted attempts.</p>
+  if (!attempts.length) return <p className="hint">No persisted attempts.</p>
   return (
     <section aria-label="Attempt history">
       <h4>Attempt history</h4>
-      <ol className="space-y-2">
+      <ol className="card-list">
         {attempts.map((attempt) => (
-          <li key={attempt.id} className="rounded-lg border border-white/10 p-3 text-sm">
+          <li key={attempt.id} className="attempt-card">
             <p>
               <strong>Cycle {attempt.retry_cycle}</strong>{' · '}
               Attempt {attempt.attempt_number} of {attempt.max_attempts}{' · '}

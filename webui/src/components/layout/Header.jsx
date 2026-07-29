@@ -1,11 +1,14 @@
 import { Link, useLocation } from 'react-router-dom'
 
 import { useApp } from '../../context/AppContext'
+import AlertBanner from '../alerts/AlertBanner'
+import SystemStatusBar from './SystemStatusBar'
 
 const TITLES = {
   '/': 'Operations queue',
   '/jobs': 'Operations queue',
-  '/leaderboard': 'Leaderboard',
+  '/completed': 'Completed videos',
+  '/leaderboard': 'Completed videos',
   '/costs': 'Costs',
   '/revenue': 'Revenue',
   '/alerts': 'Alerts',
@@ -16,6 +19,9 @@ function routeTitle(pathname) {
   return TITLES[pathname] || 'Operations control'
 }
 
+// System health and the attention total each used to occupy a full-width bar of
+// their own above the page. They carry one reading apiece, so they ride here as
+// chips instead and give roughly 90px of vertical room back to the content.
 export default function Header() {
   const location = useLocation()
   const { operatorToken, clearOperatorToken } = useApp()
@@ -28,11 +34,15 @@ export default function Header() {
         <span aria-hidden="true">/</span>
         <span aria-current="page">{title}</span>
       </div>
-      {operatorToken && (
-        <button type="button" className="button button--quiet" onClick={clearOperatorToken}>
-          Lock operations
-        </button>
-      )}
+      <div className="topbar__tools">
+        <AlertBanner />
+        <SystemStatusBar />
+        {operatorToken && (
+          <button type="button" className="button button--quiet button--sm" onClick={clearOperatorToken}>
+            Lock operations
+          </button>
+        )}
+      </div>
     </header>
   )
 }
