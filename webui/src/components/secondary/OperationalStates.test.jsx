@@ -72,7 +72,7 @@ describe('honest secondary operational routes', () => {
     renderRoute(<CostDashboard client={apiClient} pollingOptions={{ intervalMs: 60_000 }} />)
 
     expect(await screen.findByRole('heading', { level: 1, name: /cost dashboard/i })).toBeInTheDocument()
-    const table = screen.getByRole('table', { name: /aggregate operational costs/i })
+    const table = await screen.findByRole('table', { name: /aggregate operational costs/i })
     expect(within(table).getByRole('columnheader', { name: /category/i })).toHaveAttribute('scope', 'col')
     expect(within(table).getByText('$0.0000')).toBeInTheDocument()
     expect(within(table).getAllByText('0').length).toBeGreaterThan(0)

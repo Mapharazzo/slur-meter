@@ -102,6 +102,9 @@ class JobDispatcher:
         if done or supervisor.done():
             await asyncio.gather(supervisor, return_exceptions=True)
             self._supervisor = None
+        # A cancellation-responsive runner can finish exactly at the deadline.
+        # Yield once so its done callback removes it from the active set.
+        await asyncio.sleep(0)
 
     async def _run(self) -> None:
         try:
