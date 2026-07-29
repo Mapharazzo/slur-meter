@@ -594,12 +594,20 @@ def test_preview_cli_rejects_unsafe_job_without_traceback_or_absolute_path(cli_r
     assert str(base) not in diagnostic
 
 
-def test_default_config_disables_paid_audio_and_env_example_is_complete():
+def test_default_config_enables_paid_audio_and_env_example_is_complete():
+    # This project deliberately opts in to the paid audio providers, so the
+    # default config ships them enabled. Pinning the provider alongside the flag
+    # keeps this an assertion about a specific opted-in setup rather than a
+    # tautology, and still fails if a stage is silently switched to another
+    # backend.
     config = yaml.safe_load(Path("config.yaml").read_text(encoding="utf-8"))
     assert all(
-        not config["audio"][name]["enabled"]
+        config["audio"][name]["enabled"]
         for name in ("intro_tts", "outro_tts", "background_music")
     )
+    assert config["audio"]["intro_tts"]["provider"] == "elevenlabs"
+    assert config["audio"]["outro_tts"]["provider"] == "elevenlabs"
+    assert config["audio"]["background_music"]["provider"] == "lyria"
 
     documented = {
         line.split("=", 1)[0]
