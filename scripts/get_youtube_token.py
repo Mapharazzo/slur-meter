@@ -9,6 +9,8 @@ Usage:
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 SCOPES = [
@@ -27,7 +29,7 @@ client_config = {
 }
 
 flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
-creds = flow.run_console()
+creds = flow.run_local_server(port=0)
 
 print("\n✅ Add this to your .env:")
 print(f"YOUTUBE_REFRESH_TOKEN={creds.refresh_token}")
